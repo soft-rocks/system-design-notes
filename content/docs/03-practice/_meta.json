@@ -1,7 +1,7 @@
 {
   "index": {
-    "title": "Questions",
-    "description": "Common questions"
+    "title": "Practice",
+    "description": "System design practice"
   },
   "design-a-distributed-metrics-logging-and-aggregation-system": {
     "title": "Distributed Metrics Logging",

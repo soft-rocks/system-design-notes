@@ -18,9 +18,9 @@ const docsSections = [
     description: 'Fundamental concepts',
   },
   {
-    slug: '03-questions',
-    title: 'Questions',
-    description: 'Common questions',
+    slug: '03-practice',
+    title: 'Practice',
+    description: 'System design practice',
   },
   {
     slug: '04-references',
