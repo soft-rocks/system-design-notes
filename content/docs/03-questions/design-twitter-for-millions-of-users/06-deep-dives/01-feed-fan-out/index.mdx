@@ -1,0 +1,245 @@
+---
+title: Feed Fan-Out
+description: Deep dive into the hybrid push/pull fan-out strategy for Twitter timelines.
+---
+
+## The Twitter Problem
+
+### Problem Statement
+When @celebrity (10M followers) posts a tweet, the system must make that tweet appear in 10M home feeds.
+
+**Pure push approach:**
+- 10M Redis writes for a single tweet
+- At 1ms per write = 10,000 seconds = ~2.8 hours for ONE celebrity to post
+- This is completely infeasible.
+
+**Key insight:** We need to differentiate between "regular users" and "super-nodes" in the fan-out strategy.
+
+**Distribution:**
+- 99% of users have < 1000 followers → push fan-out is fast
+- 0.1% of users (celebrities, influencers) have 10M+ followers → push fan-out is infeasible
+- The remaining 1% sit in a "gray zone" of moderate influence
+
+---
+
+## Push-Based Fan-Out
+
+### How It Works
+1. User A posts a tweet.
+2. System fetches all of A's followers from the Follow table.
+3. For each follower, the tweet ID + metadata is written to their timeline cache in Redis.
+
+### Implementation
+
+```
+// Fan-out for a regular user
+followers = FOLLOW_DB.query("SELECT following_id FROM follows WHERE follower_id = :userId")
+for follower in followers:
+    timeline_key = "timeline:" + follower.id
+    redis.lpush(timeline_key, {
+        tweetId: tweet.id,
+        authorId: tweet.authorId,
+        text: tweet.text.substring(0, 100),
+        timestamp: tweet.createdAt
+    })
+    redis.trim(timeline_key, 0, 1999) // Keep last 2000 tweets
+```
+
+### Pros
+- **Extremely fast reads:** Timeline is already materialized. Redis read = O(1).
+- **Consistent ordering:** Push happens sequentially — no race conditions.
+- **Simple client UX:** Users see tweets immediately on refresh.
+
+### Cons
+- **Unbounded for super-nodes:** 10M followers → 10M writes per tweet.
+- **Wasted writes:** If only 100 of 10M followers open the app, 9,999,900 writes are wasted.
+- **Storage bloat:** 10M timeline entries × 50 bytes = 500MB per follower just for one celebrity's tweets.
+
+---
+
+## Pull-Based Fan-Out
+
+### How It Works
+1. User A posts a tweet. The tweet is written to the DB only.
+2. When User B loads their home feed, the system:
+   a. Fetches all of B's followings: `SELECT following_id FROM follows WHERE follower_id = :B_id`
+   b. For each followed user (up to ~100 most recent tweets): `SELECT * FROM tweets WHERE author_id IN (...) ORDER BY created_at DESC LIMIT 100`
+   c. Merges, sorts by timestamp, and returns the combined timeline.
+
+### Implementation
+
+```
+// Pull for a user following a super-node
+followings = FOLLOW_DB.query("SELECT following_id FROM follows WHERE follower_id = :userId")
+// Limit to recent tweets from each followed user
+tweets = TWEET_DB.batch_query(
+    "SELECT * FROM tweets WHERE author_id IN (?), deleted = false ORDER BY created_at DESC LIMIT 100",
+    followings
+)
+// Sort and return top 50
+tweets.sortBy(t => t.createdAt).reverse().slice(0, 50)
+```
+
+### Pros
+- **No wasted writes:** Tweets are written once to DB.
+- **Handles super-nodes gracefully:** Reading a celebrity's tweets is just one of many queries.
+- **Always fresh:** No stale cache concerns.
+
+### Cons
+- **Slow reads:** N queries for N followings (even with batching, this is expensive).
+- **DB load:** 500K timeline reads/sec × up to 100 DB queries each = potentially 50M DB queries/sec.
+- **Ordering issues:** Merging multiple query results adds complexity.
+
+---
+
+## Hybrid Fan-Out Strategy (RECOMMENDED)
+
+### The Algorithm
+
+```
+function getFanoutStrategy(user):
+    followers = user.followers_count
+    if followers > SUPER_NODE_THRESHOLD (10000):
+        return "PULL"  // Super-node: pull mode
+    elif followers > HYBRID_MIN_THRESHOLD (1000):
+        return "HYBRID"  // Gray zone: batch push + poll
+    else:
+        return "PUSH"  // Regular user: push fan-out
+```
+
+### Three Modes in Practice
+
+**Push Mode (regular users):**
+- Standard fan-out-on-write: tweet ID pushed to all followers' timeline caches.
+- ~99% of tweets use this mode.
+- Average latency: < 100ms for 500 followers × 1ms/write = 500ms.
+
+**Pull Mode (super-nodes):**
+- Tweet written to DB only, no push fan-out.
+- Timeline query includes a "poll" query for celebrity feeds.
+- The celebrity feed is cached per-user with TTL (e.g., 1 minute).
+
+**Hybrid Mode (gray zone):**
+- Tweets are batched and pushed periodically (every N minutes or every K tweets).
+- If a user's timeline is slightly stale (minutes old), they may see the celebrity's latest tweets via a "poll" on top of the pushed timeline.
+- Balances write cost and read freshness.
+
+### Data Flow for Hybrid Fan-Out
+
+```mermaid
+sequenceDiagram
+    participant User as User (Author)
+    participant TweetSvc as Tweet Service
+    participant Queue as Kafka Queue
+    participant TimelineSvc as Timeline Service
+    participant Redis as Redis Cache
+    participant DB as Tweet DB
+    participant Client as Client
+
+    User->>TweetSvc: POST /tweets (new tweet)
+    TweetSvc->>TweetSvc: Validate content
+    TweetSvc->>DB: Store tweet
+    TweetSvc->>Queue: Publish TweetCreated event
+    TweetSvc-->>User: Return tweet ID
+
+    Queue->>TimelineSvc: Consume TweetCreated
+
+    TimelineSvc->>TimelineSvc: Check author follower count
+    alt followers < 1000 (Push)
+        TimelineSvc->>TimelineSvc: Fetch all followers
+        loop For each follower
+            TimelineSvc->>Redis: LPUSH tweet ID to timeline
+        end
+    else followers > 10000 (Pull)
+        TimelineSvc->>DB: Store in celebrity feed index
+    else 1000 &lt;= followers &lt;= 10000 (Hybrid)
+        TimelineSvc->>Queue: Batch (accumulate K tweets)
+        Note over TimelineSvc: Push on batch or timeout
+        TimelineSvc->>Redis: LPUSH batched tweet IDs
+    end
+
+    Client->>TimelineSvc: GET /feed/home
+    TimelineSvc->>Redis: LRANGE timeline
+    alt following super-nodes
+        TimelineSvc->>DB: Poll celebrity feeds
+    end
+    TimelineSvc->>TimelineSvc: Merge, sort, paginate
+    TimelineSvc-->>Client: Return timeline
+```
+
+### Capacity Analysis (Hybrid)
+
+**Assumptions:**
+- 500M tweets/day, 99% from users with < 1000 followers
+- Average 500 followers per regular user
+- 0.1% super-nodes with average 1M followers each
+
+**Push volume (regular tweets):**
+- 495M tweets/day × 500 avg followers = 247.5B timeline writes/day
+- 247.5B / 86400 seconds = ~2.86M Redis writes/sec
+- At 100K writes/sec per Redis node = ~29 Redis nodes for fan-out
+
+**Pull volume (super-node tweets):**
+- 5M tweets/day from super-nodes
+- 0 writes on fan-out. Just 1 DB write per tweet.
+
+**Hybrid zone:**
+- ~50K tweets/day in hybrid zone.
+- Batched every 5 minutes or 10 tweets → ~1.44M batch pushes/day.
+
+### Threshold Tuning
+
+The thresholds (1000 / 10000) should be tuned based on:
+1. **Redis capacity:** More push capacity → higher thresholds.
+2. **Read latency SLA:** Tighter SLA → more push (faster reads).
+3. **Follower distribution:** Analyze the actual distribution curve.
+4. **Cache hit rate:** Monitor Redis hit rate per threshold setting.
+
+---
+
+## Data Structures for Timeline Storage
+
+### Redis List (LRANGE / LPUSH)
+- **Type:** Doubly-linked list
+- **LPUSH:** O(1) — prepend tweet ID
+- **LRANGE:** O(M) — where M is the number of elements returned (not O(log N)); accessing contiguous list nodes is O(M) with a doubly-linked list under the hood
+- **Memory:** ~50 bytes per entry (tweet ID + metadata)
+- **Max per user:** 2000 entries (TRIM)
+
+### Alternative: Redis Sorted Set (ZADD)
+- **Type:** Sorted by timestamp
+- **ZADD:** O(log N) — slightly slower than LPUSH but allows deduplication
+- **Pros:** Automatically handles duplicate tweet IDs from retweets.
+- **Cons:** More memory per entry (~100 bytes), slower writes.
+
+### Recommendation: Redis List with deduplication on read
+- Use LPUSH for speed.
+- Deduplicate on read by maintaining a "seen tweet IDs" set per user (small TTL set).
+- This avoids the overhead of sorted sets while still handling duplicates.
+
+---
+
+## Capacity Planning
+
+### Redis Timeline Cache Cluster
+
+**Per-user timeline:**
+- 2000 tweets × 50 bytes = 100KB per user
+- 50M active users × 100KB = 5TB total timeline cache
+
+**Redis cluster sizing:**
+- 5TB across ~10 Redis nodes = 500GB per node (with replication, ~1TB total)
+- 3M total ops/sec (writes + reads) → ~300K ops/sec per node
+- Modern Redis can handle ~100K-200K ops/sec per core → ~2-3 cores per node
+
+### Tweet DB
+- 500M tweets/day × 200 bytes = 100GB/day
+- 3-year retention = ~110TB
+- Sharded across ~20 PostgreSQL nodes = ~5.5TB per node
+- With proper partitioning and indexing, feasible.
+
+### Kafka
+- Each tweet event: ~1KB → 500M events/day = 500GB/day throughput
+- 3 replicas = 1.5TB/day of replication traffic
+- ~6K messages/sec peak, 500MB/s bandwidth
+- 3-5 Kafka brokers with adequate storage.

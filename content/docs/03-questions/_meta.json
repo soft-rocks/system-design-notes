@@ -1,0 +1,142 @@
+{
+  "index": {
+    "title": "Questions",
+    "description": "Common questions"
+  },
+  "design-a-distributed-metrics-logging-and-aggregation-system": {
+    "title": "Distributed Metrics Logging",
+    "description": "Design a distributed metrics logging and aggregation system",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-a-distributed-queue-like-rabbitmq": {
+    "title": "Distributed Queue (RabbitMQ)",
+    "description": "Design a distributed message queue like RabbitMQ",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-a-url-shortening-service-like-tinyurl": {
+    "title": "URL Shortening Service",
+    "description": "Design a URL shortening service like TinyURL",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-a-pastebin-service": {
+    "title": "Pastebin Service",
+    "description": "Design a Pastebin-like service",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-instagram": {
+    "title": "Instagram",
+    "description": "Design a photo-sharing social media platform like Instagram",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-facebook-messenger-or-whatsapp": {
+    "title": "Messenger or WhatsApp",
+    "description": "Design a real-time messaging platform like Facebook Messenger or WhatsApp",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "design-a-key-value-store": {
+    "title": "Distributed Key-Value Store",
+    "description": "Design a distributed key-value store for high-throughput reads and writes",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives",
+      "06-deep-dives/01-storage-engine",
+      "06-deep-dives/02-consistent-hashing",
+      "06-deep-dives/03-raft-replication",
+      "06-deep-dives/04-consistency-models",
+      "06-deep-dives/05-compaction-strategies",
+      "06-deep-dives/06-auto-scaling"
+    ]
+  },
+  "design-a-distributed-stream-processing-system-like-kafka": {
+    "title": "Distributed Stream Processing (Kafka)",
+    "description": "Design a distributed stream processing system like Kafka",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives",
+      "06-deep-dives/01-replication-and-consistency",
+      "06-deep-dives/02-exactly-once-semantics",
+      "06-deep-dives/03-consumer-group-rebalancing",
+      "06-deep-dives/04-log-compaction",
+      "06-deep-dives/05-zero-copy-optimization",
+      "06-deep-dives/06-distributed-coordination"
+    ]
+  },
+  "design-dropbox-or-google-drive": {
+    "title": "Dropbox or Google Drive",
+    "description": "Design a cloud file storage and sync service like Dropbox or Google Drive",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives"
+    ]
+  },
+  "identify-the-k-most-shared-articles-in-various-time-windows-24-hours-1-hour-5-minutes": {
+    "title": "K Most Shared Articles in Various Time Windows",
+    "description": "Design a system to track and identify the most shared articles across sliding time windows",
+    "children": [
+      "01-requirements",
+      "02-core-entities",
+      "03-api-system-interface",
+      "04-data-flow",
+      "05-high-level-design",
+      "06-deep-dives",
+      "06-deep-dives/01-sliding-window-algorithms",
+      "06-deep-dives/02-approximate-counting",
+      "06-deep-dives/03-viral-spike-handling",
+      "06-deep-dives/04-memory-optimization"
+    ]
+  }
+}

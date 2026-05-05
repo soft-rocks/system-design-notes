@@ -1,0 +1,90 @@
+---
+title: Sharding & Data Placement
+description: Per-user sharding strategy, hot-key issues, and rebalancing
+---
+
+## Why Per-User Sharding
+
+This product has a natural partition: each file belongs to exactly one user. There are no cross-user joins on File or Version tables. This makes per-user sharding the simplest and most scalable choice.
+
+```mermaid
+flowchart TD
+    Proxy["Metadata Service\nRouting Layer / Proxy\nHash(userId) → Shard ID"]
+
+    subS["Shard Pool"]
+        S0["Shard 0 (node-01)\nRDS + Cache\nUser-A, User-F, User-K"]
+        S1["Shard 1 (node-02)\nRDS + Cache\nUser-B, User-G, User-C"]
+        S2["Shard 2 (node-03)\nRDS + Cache\nUser-L, ..."]
+        S_OTHER["..."]
+    end
+
+    Proxy --> S0
+    Proxy --> S1
+    Proxy --> S2
+    Proxy --> S_OTHER
+```
+
+## Sharding Key
+
+| Field | Value |
+|---|---|
+| Sharding key | `userId` (string, hashed with murmurhash3) |
+| Hash function | `hash(userId) % numShards` |
+| Number of shards | Start at 64, scale to 256+ as needed |
+| Rebalancing | Virtual buckets; move buckets, not individual rows |
+
+## Storage Service Sharding
+
+Each user's files map to the same shard for storage metadata:
+
+```
+Object key pattern: \{shardId\}/\{sha256_prefix\}/\{contentHash\}
+
+Example:
+  userId = "abc123", shardId = 7
+  ObjectRef: bucket="files-global", key="7/a3/f4e1b...c9d2"
+```
+
+- **Single global S3 bucket** with shard-prefixed keys.
+- No cross-shard object references — storage service is stateless and shard-aware.
+- S3 itself provides the durability and scale; sharding is only for metadata routing.
+
+## Hot Key Problem
+
+### Scenario: Shared viral file
+
+A file gets shared with millions of recipients. Every download hits the same object in storage and the same metadata row.
+
+**Mitigation:**
+
+1. **Storage tier is inherently distributed** — S3/GCS handles billions of requests transparently.
+2. **CDN for public links** — cache downloaded objects at edge nodes.
+3. **Permission cache** — Redis caches `\{fileId, permission\}` with TTL; avoids database lookup per request.
+4. **Metadata read replicas** — each shard has replicas; read traffic scales linearly.
+
+### Scenario: Large enterprise account (50K files)
+
+One user has dense access patterns. All their requests go to one shard.
+
+**Mitigation:**
+
+1. **Sub-sharding** — split a hot shard by `\{userId, prefix\}` if a single user dominates.
+2. **Read replicas** — sufficient replicas per shard to absorb peak load.
+3. **Caching** — hot metadata (folder trees, recent files) cached in Redis per shard.
+
+## Rebalancing Strategy
+
+Virtual buckets enable zero-downtime rebalancing:
+
+1. Divide hash space into **N virtual buckets** (e.g., 1024).
+2. Each bucket maps to one physical shard.
+3. To add a shard: move ~N/oldShardCount buckets to the new shard.
+4. Routing layer tracks bucket → shard mapping.
+5. **No data migration at application level** — only metadata routing changes. Storage data stays in S3 with shard-prefixed keys.
+
+## Data Isolation & Multi-Tenancy
+
+- Each shard's RDS instance is logically isolated by `userId` in all queries.
+- Application code always passes userId in request context.
+- No cross-shard queries — file operations for a single file stay on one shard.
+- Sharing introduces cross-user reads, but the recipient reads from their own shard; the owner's data is fetched via service call, not a DB join.

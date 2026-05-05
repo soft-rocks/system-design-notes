@@ -1,0 +1,115 @@
+---
+title: Monitoring & Observability
+description: Deep dive into monitoring and observability for the rate limiter
+---
+
+## Metrics to Track
+
+### Rate Limiter Service Metrics (exported to Prometheus)
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `rate_limit_checks_total` | Counter | `tier`, `window`, `allowed` | Total number of rate limit checks |
+| `rate_limit_check_duration_ms` | Histogram | — | p50/p95/p99 latency of a rate limit check |
+| `rate_limit_redis_errors_total` | Counter | — | Number of Redis connection/script errors |
+| `rate_limit_redis_latency_ms` | Histogram | `op` (script/read/write) | Redis operation latency |
+| `rate_limit_policy_cache_misses_total` | Counter | — | Policy cache misses (indicates stale or missing policies) |
+| `rate_limit_bucket_count` | Gauge | `tier` | Number of active buckets in Redis (client count) |
+
+### API Gateway Metrics (per-request)
+
+| Metric | Labels | Description |
+|---|---|---|
+| `http_requests_total` | `status`, `tier`, `rate_limited` | Total requests, tagged with rate limit status |
+| `api_rate_limit_hits_total` | `tier`, `endpoint` | 429 responses per tier and endpoint |
+
+### Business Metrics
+
+| Metric | Description |
+|---|---|
+| `rate_limit_hit_ratio` | Percentage of requests that hit rate limits (by tier) |
+| `rate_limit_over_limit_count` | How many tokens over the limit a client attempted (from logs) |
+| `unique_clients_rate_limited` | Number of distinct clients denied in the last N minutes |
+
+## Alerting Strategy
+
+| Alert | Condition | Severity | Action |
+|---|---|---|---|
+| **Rate limiter high error rate** | Redis error rate > 0.1% of checks over 1m | P1 | PagerDuty — check Redis health, failover if needed |
+| **Rate limiter latency spike** | p99 check latency > 5ms over 5m | P2 | Investigate Redis performance, check for long Lua scripts |
+| **High 429 ratio** | 429 response ratio > 5% of total over 5m | P2 | Check if policies need adjustment; investigate traffic spike |
+| **Policy cache miss rate high** | Cache miss rate > 10% over 5m | P3 | Check etcd health; policy propagation may be delayed |
+| **Bucket count anomaly** | Active buckets drops by > 20% over 10m | P2 | Check if Redis is losing keys (eviction, crash) |
+
+## Debugging Rate Limiting Issues
+
+### Common Issues and Diagnostics
+
+#### "My client is being rate limited but I shouldn't be"
+
+1. **Check all 4 windows**: A client might be within the per-second and per-minute limits but exceeding the per-day quota.
+   ```
+   GET /admin/clients/\{clientId\}/usage?window=day
+   ```
+
+2. **Check ClientScope**: The client might be hitting the rate limit from a different scope (e.g., a different IP address or user ID) that shares the same underlying account tier.
+
+3. **Check custom rules**: Custom per-endpoint rules in the policy may override tier defaults. Review `customRules` in the policy JSON.
+
+4. **Policy staleness**: The gateway's local policy cache might be stale (up to 30s). Check `rate_limit_policy_cache_misses_total` for anomalies.
+
+#### "429 ratio suddenly spiked"
+
+1. Check `api_rate_limit_hits_total` by tier — is it one tier or all tiers?
+2. Check `rate_limit_check_duration_ms` — if Redis latency spiked, the gateway might have timed out and returned 429 as a fallback.
+3. Review recent policy changes — was a tier's rate reduced?
+
+### Log Format
+
+Every rate limit decision is logged:
+```json
+{
+  "timestamp": "2026-05-02T10:30:00.123Z",
+  "client_id": "client-abc123",
+  "tier": "pro",
+  "scope_type": "API_KEY",
+  "scope_value": "key-xyz789",
+  "decision": "ALLOWED|DENIED",
+  "remaining_tokens": \{"second": 48, "minute": 2450, "hour": 98000, "day": 995000\},
+  "check_duration_ms": 0.6,
+  "redis_latency_ms": 0.3
+}
+```
+
+Denial logs include additional fields:
+```json
+{
+  "denied_window": "second",
+  "retry_after_ms": 1200,
+  "cost": 1,
+  "tokens_before": 0,
+  "tokens_after": 0
+}
+```
+
+## Audit Logging
+
+Rate-limited requests are logged to a separate audit sink (Kinesis / Kafka topic) for:
+- **Billing reconciliation**: Bill clients for their total request volume (including denied ones).
+- **Abuse detection**: Flag clients that are consistently at their limits (potential misconfiguration) or that attempt to circumvent limits (multiple API keys).
+- **Capacity planning**: Track historical rate limit hit ratios to identify clients who should be upgraded to higher tiers.
+
+Audit log schema:
+```json
+{
+  "event_type": "RATE_LIMITED",
+  "timestamp": "2026-05-02T10:30:00.123Z",
+  "client_id": "client-abc123",
+  "tier": "pro",
+  "endpoint": "/api/v1/data",
+  "denied_window": "second",
+  "retry_after_ms": 1200
+}
+```
+
+Volume: At a 5% 429 ratio over 5,000 QPS, that's 250 audit events/sec — ~21M events/day. With ~200 bytes per event, that's ~4GB/day. This is well within the capabilities of any modern streaming platform.

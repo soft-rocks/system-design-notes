@@ -1,0 +1,81 @@
+---
+title: Data Flow
+description: Produce, consume, ISR, rebalance, and compaction flows
+---
+
+## Produce Flow
+
+```
+Producer → Load Balance → Leader Broker → (async replicate) → Follower Brokers
+```
+
+1. Producer resolves the target topic-partition via metadata (cached; refreshed every 30s).
+2. If the leader for that partition is not the current node, the producer redirects (or the load balancer routes to the correct broker).
+3. Leader appends messages to its **local log segment** (sequential disk write) and assigns offsets.
+4. Leader sends AppendResponse back to producer with assigned offsets.
+5. Leader **async replicates** to all in-sync followers via AppendMessages RPC.
+6. If required_acks = ALL, leader waits for followers to acknowledge before responding to the producer.
+7. If required_acks = LEADER or NONE, the producer gets an immediate ack.
+
+### Partitioning Strategy
+
+When a message has a key, the partition is chosen as `hash(key) % numPartitions`. This ensures all messages for the same key land in the same partition, preserving order for that key.
+
+When no key is provided, messages are distributed **round-robin** across partitions.
+
+## Consume Flow
+
+```
+Consumer → Coordinator (group management) → Leader Broker → Fetch Request → Response
+```
+
+1. Consumer connects to the cluster (bootstrap brokers list).
+2. Consumer fetches metadata to find the leader for each partition it cares about.
+3. If in a consumer group:
+   a. Consumer joins the group by sending JoinGroup to the **group coordinator**.
+   b. Coordinator assigns partitions to group members (range or round-robin strategy).
+   c. Each consumer fetches from its assigned partitions only.
+4. Consumer sends FetchRequest with its committed offset.
+5. Leader returns messages starting at that offset.
+6. Consumer processes messages, then commits the new offset back to the offset log (or auto-commits).
+
+## ISR and Leader Election Flow
+
+```
+Follower → (heartbeat, Append) → Leader
+Leader detects follower lag → removes from ISR
+Leader crashes → controller triggers leader election
+```
+
+1. Followers continuously send AppendMessages (or FetchCommitted heartbeats) to the leader.
+2. Leader tracks each follower's log end offset. If a follower's offset falls behind by more than `max.in.flight.requests * max.message.size + replica.lag.time.ms * throughput`, the leader removes it from the ISR.
+3. When a leader crashes:
+   a. The **controller broker** (one broker elected as controller via leader election) detects the failure via session timeout.
+   b. Controller selects the in-sync replica with the **highest log end offset** as the new leader.
+   c. Controller updates partition metadata in ZooKeeper (or equivalent coordination store).
+   d. Producers and consumers refresh metadata and start talking to the new leader.
+4. The crashed broker, when it comes back, **resyncs** its log from the new leader — it catches up by reading the delta between its high watermark and the leader's log end offset.
+
+## Consumer Group Rebalance Flow
+
+```
+Consumer joins group → Coordinator detects join → Triggers rebalance → Assigns partitions → Consumers start fetching
+```
+
+1. A consumer sends JoinGroupRequest with its group ID.
+2. Coordinator collects joins from all group members (with a configurable timeout).
+3. Coordinator runs the **partition assigner** (range assigner: consecutive partitions per consumer; round-robin: even distribution).
+4. Coordinator sends SyncGroupResponse with the assignment to each member.
+5. Each member starts fetching from its assigned partitions.
+6. If a consumer crashes, the next heartbeat miss triggers another rebalance.
+
+## Log Compaction Flow
+
+```
+Background thread scans segment files → identifies duplicates by key → keeps only the latest value per key
+```
+
+1. Every `log.cleanup.interval.minutes`, a background thread scans completed (closed) log segments.
+2. For segments with cleanupPolicy = COMPACT, it builds a key → latest offset map.
+3. It retains only the last write per key; earlier duplicates are zeroed out.
+4. Compacted segments are merged and replaced with a cleaner version.

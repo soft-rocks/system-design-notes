@@ -1,0 +1,158 @@
+---
+title: Security
+description: Deep dive into threat model and defense-in-depth strategy for paste security.
+---
+
+### Security
+
+#### Challenge
+
+A pastebin service is an attractive target: keys provide full read/write access to paste content, keys are shared publicly (in URLs, chats, forums), and the service can be abused for hosting malicious content (phishing URLs, malware, exploit code). The threat model must cover:
+
+1. **Key enumeration attacks** — an attacker iterates through the key space to find valid pastes.
+2. **Supply chain attacks** — compromised paste content shared in developer workflows could inject malicious code or configs.
+3. **Data exposure** — misconfiguration or bugs that leak paste content to unauthorized parties.
+
+**Note on content abuse**: Content filtering (phishing detection, malware scanning, sensitive data patterns) is covered in the Content Moderation chapter (Section 13). This chapter focuses on transport security, input validation boundaries, key space security, API key authentication, XSS prevention, and data protection.
+
+**Critical insight**: Since keys are the sole access control and users share them publicly, we must assume every public paste key is known to the world. The security model is **security through obscurity** for individual pastes (anyone with the key has access) combined with **rate limiting and detection** to make enumeration infeasible.
+
+#### Solution: Defense-in-Depth Across Seven Layers
+
+**1. Transport Security**
+
+| Control | Implementation |
+|---------|----------------|
+| TLS | 1.3+ enforced; HTTP → HTTPS redirect; HSTS header (`max-age=31536000; includeSubDomains`) |
+| Certificate | Wildcard cert (`*.pastebin.com`) via Let's Encrypt / ACM; auto-renewal |
+| Cipher suite | ECDHE + AES-256-GCM or ChaCha20-Poly1305; disable weak ciphers and legacy protocols (SSLv3, TLS 1.0/1.1) |
+| Key exchange | X25519 for forward secrecy |
+
+**2. Input Validation — Paste Content**
+
+```python
+def validate_paste(content: str) -> ValidationResult:
+    # Size check
+    if len(content.encode("utf-8")) > 64 * 1024:
+        return fail("Content exceeds 64KB limit")
+
+    # Encoding check
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        return fail("Only UTF-8 content is accepted")
+
+    # Null byte rejection (before strip to avoid double-encoding issues)
+    if "\x00" in content:
+        return fail("Null bytes not allowed")
+
+    return ok(content)
+```
+
+- **64KB limit**: Prevents abuse as a file-sharing service and controls storage costs.
+- **UTF-8 only**: Prevents encoding attacks that could bypass filters or corrupt downstream systems.
+- **Null byte rejection**: Prevents string truncation attacks in languages that use null-terminated strings.
+- **No file uploads**: Only text content. Prevents binary/malware delivery.
+
+**3. Key Space Security**
+
+| Attack Vector | Defense |
+|---------------|---------|
+| Enumeration via sequential keys | CSPRNG generation — keys are unpredictable, not sequential |
+| Brute-force key guessing | 1.1T key space; at 20 req/min rate limit, attacker tries ~1,200 keys/hour. Probability of guessing a valid key for any specific paste: ~1/1.1T per attempt |
+| Custom key collisions | Reserved word list prevents path conflicts; custom keys validated against `[a-z2-7]` only |
+| Cookie-tossing (iterating through keys) | Rate-limited to 20 req/min per IP; large-scale iteration returns 429 Too Many Requests |
+
+**4. API Key Security**
+
+```
+API Key format: sk_live_<base62_encoded_random>
+  - sk_live_ prefix identifies live keys
+  - sk_test_ prefix identifies sandbox keys
+  - <base62_encoded_random> is 32 bytes of CSPRNG → 52+ base62 characters
+
+Key lifecycle:
+  - Created: stored as HMAC-SHA256 hash in DB (never store plaintext)
+  - Used: presented in Authorization: Bearer <key> header
+  - Verified: API Gateway computes HMAC with master secret, constant-time compare
+  - Rotated: 90-day rotation enforced; old keys continue to work until replaced
+  - Revoked: immediate invalidation; user must obtain a new API key for API access. Existing pastes remain accessible via their paste keys (API key does not control paste access — only rate limits and quotas).
+```
+
+- **HMAC-SHA256**: API keys are never stored in plaintext. Verification uses `hmac.compare_digest()` for constant-time comparison (~0.1ms vs ~300ms for bcrypt). Key rotation is handled by storing multiple active HMAC values keyed by version ID. Indexed lookup uses a hash-prefix of the random portion (not the constant `sk_live_` prefix) to avoid full-table scans.
+- **90-day rotation**: Enforced via API response warning 30 days before expiry, 422 Unprocessable Entity at expiry.
+- **Key scope**: API keys only affect rate limits and read quotas — they do not provide paste ownership. A paste is owned by its key (the short key), not by an API key.
+
+**5. XSS Prevention for Rendered Content**
+
+When paste content is rendered in a browser (e.g., `/p/\{key\}` in HTML):
+
+| Technique | Implementation |
+|-----------|----------------|
+| Content-Type | `text/plain; charset=utf-8` — never `text/html` |
+| HTML escaping | All `<`, `>`, `&`, `"`, `'` escaped in server-rendered views |
+| CSP headers | `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` |
+| X-Frame-Options | `DENY` — prevents clickjacking |
+| X-Content-Type-Options | `nosniff` — prevents browser MIME sniffing |
+
+```http
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: inline; charset=utf-8
+Content-Security-Policy: default-src 'none'
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Cache-Control: public, max-age=3600
+```
+
+**6. CORS Headers**
+
+Since pastes are rendered in browsers (including JavaScript-based viewers), CORS must be explicitly configured:
+
+| Header | Value | Rationale |
+|--------|-------|-----------|
+| `Access-Control-Allow-Origin` | `*` for public pastes, exact origin for private pastes | Public pastes are embeddable; private pastes restrict to the admin dashboard origin |
+| `Access-Control-Allow-Methods` | `GET` | Only read operations need CORS; writes use traditional auth |
+| `Access-Control-Allow-Headers` | `Authorization` | Allow authenticated reads from browser apps |
+| `Access-Control-Expose-Headers` | X-RateLimit-Limit, X-RateLimit-Remaining | Allow client JS to surface rate limit info |
+| `Access-Control-Max-Age` | `86400` | Preflight cache for 24h |
+
+`private` pastes: `Access-Control-Allow-Origin` should **never** be `*`. If a browser-based admin panel reads private pastes, use the exact origin. If no browser consumer exists for private pastes, omit CORS entirely.
+
+**7. Data Protection**
+
+| Layer | Implementation |
+|-------|----------------|
+| Data at rest (object storage) | S3 server-side encryption (AES-256 / SSE-S3) |
+| Data at rest (PostgreSQL) | Encryption at rest via RDS encryption (AES-256) |
+| Data at rest (Redis) | TLS in transit; RDB in memory is not encrypted (acceptable for paste metadata) |
+| Backups | Encrypted backups to S3 with KMS-managed keys |
+
+**8. Incident Response**
+
+| Scenario | Response |
+|----------|----------|
+| Key compromise (paste key guessed/leaked) | Paste key is public by design; no "compromise" — the owner can delete and recreate |
+| Data breach (paste content leaked) | Assess scope; if content is public (by design), the breach is limited to access pattern metadata; rotate API keys if API keys were compromised |
+| Supply chain attack (compromised paste shared widely) | Rapid purge: `DELETE /api/v1/pastes/\{key\}`; CDN purge; notify affected consumers if possible |
+| DDoS attack | Cloudflare absorbs traffic; enable "Under Attack" mode (JS challenge); scale origin horizontally |
+
+**9. Security Monitoring**
+
+| Metric | Alert |
+|--------|-------|
+| 404 rate spike | Possible enumeration attack |
+| Single paste > 10K reads/min | Viral paste or abuse; auto-quarantine flag |
+| New API key creation rate > 10/min | Possible automated abuse |
+| Upload size anomalies | Users testing size limits or encoding attacks |
+| Rate limit hit rate > 5% | Possible abuse or misconfiguration |
+
+**10. Threat Model Summary**
+
+| Threat | Likelihood | Impact | Mitigation |
+|--------|-----------|--------|------------|
+| Key enumeration | Low (1.1T space) | Low (rate limited) | CSPRNG + rate limiting |
+| XSS via paste content | Low (text/plain) | Medium | CSP + X-Frame-Options + no-html content-type |
+| API key theft | Medium | Medium (rate limit bypass) | HMAC-SHA256 + 90-day rotation |
+| Data leak (private paste via CDN) | Low | High | Cache bypass rules + origin-only routing |
+
+**See Also**: [Content Moderation](../13-content-moderation) — content filtering, phishing detection, and abuse detection; [Rate Limiting](../9-rate-limiting) — DDoS protection, sliding window enforcement.

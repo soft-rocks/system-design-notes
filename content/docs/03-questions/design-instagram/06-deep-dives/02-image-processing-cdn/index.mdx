@@ -1,0 +1,52 @@
+---
+title: Image Processing & CDN
+description: Deep dive into the image processing pipeline, derivative generation, S3 storage strategy, and CloudFront CDN delivery.
+---
+
+## Derivative Generation
+
+| Derivative | Resolution | Use Case | Avg File Size |
+| --- | --- | --- | --- |
+| original | As-captured | Full-resolution viewer, download | ~2MB |
+| large | 1080px wide | Feed display (mobile) | ~300KB |
+| small | 320px wide | Profile grid, preview | ~50KB |
+| thumb | 150px wide | Thumbnail, loading skeleton | ~10KB |
+
+**Pipeline:** Download from S3 → decode (JPEG/PNG/HEIC/WebP) → EXIF orientation correction → resize → re-encode (quality 80 WebP or JPEG) → upload to CDN source bucket → write `PhotoDerivative` metadata.
+
+**Worker scale:** ~5 seconds per image × 50M uploads/day = ~580 concurrent workers minimum. Run ~2000 for headroom.
+
+## Storage Strategy
+
+S3 organization: `s3://instagram-media/\{year\}/\{month\}/\{day\}/\{photo_id\}_\{resolution\}.jpg`
+
+**Lifecycle policies:**
+- HEIC originals converted and deleted within 24 hours
+- Originals moved to S3 Glacier after 90 days (5–12 hour retrieval)
+- Derivatives always in S3 Standard
+- Cross-region replication for 11-nines durability
+
+## CDN Delivery
+
+CloudFront with S3 origin. Key decisions:
+
+- **Cache-Control:** 24-hour `max-age` for immutable derivatives
+- **Signed URLs:** Used only for private account images (5-minute TTL, signed by Auth Service)
+- **Origin shield:** Single CloudFront edge per region deduplicates cache misses
+- **Cache hit ratio:** >95% for popular images (top 10% of photos → 80% of views)
+- **Bandwidth savings:** Derivatives reduce average download size by ~90% (~9TB/day saved)
+
+## Adaptive Quality
+
+The client reports its network type in HTTP headers. The API returns appropriate derivative URLs:
+
+| Network | Returned Derivatives |
+| --- | --- |
+| WiFi | large + original |
+| 4G | large |
+| 3G | small |
+| Slow 3G | thumb only (lazy-load on tap) |
+
+**Progressive JPEGs** render a low-quality version in ~200ms and sharpen as more data arrives.
+
+**WebP derivatives** are served to clients with `Accept: image/webp`, achieving 25–35% additional size reduction over JPEG.

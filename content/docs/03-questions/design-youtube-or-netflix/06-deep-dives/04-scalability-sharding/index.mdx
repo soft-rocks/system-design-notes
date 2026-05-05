@@ -1,0 +1,91 @@
+---
+title: Scalability & Sharding Strategy
+description: Deep dive into data sharding and scaling strategies
+---
+
+## Database Sharding Strategy
+
+**Problem**: Primary DB handles 2M+ read QPS + 42 write QPS. Single instance hits WAL/lock contention at ~50K writes/sec. Sharding distributes load.
+
+**Sharding key**: `videoId` (hash-based)
+```
+shard_id = hash(videoId) % NUM_SHARDS
+```
+
+**Why videoId, not userId?**
+- Video metadata is the dominant read pattern (95% of queries are video-specific)
+- User profile queries (subscriptions, playlists) are fan-out reads — acceptable to fan-out across shards via a user-shard index table
+- Video-centric access pattern aligns with the 100K:1 read:write ratio
+
+**Shard topology:**
+- Initial: 64 shards → 4 DB nodes, each hosting 16 shards (primary + replica)
+- Scale: 256 shards → 32 DB nodes, each hosting 8 shards
+- Growth: add nodes, redistribute shards via consistent hashing ring
+
+**Shard rebalancing (consistent hashing):**
+- Hash ring positions: virtual nodes (150 per physical node)
+- Add/remove node: only 1/N of keys move (N = shard count), minimizing disruption
+- Rebalancing runs during maintenance window, migrates ~5GB/hour per shard
+
+**Failover:**
+- Each shard has an automatic replica in a different AZ
+- Patroni (PostgreSQL HA) manages failover: &lt;30s RTO
+- Read replicas per shard: 3 replicas for hot shards, 1 for cold shards
+
+## Redis Cache Architecture
+
+**Cache coverage targets:**
+- Hot data (top 1% videos): 100% cache hit rate → ~1M videos cached
+- Warm data (next 9%): ~90% hit rate → ~9M videos
+- Cold data (long tail): ~0% hit rate → direct DB fallback
+
+**Cluster topology:**
+- 96 Redis nodes in 3 availability zones (32 nodes/AZ)
+- Keys sharded by `videoId` hash across 96 hash slots (Redis Cluster mode)
+- Memory per node: ~64GB → total ~6TB raw cache capacity
+- After overhead: ~4TB usable for video metadata (~200KB avg per video with variants)
+
+**Write strategy (cache-aside):**
+```
+Read:  Redis GET → miss → DB SELECT → Redis SET (TTL) → return
+Write: DB UPDATE → Redis SET → return
+```
+- No write-through (adds latency to write path, not worth it for metadata writes)
+- TTL-based expiration: 5 minutes for hot videos, 1 hour for warm, no TTL for cold
+- Cache stampede protection: use Redis SET NX with expiry (single-writer eviction for same key)
+
+**Eviction policy:**
+- LFU (Least Frequently Used) with approximate counting — better than LRU for video platforms where view counts correlate with long-term popularity
+- Max memory: 85% — triggers eviction when approaching limit
+
+## Multi-Region Deployment
+
+**Active-active across 3 regions** (US-East, EU-West, APAC-Southeast):
+
+```
+     DNS (Geo-aware)
+    /       |        \
+  US-East  EU-West  APAC
+```
+
+**Data replication:**
+- Primary DB: async replication to secondary regions (RPO ~1-5 seconds, acceptable for metadata)
+- Redis: no cross-region replication (too expensive for 4TB). Each region has its own hot cache.
+- Object storage: S3 cross-region replication (async, RPO ~minutes)
+- Kafka: MirrorMaker 2 replicates topics across regions for analytics continuity
+
+**Traffic routing:**
+- DNS-level geo-routing: users in APAC get routed to APAC region
+- Regional isolation: each region is fully self-sufficient for video playback
+- Cross-region sync only needed for: new video availability (S3 replication), user profile (DB replication)
+
+**Disaster recovery:**
+- RTO: 15 minutes (failover to second region)
+- RPO: 5 minutes (async DB replication lag)
+- Region health checks every 10 seconds from a dedicated health service
+- Automatic traffic cutover if primary region fails 3 consecutive health checks
+
+**Cost optimization:**
+- Cache only hot data per region (reduces memory cost 90% vs caching everything)
+- Cross-region S3 replication for active regions only; pause for cold storage archival
+- Use spot instances for transcoder workers (70% cost savings, tolerate preemption via Kafka retry)

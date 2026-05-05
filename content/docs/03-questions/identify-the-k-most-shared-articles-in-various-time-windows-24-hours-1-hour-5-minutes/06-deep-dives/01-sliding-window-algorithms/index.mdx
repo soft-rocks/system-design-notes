@@ -1,0 +1,125 @@
+---
+title: "Sliding Window Algorithms"
+description: "Algorithmic approach for computing exact top-K across multiple sliding time windows"
+---
+
+## The Problem: Exact Top-K Over Sliding Windows
+
+A "tumbling window" (fixed 5-minute buckets) is trivial: count events per bucket, pick top-K. But a **sliding window** means a query at 10:30:00 about the last 5 minutes covers 10:25:00–10:30:00, while a query at 10:30:30 covers 10:25:30–10:30:30. The window boundary moves continuously.
+
+We need an approach that:
+- Supports multiple window sizes (5m, 1hr, 24hr) from the **same data**
+- Gives **exact** counts (approximations are acceptable only as optimization)
+- Answers queries in < 100ms p99
+
+## Hierarchical Bucketing
+
+The key insight: use **different granularities** for different window sizes, all fed from the same raw event stream.
+
+```
+Raw events (per article_id):
+  ┌────────┬───────────┐  Bucket: [10:25:00 - 10:25:10)
+  │ art_1  │ count=12  │  Bucket: [10:25:10 - 10:25:20)
+  └────────┴───────────┘  Bucket: [10:25:20 - 10:25:30)
+                           ...
+
+5-minute window (10s granularity, 30 buckets):
+  [10s bucket × 30] → sum for window count
+
+1-hour window (1min granularity, 60 buckets):
+  [1min bucket × 60] → sum for window count
+
+24-hour window (10min granularity, 144 buckets):
+  [10min bucket × 144] → sum for window count
+```
+
+### Why not use the same granularity for all windows?
+
+If we used 10-second buckets for all windows:
+- 24-hour window = 8,640 buckets per article → **prohibitive scan** per query
+- Query latency would be ~100x worse for 24hr vs 5min
+
+If we used 10-minute buckets for all windows:
+- 5-minute window = 0.5 buckets → **cannot compute** sliding window at all
+
+**Solution**: different granularities, same events. Each event contributes to all three granularity layers simultaneously.
+
+## Min-Heap Top-K Algorithm
+
+For a given window, we need to find the top K articles across all buckets. The algorithm:
+
+```python
+def get_top_k(article_ids, bucket_keys, K, granularity):
+    """
+    article_ids: list of all active article IDs (~100K)
+    bucket_keys: list of Redis bucket keys for this window (30/60/144 keys)
+    K: number of results to return
+    granularity: 5m / 1h / 24h
+    """
+    # Step 1: Pipeline MGET all counters
+    counters = redis.pipeline_mget(bucket_keys)  # O(1) round-trip
+
+    # Step 2: Sum counts per article across buckets
+    article_totals = defaultdict(int)
+    for bucket_key, count in counters.items():
+        article_id = parse_article_id(bucket_key)
+        article_totals[article_id] += count
+
+    # Step 3: Min-heap of size K
+    min_heap = []  # (count, article_id) — smallest at top
+    for article_id, count in article_totals.items():
+        if count == 0:
+            continue
+        if len(min_heap) < K:
+            heapq.heappush(min_heap, (count, article_id))
+        elif count > min_heap[0][0]:
+            heapq.heapreplace(min_heap, (count, article_id))
+
+    # Step 4: Sort descending
+    result = sorted(min_heap, reverse=True)  # O(K log K)
+    return result
+```
+
+**Complexity**: O(n) to scan all article totals + O(K log K) to sort result.
+With n = 100K articles and K = 100: the heap scan dominates, taking ~10ms in Redis pipeline + < 1ms in CPU.
+
+## Handling Partial Buckets at Window Edges
+
+The first and last buckets in a window are **partial** — they don't contain a full bucket worth of time. For example, if the current time is 10:30:30 and we query the last 5 minutes:
+- The first bucket (10:25:00–10:25:10) is **full** ✓
+- The last bucket (10:30:00–10:30:10) is **partial** — only 30 seconds have passed
+
+**Option A: Use proportional weights**
+
+```
+partial_ratio = (current_time - bucket_start) / bucket_duration
+effective_count = actual_count * partial_ratio  ← WRONG
+```
+
+This is **incorrect** because we're counting shares that already happened, not projecting future shares. We should use the actual count, not a weighted one.
+
+**Option B: Accept slight inaccuracy**
+
+The 5-minute window query at 10:30:30 naturally includes 0–9 seconds from the last bucket. This introduces < 0.2% error (9 seconds out of 300 seconds) — negligible for trending use cases.
+
+**Option C: Use variable-sized first/last buckets**
+
+Track the exact window boundary per query. For a query at 10:30:30 about the last 5 minutes:
+- Window spans 10:25:30–10:30:30
+- First bucket is 10:25:30–10:25:40 (partial, 10 seconds)
+- Middle buckets are full
+- Last bucket is 10:30:30–10:30:40 (partial, not yet started)
+
+This requires **variable bucket granularity** (1-second precision near boundaries). It's more complex but gives exact counts. In practice, Option B is used.
+
+## Why Not the Space-Saving Algorithm?
+
+The **Space-Saving** algorithm (Metwally et al., 2005) is a streaming algorithm for top-K that uses O(K) memory. It works like this:
+1. Maintain a hash table of size K.
+2. For each incoming event: if article_id is in the table, increment its counter. If not, evict the article with the smallest counter.
+3. The top-K articles are those with the highest counters.
+
+This is elegant but has limitations:
+- **No window support**: Space-Saving is designed for infinite streams, not sliding windows. You'd need K copies (one per bucket), defeating the memory savings.
+- **Overcount errors**: Evicted articles that reappear get reset to zero, causing undercount.
+- **Our approach is simpler**: With 100K active articles × 234 buckets × 100 bytes = ~2.3GB total, Redis handles this comfortably.

@@ -1,0 +1,71 @@
+---
+title: Recurrence Engine
+description: Master + exception storage model, expansion algorithm, exception handling, and edge cases for recurring events.
+---
+
+## Master + Exception Storage Model
+
+Master event stores: `id`, `recurring_event_id` (null for non-recurring), `rrule` (text), `max_instances` (default 365), `created_at`, `updated_at`
+
+Exception rows: `id` (UUIDv7), `recurring_event_id` (FK to master), `original_start_time` (UTC timestamp), `patch` (JSONB: fields to override)
+
+No pre-materialized occurrences stored — expansion is computed at read time.
+
+**Storage savings:** For a daily event for 5 years: 1 master + 0 exceptions vs 1,825 occurrence rows = 99.9% storage savings.
+
+## Expansion Algorithm
+
+```
+function ExpandRecurrence(master, timeMin, timeMax):
+  rules = parse_rrule(master.rrule)
+  occurrences = []
+  dt = master.start
+
+  while dt < timeMax and occurrences.count < max_instances:
+    if dt &gt;= timeMin:
+      occurrences.append({
+        id: master.id,
+        start: dt,
+        end: dt + (master.end - master.start),
+        recurringEventId: master.recurringEventId,
+        originalStartTime: dt,
+        isException: false
+      })
+    dt = rules.next(dt)
+
+  # Apply exceptions
+  exceptions = get_exceptions(master.recurringEventId, timeMin, timeMax)
+  for exc in exceptions:
+    replace(occurrences, exc.originalStartTime, {
+      ...occurrences matching exc.originalStartTime,
+      ...exc.patch (fields overridden)
+    })
+
+  return sort_by(occurrences, start)
+```
+
+- `rules.next(dt)`: RFC 5545 compliant iterator — handles month-end rollover, leap years, DST transitions
+- Complexity: O(M) where M = number of occurrences in window (worst case: 62 days for FREQ=DAILY)
+- `max_instances` cap prevents runaway expansion from malicious rules
+
+## Exception Handling
+
+- Lookup: `SELECT * FROM exceptions WHERE recurring_event_id=? AND start BETWEEN timeMin AND timeMax`
+- Matching: by `original_start_time` (UTC) — timezone-agnostic comparison
+- Patch: JSONB merge with shallow override (attendees, reminders not merged — full replacement)
+- Delete: soft-delete (`status=cancelled`) — preserves history for audit
+
+## Performance Optimization
+
+- **Expansion cache:** `recurrence:expanded:\{recurringEventId\}:\{timeMin\}:\{timeMax\}` in Redis, TTL=60s
+  - Invalidated on exception create/update/delete
+- **Batch expansion:** calendar view loads group recurring events → single expand call per calendar
+- **Async pre-warm:** for popular shared calendars, pre-expand next week's recurrences on a schedule
+
+## Edge Cases
+
+- **DST:** RRULE uses `TZID` property; expansion applies timezone rules at each occurrence
+  - "9am PT every Monday" → 8am during PST, 9am during PDT (wall clock stays 9am)
+  - Implementation: store `start`/`end` in UTC; parse `TZID` from master; use `dateutil.rrule` or equivalent
+- **Month-end:** "last Friday of every month" → handles February, leap years
+- **Cancellation:** recurring event cancelled with `status=cancelled` → all future occurrences hidden; past preserved

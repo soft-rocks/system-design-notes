@@ -1,0 +1,30 @@
+---
+title: Core Entities
+description: Core entities for distributed key-value store
+---
+
+## Core Entity Definitions
+
+- **Node**: A server process that stores a subset of key-value pairs and communicates with other nodes via gRPC/TCP.
+- **Partition**: A contiguous range of hash space. Each partition is assigned to exactly one leader node and replicated to f followers. With 2^32 partitions spread across 100 nodes, each node handles ~40K partitions.
+- **Key-Value Pair**: An entry consisting of a string key, binary value, and optional metadata (TTL, version vector, last-modified timestamp).
+- **Mutation Log**: Append-only write-ahead log (WAL) per partition, used for crash recovery and replication. Each entry is a mutation (set, delete, or TTL update).
+- **SSTable (Sorted String Table)**: Immutable, sorted on-disk data structure containing key-value pairs indexed by key hash. Produced when the in-memory memtable reaches a size threshold (typically 64MB).
+- **Bloom Filter**: Probabilistic data structure per SSTable for quickly determining if a key exists in that file. False positives are possible; false negatives are not. Typically 1% false positive rate, 8 bytes per key.
+- **Index Block**: In-memory hash map from key hash to file offset within the SSTable. Loaded at SSTable creation time. O(1) average lookup.
+- **Raft Group**: A set of nodes replicating a single partition's mutation log via the Raft consensus protocol. Typically 3 or 5 nodes per group.
+
+## Entity Relationships
+
+A **Node** hosts multiple **Partitions** (100-1000 per node in production). Each **Partition** has one **Leader** node that serves all client reads and writes, and multiple **Follower** nodes that replicate the data. **Partitions** are mapped from keys via consistent hashing of the key hash.
+
+The **Node** writes mutations to its local **Mutation Log** (WAL with fsync), then applies them to the in-memory memtable. The leader replicates mutations to followers via the **Raft Group** protocol. When the memtable reaches its size threshold, it is flushed as an immutable **SSTable** file on disk. Each SSTable gets its own **Index Block** and **Bloom Filter** in memory.
+
+**Background compaction** merges multiple SSTable files into fewer, larger files, removing expired entries and tombstones in the process.
+
+## Key Design Decisions
+
+- **Hash-based partitioning over range-based**: Avoids hotspotting on sequential keys and enables true parallel reads across all nodes. Range scans require a secondary prefix index.
+- **Raft over primary-replica replication**: Raft provides linearizable consistency, automatic leader election, and split-brain protection without an external coordination service.
+- **LSM-Tree over B-Tree storage**: LSM-Tree optimizes for write-heavy workloads with sequential disk writes, amortized O(1) write amplification, and background compaction that does not block reads.
+- **Eventual consistency with optional strong reads**: Most applications tolerate eventual consistency for reads, reducing read latency. Strong consistency is available for critical operations via the `linearizable` flag.

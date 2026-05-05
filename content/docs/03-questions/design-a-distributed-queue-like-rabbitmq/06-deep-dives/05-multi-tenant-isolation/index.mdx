@@ -1,0 +1,71 @@
+---
+title: Multi-Tenant Isolation
+description: Virtual hosts, permissions model, authentication, resource isolation, deployment strategies, and security.
+---
+
+## Virtual Host (vhost)
+
+Logical namespace isolation within a single broker node.
+
+Each vhost has independent:
+- Exchanges, queues, bindings
+- Users and permissions
+- Queue message sets (no cross-vhost visibility)
+
+**Isolation guarantees:** publisher in vhost A cannot reach exchange in vhost B; management API scoped to vhost.
+
+**Resource sharing:** all vhosts share broker processes, memory, disk, network. No hard resource limit per vhost. Soft isolation — not suitable for untrusted tenants.
+
+## Permissions Model
+
+| Permission | Description |
+|-----------|-------------|
+| **configure** | Declare/delete exchanges, queues, bindings |
+| **write** | Publish messages to exchanges |
+| **read** | Consume from queues; access messages |
+
+**Authorization flow:**
+1. User authenticates (PLAIN, SCRAM-SHA256, AMQPLAIN)
+2. User → vhost mapping validated
+3. For each operation: check permission bit for vhost
+   - Publish: requires `write` on source exchange
+   - Consume: requires `read` on destination queue
+   - Declare: requires `configure` on resource
+
+Guest user: `guest`/`guest` with full access to `/` vhost; disabled by default.
+
+## User Authentication
+
+| Mechanism | Description |
+|-----------|-------------|
+| PLAIN | Username/password |
+| SCRAM-SHA256 | Salted hash |
+| AMQPLAIN | Legacy |
+| External | X.509 TLS client certificates (mTLS) |
+| LDAP | User lookup + password via LDAP; local roles |
+| OAuth 2.0 | Access token validated at connection time |
+
+## Resource Isolation & Limits
+
+RabbitMQ does not support hard resource limits per vhost natively.
+
+**Workarounds:**
+- Separate broker nodes per vhost group (one node per tenant)
+- External rate limiting via management plugin + policy
+- Queue-level limits: `x-max-length`, `x-max-length-bytes` (per-queue, not per-vhost)
+
+## Multi-Tenant Deployment Strategies
+
+| Strategy | Isolation | Cost | Best For |
+|----------|-----------|------|----------|
+| Single broker, multiple vhosts | Soft (namespace only) | Lowest | Internal teams |
+| One broker per vhost | Hard (process isolation) | Medium | Untrusted tenants |
+| Clusters, vhosts per AZ | Hard (node per group) | Highest | Enterprise SaaS |
+| Containerized brokers | Hard (container) | Medium-High | Kubernetes |
+
+## Security Considerations
+
+- **Cross-vhost attacks:** impossible at protocol level; DoS possible via resource exhaustion
+- **Message leakage:** impossible — no cross-vhost routing
+- **TLS:** required for all connections in multi-tenant setups
+- **Audit logging:** track all vhost operations for compliance

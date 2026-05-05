@@ -1,0 +1,22 @@
+{
+  "index": {
+    "title": "Basic Concept",
+    "description": "Fundamental concepts"
+  },
+  "b-tree-plus": {
+    "title": "B-Tree Plus",
+    "description": "B-Tree Plus is an optimized variant of the B-Tree that uses a linked-list structure to improve range query performance."
+  },
+  "idempotency-key": {
+    "title": "Idempotency Key",
+    "description": "Guarantees duplicate requests produce exactly one effect on the server"
+  },
+  "lsm-tree": {
+    "title": "LSM Tree",
+    "description": "Log-Structured Merge-Tree"
+  },
+  "time-series-databases": {
+    "title": "Time Series Databases",
+    "description": "Storage architectures optimized for time-series data — columnar storage, chunked hypertables, and LSM-tree compaction for reads, writes, and bulk deletes."
+  }
+}

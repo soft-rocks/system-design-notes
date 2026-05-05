@@ -1,0 +1,89 @@
+---
+title: Requirements
+description: Functional requirements, non-functional requirements, and scale assumptions for an A/B testing system.
+---
+
+## Functional Requirements
+
+### User Experiment Creation
+Users can create experiments with multiple variants (typically control + 2–4 treatments), define traffic allocation ratios (e.g., 50% control, 25% variant A, 25% variant B), set start/end dates, and pause/resume at will. Each experiment has a unique ID and a configurable name for tracking.
+
+### Audience Targeting
+Experiments can target specific user segments based on criteria such as demographics (region, language), behavior (new vs. returning users, purchase history), device type, app version, or custom attributes. Only users matching the targeting criteria enter the assignment pool.
+
+### Assignment Engine
+The core of the system: deterministically assign each qualifying user to a variant. The algorithm must be consistent — the same user always gets the same variant for the duration of the experiment, regardless of which service or device they use. This is typically done via a hash function (e.g., `hash(user_id, experiment_id) % bucket_size`) mapped to traffic segments.
+
+### Real-Time Feature Variation
+Once assigned, the client SDK receives the variant configuration with very low latency. The system must serve assignment decisions at **< 10ms p99** for a smooth user experience. This is achieved through distributed caches close to the client.
+
+### Event Tracking
+Users (experiment creators) define custom events to track (e.g., `page_view`, `button_click`, `purchase_completed`). The SDK collects these events and tags them with the assigned variant ID. The system aggregates events per variant to compute metrics.
+
+### Statistical Analysis
+For each experiment, the system computes per-variant metrics: conversion rate, mean revenue per user, session duration, etc. It must provide:
+- **Confidence intervals** (e.g., 95% CI)
+- **P-values** with proper multiple-comparison correction (e.g., Bonferroni or Benjamini-Hochberg)
+- **Statistical significance** determination
+- **Sequential testing** support with proper alpha-spending functions
+
+### Stopping & Rolling
+The system must support:
+- **Manual stop**: Experiment owners can stop any experiment.
+- **Auto-stop**: Based on significance thresholds (e.g., p < 0.05 for winner) or guardrail metrics (e.g., no degradation in core KPIs).
+- **Rollout**: Gradually increase traffic to a winning variant.
+- **Rollback**: Immediately switch all traffic back to control.
+
+### Feature Flag Support
+Beyond full A/B tests, the system must support simple on/off feature flags. Flags allow gradual feature rollouts without running experiments — just a boolean or percentage toggle that can be changed without a code deployment.
+
+### Experiment Reporting
+Dashboards showing real-time results per experiment: metric charts, variant comparisons, segment-level breakdowns (by region, device, etc.), and confidence metrics. Export capabilities for further analysis.
+
+### QA Mode
+Experiment creators and testers can opt into a specific variant for manual testing. This is done via a URL parameter or SDK flag that overrides the normal assignment logic.
+
+## Non-Functional Requirements
+
+### Scalability
+- **Assignment decisions**: Serve 100M+ DAU at < 10ms p99. Each decision is a lightweight hash + cache lookup.
+- **Event ingestion**: Handle 500K+ events/sec peak, with buffering and batching for efficient writes.
+
+### Consistency
+User-variant assignment must be globally consistent. If a user opens the app on mobile and desktop, they must see the same variant. This is ensured by a deterministic hash function keyed on `user_id + experiment_id`.
+
+### Availability
+99.99% uptime for the assignment and flag-serving path. The system must never block core product functionality — if the experiment service is down, users default to control (or a pre-configured fallback).
+
+### Low Client Impact
+- SDK must be lightweight (< 50KB gzipped)
+- Async event reporting with local queue
+- Offline cache: events are stored locally when network is unavailable and flushed when connectivity returns
+- Variant cache: users cache their assignment for the experiment duration
+
+### Data Integrity
+- No loss of event data during normal operations
+- Exactly-once or at-least-once collection with deduplication at ingestion time
+- Audit logs for all experiment changes (who changed what, when)
+
+### Multivariate & Layered Support
+Multiple experiments can run concurrently on the same user page. The system must handle "layering" — assigning users to one experiment per layer, with negative control groups to detect interference between layers.
+
+### Privacy & Compliance
+- GDPR/CCPA compliant: ability to exclude users from experiments and tracking
+- Data retention policies (e.g., raw events deleted after 1 year)
+- User consent management integration
+- Anonymization of PII in event data
+
+## Scale Assumptions
+
+| Metric | Value |
+|---|---|
+| Daily Active Users (DAU) | 100M |
+| Concurrent experiments | 1,000 |
+| Variants per experiment | 3–5 |
+| Events per user per session | 5–20 |
+| Peak event ingestion rate | ~500K events/sec |
+| Data retention (raw) | 1 year |
+| Data retention (aggregated) | Indefinite |
+| Estimated storage | ~5TB/month raw events |

@@ -1,0 +1,23 @@
+---
+title: Deep Dives
+description: Detailed examination of key subsystems — short code generation, cache layer, analytics pipeline, blacklist management, rate limiting, database sharding, HA/DR, security, performance optimization, and extensibility
+---
+
+### Deep Dives — 16 Subsystem Designs
+
+- [Short Code Generation Algorithm](design-a-url-shortening-service-like-tinyurl/06-deep-dives/01-short-code-generation-algorithm) — Base57 encoding, collision analysis, URL normalization, deduplication, and custom alias handling
+- [Cache Layer Optimization](design-a-url-shortening-service-like-tinyurl/06-deep-dives/02-cache-layer-optimization) — Multi-tier caching (local LRU + Redis), negative caching, read/write path optimization
+- [Redirect Strategy](design-a-url-shortening-service-like-tinyurl/06-deep-dives/03-redirect-strategy) — HTTP 301 vs 302 selection, response headers, cache control, blocked URL handling
+- [Link Expiration](design-a-url-shortening-service-like-tinyurl/06-deep-dives/04-link-expiration) — TTL configuration, lazy deletion, Redis TTL fallback
+- [Data Retention & Lifecycle](design-a-url-shortening-service-like-tinyurl/06-deep-dives/05-data-retention-and-lifecycle) — Tiered retention policy, partitioned cleanup, storage cost optimization
+- [Analytics Pipeline Design](design-a-url-shortening-service-like-tinyurl/06-deep-dives/06-analytics-pipeline-design) — Kafka ingestion, ClickHouse storage, materialized views, query performance
+- [Blacklist Management System](design-a-url-shortening-service-like-tinyurl/06-deep-dives/07-blacklist-management-system) — Distributed blacklist, in-memory caching, ETag sync, fail-safe behavior
+- [Rate Limiting Implementation](design-a-url-shortening-service-like-tinyurl/06-deep-dives/08-rate-limiting-implementation) — Sliding window with Redis sorted sets, Lua atomicity, per-policy limits
+- [Database Sharding Strategy](design-a-url-shortening-service-like-tinyurl/06-deep-dives/09-database-sharding-strategy) — Horizontal sharding, FNV-1a hashing, replication, rebalancing
+- [High Availability and Disaster Recovery](design-a-url-shortening-service-like-tinyurl/06-deep-dives/10-high-availability-and-disaster-recovery) — Multi-region active-passive, DNS failover, RPO/RTO
+- [Security Hardening](design-a-url-shortening-service-like-tinyurl/06-deep-dives/11-security-hardening) — Defense-in-depth: input validation, DDoS protection, enumeration prevention
+- [Performance Optimization Techniques](design-a-url-shortening-service-like-tinyurl/06-deep-dives/12-performance-optimization-techniques) — Network-level, application-level, database, and caching optimizations
+- [Future Extensibility](design-a-url-shortening-service-like-tinyurl/06-deep-dives/13-future-extensibility) — Password protection, custom domains, analytics dashboard, QR codes, webhooks
+- [API Design](design-a-url-shortening-service-like-tinyurl/06-deep-dives/14-api-design) — RESTful endpoints, request/response patterns, versioning, API key auth
+- [DNS and Domain Routing](design-a-url-shortening-service-like-tinyurl/06-deep-dives/15-dns-and-domain-routing) — Wildcard DNS, CNAME flattening, multi-tenant domain routing, custom domain verification
+- [Cost Analysis](design-a-url-shortening-service-like-tinyurl/06-deep-dives/16-cost-analysis) — Monthly infrastructure cost estimate, per-operation cost, optimization strategies

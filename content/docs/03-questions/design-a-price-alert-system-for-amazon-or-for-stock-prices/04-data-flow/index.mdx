@@ -1,0 +1,103 @@
+---
+title: Data Flow
+description: Read/write and sync data flows for the price alert system.
+---
+
+## Write Path (Alert Creation)
+
+1. User creates alert via `POST /api/v1/alerts` → AlertService
+2. AlertService validates subscription tier limit (active alert count)
+3. AlertService resolves `target_id` to get `target_name` (lookup ProductCatalog/StockInfo)
+4. AlertService writes Alert record to PostgreSQL with `status=ACTIVE`
+5. AlertService publishes `alert-created` event to Kafka (for cache warm)
+6. CacheService consumes `alert-created`, adds alert to Redis sorted set `alert:eval:STOCK:AAPL`
+7. AlertService returns `201 { alert }`
+
+**Latency:** p50 ~50ms, p99 ~120ms
+
+## Write Path (Price Ingestion & Evaluation)
+
+This is the critical path for alert accuracy.
+
+1. PollService schedules poll per target based on polling interval
+2. PollService calls external API → gets price response
+3. PollService writes PollJob record and publishes to Kafka `price-updates-ingestion`
+4. PriceIngestionService consumes event, normalizes to canonical format
+5. PriceIngestionService writes PriceEvent to PostgreSQL (partitioned table)
+6. PriceIngestionService publishes normalized event to Kafka `price-updates-ingestion` (internal)
+7. EvaluationService (consumer group) reads from Kafka, keyed by target_id
+8. EvaluationService looks up active alerts from Redis sorted set `alert:eval:{type}:{id}`
+9. Binary search sorted set to find threshold crossings:
+
+| Condition | Logic |
+|-----------|-------|
+| ABOVE | `current_price >= threshold` AND `prev_price < threshold` |
+| BELOW | `current_price <= threshold` AND `prev_price > threshold` |
+| PERCENT_DROP | `(reference - current) / reference >= threshold%` |
+| PERCENT_GAIN | `(current - reference) / reference >= threshold%` |
+
+10. For each triggered alert:
+    a. Check cooldown: if `last_triggered_at > cooldown_minutes ago`, skip (`cooldown_applied=true`)
+    b. Write AlertTrigger record (append-only)
+    c. Publish alert-trigger event to Kafka `alert-triggers` with user_id and channels
+    d. Update `Alert.last_triggered_at`, `Alert.trigger_count` (async batched)
+11. NotificationService consumes `alert-triggers`, creates NotificationEvent records
+12. NotificationService dispatches to SES/FCM/Twilio per channel
+13. NotificationService updates delivery status (`SENT` → `DELIVERED` or `FAILED`)
+
+**End-to-end p99:** poll (~5s) + ingestion (~50ms) + evaluation (~200ms) + notification (~5s push / ~10s email) = **~30s**
+
+## Read Path (User Queries)
+
+### List Active Alerts
+```
+User → API Gateway → AlertService → PostgreSQL
+SELECT * FROM alerts WHERE user_id=? AND status='ACTIVE' ORDER BY created_at DESC LIMIT 25
+```
+
+### Price History Chart
+```
+User → API Gateway → PriceService → Redis Cache (TTL 30s)
+GET prices:{target_type}:{target_id}:90d
+Cache miss → query PostgreSQL partitioned table → write Redis → return
+```
+
+### Notification Inbox
+```
+User → API Gateway → NotificationService → PostgreSQL
+SELECT * FROM notification_events WHERE user_id=? AND read=false ORDER BY created_at DESC LIMIT 50
+```
+
+### Alert Trigger History
+```
+User → API Gateway → AlertService → PostgreSQL (read replica)
+SELECT * FROM alert_triggers WHERE alert_id=? ORDER BY triggered_at DESC LIMIT 50
+```
+
+## Sync/Replication Flow
+
+### Multi-Region (us-east-1 primary, eu-west-1 DR)
+
+| Component | Replication | Strategy |
+|-----------|------------|----------|
+| PostgreSQL (Alerts, Users) | Active-Passive | StreamReplicate to eu-west-1, RTO < 5min |
+| PostgreSQL (PriceEvents) | Write to primary only | Partitioned table, read replicas in-region |
+| Redis (Alert Cache) | Active-Active | Cross-Cluster Replication, sync lag < 1s |
+| Kafka | MirrorMaker 2.0 | Async replication, potential reorder |
+| S3 (Price archives) | Cross-region | Automatic S3 replication |
+
+### Price Event Replication to Analytics
+
+```
+PostgreSQL (price_events)
+  → Debezium CDC → Kafka: prices-cdc
+  → Flink aggregation → ClickHouse (backtesting, admin analytics)
+```
+
+### Outbound Delivery Confirmation
+
+```
+NotificationService → SES/FCM/Twilio
+  → Delivery webhook → SNS → NotificationService updates status
+  → Failed → SQS retry queue → exponential backoff (1s, 5s, 25s, 125s, 625s)
+```

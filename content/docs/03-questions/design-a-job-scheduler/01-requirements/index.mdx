@@ -1,0 +1,100 @@
+---
+title: Requirements
+description: Functional and non-functional requirements, scale assumptions, and workload profile for a distributed job scheduler.
+---
+
+## Functional Requirements
+
+A job scheduler must support the following core functionalities:
+
+**Job Submission & Management**
+- Users submit jobs with a payload (script, container image, command) and resource requirements (CPU, memory, disk, GPU).
+- Jobs can include environment variables, secrets, and configuration mounts.
+- Support job naming, tagging, and metadata for grouping and filtering.
+- Jobs can be submitted as single-shot (run once) or recurring (cron-triggered).
+
+**Scheduling Policies**
+- Support multiple scheduling strategies: FIFO, priority-based, fair-share, and backfill.
+- Support scheduling constraints: node affinity/anti-affinity, taints/tolerations, and zone/region placement.
+- Deadline-aware scheduling — jobs with hard deadlines get higher priority.
+
+**Job Lifecycle Management**
+- Jobs transition through well-defined states: PENDING → QUEUED → SCHEDULED → RUNNING → SUCCESS/FAILED/CANCELLED.
+- Support job retries with configurable retry count and backoff strategy (exponential, fixed).
+- Support job cancellation, pausing, and resuming.
+- Support job dependencies: DAG-style where Job B starts after Job A succeeds (or always).
+
+**Recurring Jobs**
+- Cron-based scheduling with standard cron expressions.
+- Support timezone-aware cron definitions.
+- Support missed-run policies: skip, run-latest, or run-all.
+- Chain recurring jobs with dependency ordering.
+
+**Scaling & Concurrency**
+- Limit max concurrent jobs per user/tenant to prevent resource starvation.
+- Auto-scale job parallelism for map-reduce style workloads.
+
+**Observability**
+- Real-time job status and log streaming.
+- Historical job execution history with filtering, sorting, and pagination.
+- Alerting on job failures, slowness, and SLA violations.
+
+**Multi-Tenancy**
+- Namespace/quota-based isolation per team or project.
+- Role-based access control (RBAC) for job submission and management.
+
+## Non-Functional Requirements
+
+**Reliability**
+- Job scheduling decisions must be consistent across scheduler replicas — no double-scheduling.
+- Failed job executions must be retried according to configured policy; no data loss on job payloads or artifacts.
+- The scheduler itself must tolerate single-node and AZ failures without losing in-flight scheduling state.
+- Exactly-once job execution semantics for idempotent jobs; at-least-once for non-idempotent.
+
+**Availability**
+- The API must be available for job submission and status checks during scheduler leader election (eventual consistency during failover).
+- Scheduler HA: active-passive or active-active multi-instance deployment with automatic failover.
+- Target uptime: 99.95% (approx. 22 minutes of downtime per month).
+
+**Consistency**
+- Strong consistency for job state mutations (submit, cancel, update) via a primary scheduler node.
+- Weak/eventual consistency for read replicas and dashboard aggregations.
+- Scheduler leader uses a distributed consensus mechanism (e.g., etcd/Consul Raft) for state replication.
+
+**Performance**
+- Scheduling decision latency: p99 < 100ms for scheduling a single job.
+- End-to-end latency from job submission to first container launch: p99 < 2 seconds.
+- Support job submission rate of 10K writes/sec and 50K reads/sec.
+
+**Scalability**
+- Horizontally scalable scheduler: add nodes to handle increased scheduling throughput.
+- Support 100K+ concurrent running jobs and 10M+ historical jobs in the system.
+- Worker pool (execution nodes) scales from 100 to 100K+ nodes.
+
+**Security**
+- All API communication TLS-encrypted.
+- Secrets (API keys, database passwords) injected via encrypted secret stores (e.g., Vault).
+- Job isolation at the container level with resource limits enforced by the orchestrator.
+- Audit logging for all job and scheduler configuration changes.
+
+## Scale Assumptions
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Concurrent running jobs | 100K | Large orgs like Airbnb/Uber run 100K+ jobs across data pipelines, ML training, and batch processing |
+| Total historical jobs | 10M+/day, 1B+ total | Daily ETL runs, ML experiments, and ad-hoc queries generate millions of jobs |
+| Job submission rate | 10K/sec peak | Morning peak when cron schedules fire simultaneously |
+| Job read/query rate | 50K/sec | Dashboard polling, log streaming, status checks |
+| Worker nodes | 1K - 100K | Cluster size varies by workload; must support elastic scaling |
+| Average job duration | 5 min - 4 hours | Range from quick scripts to ML training jobs |
+| Long-running jobs | Up to 7 days | ML training, large data exports |
+| Job dependencies | 500K DAG edges | Complex data pipelines with 100s of stages |
+| Recurring jobs | 100K active cron schedules | Daily/hourly/minutely scheduled tasks |
+| Storage for job metadata | 500GB+ | Job definitions, logs, metrics over 2-year retention |
+| Multi-region | 3 regions, 9 AZs | High availability and fault domain isolation |
+
+**Workload Profile**
+- 60% short-lived ETL/batch jobs (< 30 min)
+- 25% scheduled/cron jobs (data sync, report generation)
+- 10% long-running jobs (ML training, data processing)
+- 5% streaming/pipeline jobs (stateful, continuously running)

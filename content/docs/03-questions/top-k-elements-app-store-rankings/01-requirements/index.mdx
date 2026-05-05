@@ -1,0 +1,39 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for app store rankings.
+---
+
+## Functional Requirements
+
+| Capability | Description |
+|-----------|-------------|
+| **Score computation** | Composite ranking score from downloads, ratings, review sentiment, crash-free rate, retention, revenue |
+| **Dynamic ranking** | Incremental recompute on data arrival, not batch overnight |
+| **Time-decay** | Exponential decay over 30–90 days for recency weighting |
+| **Categorization** | Top-K per category and global Top-K |
+| **Region awareness** | Per country/region rankings with locale-specific signals |
+| **Anti-gaming** | Detect suppression of review bombing, download fraud |
+| **Diversity** | Max 2 apps per category in Top-K view to prevent dominance |
+| **Explainability** | Ranking score decomposable into signal contributions |
+
+## Non-Functional Requirements
+
+| Metric | Target |
+|--------|--------|
+| Ranking update frequency | Every 15 minutes |
+| Query latency (p99) | < 10ms (from cache) |
+| Ranking computation SLA | All categories ranked within 10 min of data availability |
+| Data freshness | Events reflected within 5 minutes |
+| Availability | 99.95% for ranking query API |
+| Scale | ~100K ranking computations per update cycle |
+
+## Scale Assumptions
+
+| Parameter | Value |
+|-----------|-------|
+| App catalog | ~5M apps total, ~50K per category, ~500 categories |
+| Regions | 200 countries/regions |
+| Events | 10B events/day (ratings, downloads, crashes, reviews) |
+| Ranking update window | 15 minutes |
+| Top-K size | K = 100 per category-region pair |
+| Read traffic | 100K queries/sec (browse + search result ranking) |

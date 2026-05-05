@@ -1,0 +1,27 @@
+---
+title: Hotel Booking System — Room Availability & Reservation
+description: A complete system design for a hotel booking platform supporting room availability management, reservation booking, channel manager integration, and overbooking strategy at scale.
+---
+
+## Table of Contents
+
+| Section | Description |
+|---|---|
+| [Requirements](./01-requirements/) | Functional requirements, non-functional requirements, and scale assumptions |
+| [Core Entities](./02-core-entities/) | Domain model: Hotel, Property, Room, Reservation, Rate Plan, Guest, Availability |
+| [API / System Interface](./03-api-system-interface/) | REST APIs, Kafka events, channel manager integrations |
+| [Data Flow](./04-data-flow/) | Write path (booking creation), read path (search), multi-region replication |
+| [High Level Design](./05-high-level-design/) | Architecture overview, service decomposition, technology choices |
+| [Deep Dives](./06-deep-dives/) | Double-booking prevention, overbooking strategy, search at scale, room assignment, channel integration |
+
+## Overview
+
+A hotel booking system for 50,000 partner hotels (5M rooms) serving 100M monthly active users. The system handles room availability management, reservation booking across multiple channels (direct website, OTA partners, GDS), dynamic pricing, and guest loyalty integration.
+
+**Key design decisions:**
+- **Active-Active reads, Active-Passive writes**: Search is globally distributed; bookings use a single PostgreSQL master for inventory consistency.
+- **Room-type-level availability**: Atomic unit of availability is the room type count, not individual rooms — reduces write contention 5x.
+- **Blockhold pattern**: 15-minute atomic inventory reservation during checkout to prevent double-booking.
+- **CDC-based data distribution**: Debezium captures PostgreSQL changes for downstream consumers (ES index, loyalty, notifications).
+
+**Scale:** 5M rooms, 50K peak searches/sec, 5K peak bookings/sec, 99.99% availability target.

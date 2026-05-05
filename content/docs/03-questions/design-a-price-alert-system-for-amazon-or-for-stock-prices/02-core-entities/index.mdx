@@ -1,0 +1,210 @@
+---
+title: Core Entities
+description: Core data model for the price alert system.
+---
+
+## Entity Definitions
+
+### 1. Alert
+
+The central entity. Represents a single price alert configured by a user.
+
+```json
+{
+  "id": "uuid (PK)",
+  "user_id": "uuid",
+  "target_type": "PRODUCT | STOCK",
+  "target_id": "string",           // ASIN:B08F3HTG7J or ticker AAPL
+  "target_name": "string",         // cached human-readable name
+  "condition": "ABOVE | BELOW | PERCENT_DROP | PERCENT_GAIN",
+  "threshold_value": "decimal",    // absolute price or percentage
+  "reference_price": "decimal",    // price at creation or last trigger
+  "notification_channels": ["EMAIL", "PUSH", "SMS"],
+  "cooldown_minutes": "int",       // default 60
+  "status": "ACTIVE | PAUSED | DELETED",
+  "subscription_tier": "FREE | PREMIUM",
+  "created_at": "timestamp",
+  "updated_at": "timestamp",
+  "last_triggered_at": "timestamp",
+  "trigger_count": "int",
+  "metadata": {                    // optional extra data
+    "seller": "Amazon.com",
+    "condition": "new",
+    "currency": "USD"
+  }
+}
+```
+
+**Indexes:**
+- `(user_id, status)` — listing active alerts
+- `(target_type, target_id)` — shared polling lookup
+- `(status, created_at)` — stale alert cleanup
+
+---
+
+### 2. PriceEvent
+
+A canonical price update event, normalized from any external source.
+
+```json
+{
+  "event_id": "uuid (PK)",
+  "source_type": "STOCK_API | AMAZON_API | SCRAPE",
+  "target_type": "PRODUCT | STOCK",
+  "target_id": "string",
+  "price": "decimal",
+  "currency": "USD",
+  "volume": "int",                 // optional, stock volume
+  "timestamp": "timestamp",        // from source
+  "ingested_at": "timestamp",      // system receive time
+  "metadata": JSONB                // seller, exchange, market cap, etc.
+}
+```
+
+**Storage:** Partitioned by `(target_type, target_id, date)`. Stock data partitioned daily; product data weekly.
+
+---
+
+### 3. NotificationEvent
+
+A single notification delivery attempt.
+
+```json
+{
+  "id": "uuid (PK)",
+  "alert_id": "uuid (FK)",
+  "user_id": "uuid (FK)",
+  "price_at_trigger": "decimal",
+  "threshold_value": "decimal",
+  "percentage_change": "decimal",
+  "channels": ["EMAIL", "PUSH"],
+  "delivery_status": "PENDING | SENT | DELIVERED | FAILED",
+  "retry_count": "int",
+  "last_retry_at": "timestamp",
+  "sent_at": "timestamp",
+  "delivered_at": "timestamp",
+  "external_message_id": "string", // SES / Firebase message ID
+  "created_at": "timestamp"
+}
+```
+
+**Indexes:** `(alert_id)`, `(user_id, created_at DESC)`, `(delivery_status, retry_count)` for retry jobs.
+
+---
+
+### 4. User
+
+```json
+{
+  "id": "uuid (PK)",
+  "email": "string",
+  "email_verified": "boolean",
+  "subscription_tier": "FREE | PREMIUM",
+  "subscription_expires_at": "timestamp",
+  "notification_preferences": { "email": true, "push": true, "sms": false },
+  "sms_phone": "string | null",
+  "created_at": "timestamp"
+}
+```
+
+---
+
+### 5. ProductCatalog
+
+```json
+{
+  "target_id": "string (PK)",      // ASIN
+  "target_type": "PRODUCT",
+  "title": "string",
+  "brand": "string",
+  "category": "string",
+  "image_url": "string",
+  "currency": "string",
+  "last_price": "decimal",
+  "last_updated": "timestamp",
+  "is_active": "boolean",
+  "source": "AMAZON"
+}
+```
+
+Maps `target_id` to human-readable product info for notification content and alert creation UX.
+
+---
+
+### 6. StockInfo
+
+```json
+{
+  "target_id": "string (PK)",      // ticker "AAPL"
+  "target_type": "STOCK",
+  "company_name": "string",
+  "exchange": "NASDAQ | NYSE",
+  "currency": "string",
+  "last_price": "decimal",
+  "last_updated": "timestamp",
+  "market_cap": "decimal",
+  "sector": "string"
+}
+```
+
+---
+
+### 7. AlertTrigger (Audit Log)
+
+```json
+{
+  "id": "uuid (PK)",
+  "alert_id": "uuid (FK)",
+  "triggered_at": "timestamp",
+  "price_when_triggered": "decimal",
+  "threshold_value": "decimal",
+  "notification_ids": ["uuid"],    // one per channel
+  "cooldown_applied": "boolean",
+  "missed_evaluation": "boolean"   // set by reconciliation job
+}
+```
+
+Append-only. Used for user-facing trigger history and accuracy reconciliation.
+
+---
+
+### 8. PollJob
+
+```json
+{
+  "id": "uuid (PK)",
+  "target_type": "PRODUCT | STOCK",
+  "target_id": "string",
+  "source_type": "STOCK_API | AMAZON_API | SCRAPE",
+  "scheduled_at": "timestamp",
+  "started_at": "timestamp",
+  "completed_at": "timestamp",
+  "status": "SCHEDULED | RUNNING | COMPLETED | FAILED",
+  "price_event_ids": ["uuid"],
+  "error": "string | null"
+}
+```
+
+Ensures each target is polled at most once per cycle, regardless of how many alerts reference it.
+
+---
+
+## Relationships
+
+### User → Alert (1:N)
+One user creates many alerts. Alerts are scoped to a single user.
+
+### Alert → NotificationEvent (1:N)
+One alert trigger creates one notification event per channel. An alert with `["EMAIL", "PUSH"]` creates 2 records per trigger.
+
+### Alert → AlertTrigger (1:N)
+Each alert fire appends one trigger record — the audit trail for accuracy and user history.
+
+### PollJob → PriceEvent (1:N)
+A single poll creates one PriceEvent. All alerts for that target are evaluated against it.
+
+### Alert → ProductCatalog/StockInfo (N:1)
+Alerts reference `target_id` mapped to product or stock info. `target_name` is cached on Alert to avoid joins at evaluation time.
+
+### PriceEvent → AlertTrigger (via evaluation) (N:1)
+One PriceEvent fans out to many AlertTriggers (one per active alert for that target). This is the core 1→N evaluation step.

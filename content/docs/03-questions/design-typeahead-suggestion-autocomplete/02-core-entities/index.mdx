@@ -1,0 +1,61 @@
+---
+title: Core Entities
+description: Core entities for typeahead/autocomplete system design
+---
+
+## Entity Definitions
+
+### PrefixEntry
+| Field | Type | Notes |
+|-------|------|-------|
+| `prefix` | String | The key (e.g., "goo", "google") |
+| `term` | String | The full autocomplete term (e.g., "google search") |
+| `score` | Float | Aggregated frequency/popularity score (Redis ZSET-compatible float64) |
+| `category` | Enum | SEARCH / PRODUCT / ENTITY / TRENDING / HISTORY |
+| `usageCount` | Long | Total number of queries matching this prefix-term pair |
+| `clickCount` | Long | Total number of times users selected this term (for CTR-based ranking) |
+| `lastUsed` | Timestamp | Most recent usage time (for freshness decay) |
+| `createdAt` | Timestamp | First seen time |
+
+### QueryTerm
+| Field | Type | Notes |
+|-------|------|-------|
+| `termId` | UUID | Primary key |
+| `term` | String | Full term (e.g., "google maps") |
+| `frequency` | Long | Rolling 24h query count |
+| `trendingScore` | Double | Velocity-based score for trending detection |
+| `category` | Enum | Product / Entity / General / Brand |
+| `metadata` | JSONB | Domain-specific payload (image URL, entity type, etc.) |
+| `lastUpdated` | Timestamp | Last frequency update |
+
+### UserSession
+| Field | Type | Notes |
+|-------|------|-------|
+| `sessionId` | String | Session ID (ephemeral) |
+| `userId` | UUID (nullable) | Null for anonymous users |
+| `queryHistory` | String[] | Last 20 search queries |
+| `selectedTerm` | String | Last user-selected autocomplete term |
+| `location` | JSONB | Lat/long, country, region |
+| `language` | String | BCP 47 language tag |
+| `deviceType` | Enum | MOBILE / DESKTOP / TV |
+| `createdAt` | Timestamp | Session start |
+
+## FuzzyMatchResult (Transient)
+
+Not a persistent entity — a computation result generated per-query by the fuzzy matcher service.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `inputQuery` | String | User-typed characters |
+| `correctedTerm` | String | Auto-corrected result |
+| `distance` | Integer | Edit distance (1 or 2) |
+| `phoneticHash` | String | Double-metaphone or Soundex encoding |
+| `confidence` | Double | Model-based confidence score |
+
+## Relationships
+
+```
+PrefixEntry → QueryTerm (term → termId): dictionary lookup maps prefix to term
+UserSession → QueryTerm (queryHistory → term): personalization weighting
+PrefixEntry × QueryTerm: one-to-many (one prefix can match many terms)
+```

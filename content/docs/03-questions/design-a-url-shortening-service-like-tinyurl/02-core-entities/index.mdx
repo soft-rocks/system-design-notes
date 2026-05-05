@@ -1,0 +1,132 @@
+---
+title: Core Entities
+description: Domain entities, attributes, constraints, access patterns, relationships, and volume estimates for the URL shortening service.
+---
+
+### 1. URL Mapping (Primary Entity)
+
+Represents the core relationship between a short code and its target URL. This is the most critical entity in the system.
+
+**Attributes**:
+
+- `short_code` (string, 6-8 chars, base62): Unique identifier for the shortened URL (primary key)
+- `original_url` (string, max 2048 chars): Full target URL (must be valid, sanitized)
+- `created_at` (timestamp): Creation time (UTC)
+- `expires_at` (timestamp, nullable): Expiration time if configured
+- `status` (enum: active, expired, disabled): Current state of the mapping
+- `metadata` (JSON, nullable): Additional data like campaign tags, analytics context
+
+**Constraints**:
+
+- `short_code` must be unique
+- `original_url` must be a valid HTTP/HTTPS URL
+- `created_at` ≤ `expires_at` (if expires_at is set)
+- `status` defaults to 'active'
+
+**Access Patterns**:
+
+- Primary: Look up by `short_code` (read-heavy, P95 < 50ms)
+- Secondary: Insert by `short_code` (single-shard write, P95 < 50ms)
+- Tertiary: Batch update `status` and `expires_at` (daily cleanup)
+
+### 2. Analytics Record (Derived Entity)
+
+Captures detailed metadata about each redirect event for analytics and monitoring.
+
+**Attributes**:
+
+- `id` (UUID or auto-increment): Unique identifier for the analytics record
+- `short_code` (string): Reference to URL mapping
+- `timestamp` (timestamp): Time of redirect (UTC)
+- `ip_prefix` (string): First 24 bits of IPv4 or first 96 bits of IPv6 (privacy-preserving, for geo approximation)
+- `user_agent` (string, nullable): Parsed and stripped before storage
+- `referrer` (string, nullable): Original referrer URL
+- `country` (string, nullable): Derived from `ip_prefix` via GeoIP lookup
+- `device_type` (enum: mobile, tablet, desktop, bot): Derived from user_agent
+- `browser` (string, nullable): Derived from user_agent
+- `os` (string, nullable): Derived from user_agent
+
+**Constraints**:
+
+- `short_code` must reference an existing, active URL mapping
+- `ip_prefix` must be valid truncated IP format (no full IP stored — privacy-preserving)
+
+**Access Patterns**:
+
+- Write-heavy: High-throughput ingestion (10K+ events/sec)
+- Read: Aggregated analytics queries (count, geo-distribution, time-series)
+- Batch: Daily/weekly summarization into aggregate tables
+
+### 3. Rate Limiting Record (System Entity)
+
+Tracks client request counts for abuse prevention using a sliding window sorted set in Redis.
+
+**Attributes** (stored as Redis sorted set members):
+
+- `key` (string): `rate:<client_id>:<endpoint>`
+- `member` (string): Unique event timestamp or random nonce
+- `score` (float): Unix epoch timestamp for sorted set ordering
+- `ttl` (int): Time-to-live in seconds (matches window duration)
+
+**Constraints**:
+
+- `score` must be monotonically increasing (Unix timestamp)
+- Key must expire automatically after window duration
+- Sorted set size bounded by rate limit threshold
+
+**Access Patterns**:
+
+- Write: ZADD + ZREMRANGEBYSCORE (every request, single pipeline)
+- Read: ZCARD (every request, same pipeline)
+- TTL: Automatic expiration via Redis EXPIRE
+
+### 4. URL Blacklist (System Entity)
+
+Maintains prohibited URLs and patterns to prevent abuse.
+
+**Attributes**:
+
+- `id` (UUID): Unique identifier for the entry
+- `pattern` (string): Domain match, substring, or regex pattern
+- `type` (enum: domain, substring, regex): Match strategy
+- `reason` (string): Reason for blacklisting
+- `created_by` (string): Admin/system that added the entry
+- `created_at` (timestamp)
+- `expires_at` (timestamp, nullable): Expiration if configured
+- `active` (boolean, default true): Whether pattern is enforced
+
+**Constraints**:
+
+- `pattern` must be valid format for its `type`
+- `type=regex` patterns must be validated before insertion (avoid catastrophic backtracking)
+- `active` determines current enforcement
+
+**Access Patterns**:
+
+- Read: On every URL creation (must be < 20ms, served from in-memory cache)
+- Write: Low frequency (admin actions only)
+- Batch: Periodic pattern validation and cleanup of expired entries
+
+### Entity Relationships
+
+- **URL Mapping** is the central entity
+- **Analytics Record** has a 1:many relationship with URL Mapping (one URL → many clicks)
+- **Rate Limiting Record** is associated with client identity, not specific URLs
+- **URL Blacklist** is independent but referenced during URL creation
+
+### Data Volume Estimates
+
+- **URL Mapping**: 50M new entries/day; 18.25B rows/year. Active retention ~2 years → ~36.5B total rows. At ~200 bytes/row (short_code 8B + original_url 512B + created_at 8B + status 1B + metadata 100B overhead), raw storage ~200 GB/day, ~73 TB/year with 3× replication → ~220 TB total. (Correction: the original "360 GB" figure used 0.01 bytes/row — clearly wrong.)
+- **Analytics Record**: 2B events/day at ~50 bytes/event = ~100 GB/day raw. Stored in ClickHouse with partition pruning; raw retention 7 days (~700 GB), hot aggregated rollups 30 days (~3 TB), long-term aggregates (daily/monthly buckets) ~50 GB.
+- **Rate Limiting Record**: Sliding window sorted sets per `client_id` at ~23K RPS. At peak 100K concurrent clients with 60-second windows → each client has up to 60 entries (1 per second), each entry ~100 bytes → ~600 MB per shard. With 10 shards + 3× replication → ~18 GB total Redis memory.
+- **URL Blacklist**: ~10K entries, ~2 MB raw; served from in-memory cache (B-Tree or hash) → ~50 MB heap.
+
+### Design Considerations
+
+- URL Mapping is the only entity requiring strong consistency
+- Analytics records can be eventually consistent (batched writes)
+- Rate limiting requires high-throughput, low-latency storage (in-memory Redis)
+- URL Blacklist must be cached aggressively (read-only, frequently accessed)
+- All entities must support horizontal scaling
+- Primary storage for URL Mapping should be partitioned by short_code for even distribution
+- Analytics data should be written to a time-series database (e.g., ClickHouse)

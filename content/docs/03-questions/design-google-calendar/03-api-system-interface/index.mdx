@@ -1,0 +1,262 @@
+---
+title: API / System Interface
+description: Google Calendar API endpoints, internal service interfaces, and integration patterns.
+---
+
+## Event CRUD API
+
+### Create Event
+
+`POST /calendar/v3/calendars/\{calendarId\}/events`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `summary` | string | yes | Event title |
+| `description` | string | no | Event description |
+| `location` | string | no | Physical location |
+| `start` | object | yes | `\{dateTime, timeZone\}` or `\{date\}` for all-day |
+| `end` | object | yes | Same format as start |
+| `recurrence` | string[] | no | RRULE/VRRULE array |
+| `reminders` | object | no | `\{useDefault, overrides: [{minutes, method\}]}` |
+| `attendees` | object[] | no | `[\{email, responseStatus\}]` |
+| `visibility` | string | no | `default`, `public`, `private`, `confidential` |
+| `colorId` | string | no | Calendar color reference |
+| `source` | object | no | `\{url, title\}` |
+
+**Response:** 200 with event resource + `ETag` for optimistic locking.
+
+For recurring events, returns `id` (master) + `recurringEventId` + `originalStartTime` (null for master).
+
+### List Events
+
+`GET /calendar/v3/calendars/\{calendarId\}/events`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `timeMin` | ISO 8601 | — | Start of time window |
+| `timeMax` | ISO 8601 | — | End of time window |
+| `maxResults` | int | 250 | Max items (1–2500) |
+| `singleEvents` | boolean | true | Expand recurrences |
+| `q` | string | — | Full-text search |
+| `calendarId` | string[] | — | Multi-calendar query |
+| `pageToken` | string | — | Pagination cursor |
+| `updatedMin` | ISO 8601 | — | Incremental sync filter |
+
+**Response:** `\{ `items`: Event[], `nextPageToken`: string, `itemsPerPage`: int \}`
+
+### Update Event
+
+`PUT /calendar/v3/events/\{eventId\}`
+
+- Conditional update via `If-Match` ETag header
+- Partial update: send only changed fields
+- Recurrence: `eventId` targets master; `recurringEventId` + `originalStartTime` targets override
+
+### Delete Event
+
+`DELETE /calendar/v3/events/\{eventId\}`
+
+- `eventId=master` → deletes all occurrences
+- `recurringEventId` + `originalStartTime` → deletes single occurrence
+
+### Partial Update
+
+`PATCH /calendar/v3/events/\{eventId\}` — same recurrence semantics as PUT.
+
+---
+
+## Recurrence Handling
+
+```
+Master Event (stored)
+  ├─ rrule: FREQ=WEEKLY;BYDAY=MO,TH
+  ├─ maxInstances: 365
+  └─ exceptions: [\{recurringEventId, originalStartTime, modified fields\}]
+
+Read Path:
+  ExpandRecurrence(master, timeMin, timeMax)
+    → Apply exceptions (override matched instances)
+    → Return flattened Occurrence[]
+```
+
+- Master event stored once; exceptions stored as sparse overrides
+- Expansion computed at read time via `RecurrenceEngine`
+- `maxInstances` parameter caps expansion for queries (default 365); prevents runaway computation on malformed rules
+
+---
+
+## Invitation and RSVP
+
+```
+CREATE /events/\{eventId\}/sendInvites    → 202 (async, operationId)
+PATCH /events/\{eventId\}/attendees/\{email\}
+GET  /events/\{eventId\}/attendees
+```
+
+### Invitation Processing Pipeline
+
+```
+1. Send email → attendee clicks link
+2. Update invitations table → set responseStatus
+3. Set response_change_time → trigger organizer notification
+4. Run overlap check on attendee's calendar if accepted
+```
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/events/\{eventId\}/sendInvites` | POST | Invite attendees asynchronously |
+| `/events/\{eventId\}/attendees/\{accountEmail\}` | PATCH | Update single attendee status |
+| `/events/\{eventId\}/attendees` | GET | List all attendees with statuses |
+
+Attendee statuses: `needs_action`, `accepted`, `tentative`, `declined`.
+
+---
+
+## Calendar Management API
+
+```
+POST   /calendar/v3/calendars
+GET    /calendar/v3/calendars
+PATCH  /calendar/v3/calendars/\{calendarId\}
+DELETE /calendar/v3/calendars/\{calendarId\}
+GET    /calendar/v3/users/me/calendarList/\{calendarId\}
+POST   /calendar/v3/calendars/\{calendarId\}/acl
+```
+
+### ACL Roles
+
+| Role | Permissions |
+|------|-------------|
+| `owner` | Full control + manage ACL |
+| `writer` | Create/edit/delete events |
+| `reader` | View events |
+| `none` | No access |
+
+### Sharing Model
+
+- Calendars owned by one user; shared with multiple users via ACL
+- Each shared calendar has an `accessRole` per user
+- `calendarList` tracks user's subscribed calendars with per-calendar settings (color, notification defaults)
+
+---
+
+## Search and Free/Busy API
+
+### Free/Busy Lookup
+
+`POST /calendar/v3/freeBusy`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timeMin` | ISO 8601 | Window start |
+| `timeMax` | ISO 8601 | Window end |
+| `items` | object[] | `[\{calendarId, timeZone\}]` |
+| `groupTimezone` | string | Result timezone |
+| `timeZone` | string | Response timezone |
+
+**Response:** `\{ `calendars`: map[calendarId]→{ `busy`: Interval[] \} }`
+
+### Search
+
+`GET /calendar/v3/events?q=...&timeMin=...&timeMax=...`
+
+- Full-text query on `summary`, `description`, `location`
+- `attendeeId` filter: events involving specific user
+- Ranking: recency boost + keyword match relevance
+
+### Find Free Time (Internal)
+
+`POST /calendar/v3/findFreeTime`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `requests` | object[] | `\{timeWindows, duration, attendees, workingHours\}` |
+| `organizationId` | string | Optional org-wide search |
+
+**Response:** `\{ `freeTimeResults`: [{ `candidates`: [{start, end, quality\}], `errors`: [] }] }`
+
+---
+
+## Real-Time Sync and Webhooks
+
+### Polling-Based Sync
+
+`GET /calendar/v3/calendars/\{calendarId\}/changes`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `pageToken` | string | Continuation token |
+| `timeMin` | ISO 8601 | Minimum update time |
+| `maxResults` | int | Max items |
+
+**Response:** `\{ `items`: Event[], `nextPageToken`: string \}`
+
+Recommend exponential backoff on polling clients.
+
+### Push Notifications (Webhooks)
+
+`POST /admin/directory/v1/hook`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique webhook ID |
+| `type` | string | `web_hook` |
+| `address` | string | HTTPS endpoint URL |
+| `conditions` | object | `\{ `calendarId`, `eventTypes` \}` |
+
+Google pushes JSON payload on event create/update/delete. Retry with exponential backoff; endpoint must return 200.
+
+### WebSocket Real-Time Feed
+
+`wss://push.googleapis.com/event/v1/\{userId\}`
+
+- Subscribe to calendar events; receives `resourceUri` for fetching updates
+- Auto-reconnect with jitter; heartbeats every 30s
+
+### Conflict Resolution
+
+- Last-write-wins with ETag comparison
+- Clients receive 412 Precondition Failed on stale writes; must re-fetch and retry
+
+---
+
+## Internal Service Interfaces
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  EventService   │    │ RecurrenceEngine │    │AvailabilitySvc  │
+│ CreateEvent()   │    │ Expand()         │    │ ComputeFreeBusy()│
+│ GetEvent()      │    │                  │    │                  │
+│ UpdateEvent()   │    │                  │    │                  │
+│ DeleteEvent()   │    │                  │    │                  │
+└────────┬────────┘    └────────┬─────────┘    └────────┬─────────┘
+         │                      │                       │
+         │                      │                       │
+┌────────▼──────────────────────▼───────────────────────▼────────┐
+│                        Event Store (Sharded)                   │
+└────────────────────────────────────────────────────────────────┘
+         │                      │                       │
+         │                      │                       │
+┌────────▼────────┐    ┌────────▼─────────┐    ┌────────▼─────────┐
+│NotificationSvc  │    │  SyncService     │    │  SearchIndex     │
+│ SendInvite()    │    │ StreamEvents()   │    │ IndexEvent()     │
+│ DispatchRemind()│    │ ApplyDelta()     │    │ Search()         │
+└─────────────────┘    └──────────────────┘    └──────────────────┘
+         │
+         │
+┌────────▼────────┐
+│ ShareService    │
+│ GrantAccess()   │
+│ RevokeAccess()  │
+└─────────────────┘
+```
+
+| Service | Methods | Responsibility |
+|---------|---------|----------------|
+| `EventService` | `Create/Get/Update/Delete` | Event persistence with ETag support |
+| `RecurrenceEngine` | `ExpandRecurrence(master, min, max)` | On-demand recurrence expansion |
+| `AvailabilityService` | `ComputeFreeBusy(ids, min, max)` | Merge busy intervals across calendars |
+| `NotificationService` | `SendInvitation/DispatchReminder` | Async invitation + reminder dispatch |
+| `SyncService` | `StreamEvents/ApplyDelta` | Change stream for sync clients |
+| `SearchIndex` | `IndexEvent/Search` | Full-text event search via Lucene/Elasticsearch |
+| `ShareService` | `GrantAccess/RevokeAccess` | ACL management for calendar sharing |

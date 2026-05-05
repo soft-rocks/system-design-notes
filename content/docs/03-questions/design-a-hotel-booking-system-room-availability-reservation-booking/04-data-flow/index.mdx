@@ -1,0 +1,224 @@
+---
+title: Data Flow
+description: Data flow for hotel booking system — availability check, booking creation, and channel sync
+---
+
+## Write Path (Booking Creation)
+
+### Search → Blockhold → Payment → Reservation
+
+```
+Guest App/Web ──Search──► API Gateway ──► Search Service ──► Elasticsearch ──► Available room types
+                                                                    │
+                                                                    ▼
+Guest App/Web ◄── Room List ────────────────────────────────────── Search Service
+     │
+     │ Select room + Submit
+     ▼
+API Gateway ──POST /reservations──► Booking Service
+                                       │
+                                       ├──► 1. Rate Engine: Compute & Lock Price
+                                       │     └──► PostgreSQL: DailyRate lookup + RateHold insert
+                                       │
+                                       ├──► 2. Inventory Service: Acquire Blockhold
+                                       │     └──► PostgreSQL: UPDATE availability SET available_rooms = available_rooms - 1
+                                       │              WHERE room_type_id = X AND date = Y AND available_rooms > 0
+                                       │              (Row-level lock ensures zero double-bookings)
+                                       │
+                                       ├──► 3. Payment Service: Authorize
+                                       │     └──► Stripe/PayPal: Pre-authorize card
+                                       │
+                                       ├──► 4. Create Reservation
+                                       │     └──► PostgreSQL: INSERT INTO reservations
+                                       │
+                                       ├──► 5. Release Blockhold
+                                       │     └──► UPDATE blockholds SET status = 'CONVERTED'
+                                       │
+                                       ├──► 6. Publish Events (Kinesis)
+                                       │     └──► RESERVATION_CREATED, INVENTORY_UPDATED
+                                       │
+                                       └──► 7. Async: Notify Channel, Loyalty, Index Update
+```
+
+**Step-by-step:**
+
+1. **Price Lock**: The Rate Engine re-validates the price (client-provided price is never trusted). It creates a RateHold record in PostgreSQL with a 15-minute TTL. This prevents price changes during the checkout window.
+
+2. **Blockhold**: The Inventory Service attempts an atomic decrement of available rooms. This is the critical contention point. If available_rooms > 0, the row is locked (SELECT FOR UPDATE) and decremented. If another request concurrently decrements the last room, the second request gets zero rows affected → returns 409 CONFLICT.
+
+3. **Payment**: Stripe pre-authorizes the card. This does NOT charge the card — it places a hold that expires in 7 days if not captured. Timeout: 5 seconds. Circuit breaker: if Stripe is down, return 503 with a retry-after hint.
+
+4. **Reservation Creation**: INSERT into PostgreSQL with status = CONFIRMED. Payment status = AUTHORIZED.
+
+5. **Blockhold Release**: The temporary blockhold is marked as CONVERTED (not deleted, for audit).
+
+6. **Event Publishing**: Two events are published to Kinesis: RESERVATION_CREATED (for notifications, loyalty) and INVENTORY_UPDATED (for search index refresh).
+
+7. **Async processing**: A separate consumer group processes these events: sends confirmation email, updates Elasticsearch search index, accrues loyalty points, syncs to channel partners.
+
+## Read Path (Availability Search)
+
+### Search Query Flow
+
+```
+Guest App/Web ──GET /search──► API Gateway ──► Load Balancer
+                                              │
+                                    ┌─────────┼──────────┐
+                                    ▼         ▼          ▼
+                              Search Pod  Search Pod   Search Pod
+                                    │         │          │
+                                    └────┬────┴────┬─────┘
+                                         ▼         ▼
+                                   ┌──────────────────┐
+                                   │  Elasticsearch    │
+                                   │  (Sharded by      │
+                                   │  room_type_id)    │
+                                   └──────────────────┘
+                                         │
+                                         ▼
+                                   ┌──────────────────┐
+                                   │  Redis Cache      │
+                                   │  (Popular queries │
+                                   │   5-min TTL)      │
+                                   └──────────────────┘
+```
+
+1. **Cache check (Redis)**: The search query is hashed and checked in Redis. Popular queries (e.g., "NYC, Aug 15-18, 2 guests") are cached for 5 minutes with a TTL. Hit rate: ~60% of searches.
+
+2. **Elasticsearch query**: For cache misses, the search is delegated to Elasticsearch. The index contains pre-flattened room type records with denormalized property data, rates, and availability flags. The query is:
+   ```
+   GET /rooms/_search
+   {
+     "query": {
+       "bool": {
+         "must": [
+           {"geo_distance": {"distance": "50km", "location": "-73.9857,40.7484"}},
+           {"range": {"available_on": {"gte": "2026-08-15", "lte": "2026-08-18"}}},
+           {"range": {"price_per_night": {"lte": 300}}}
+         ]
+       }
+     }
+   }
+   ```
+
+**Why Elasticsearch over PostgreSQL**: The search involves geospatial filtering (point-in-radius), range queries (price, dates), full-text search (property name, amenities), and ranking. PostgreSQL with PostGIS can do this but at much higher latency (~2-5s vs ~100ms). Elasticsearch is purpose-built for this workload.
+
+**Availability index freshness**: The room availability index is updated asynchronously from the INVENTORY_UPDATED event. Freshness: typically &lt;1 second lag. This is acceptable because room counts change infrequently (only on booking/cancellation).
+
+## Sync/Replication Flow
+
+### Multi-Region Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                               Primary Region (US-East)                          │
+│                                                                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐  │
+│   │  Search      │    │  Booking    │    │  Payment    │    │  PostgreSQL     │  │
+│   │  (Read, AA)  │    │  (Write,    │    │  (Write,    │    │  (Primary       │  │
+│   │              │    │   AP)       │    │   AP)       │    │    Master)      │  │
+│   └─────────────┘    └─────────────┘    └─────────────┘    └─────────────────┘  │
+│        ▲                      ▲                      ▲                      │    │
+│        │                      │                      │                      │    │
+│   ┌────┴──────────────────────┴──────────────────────┴──────────────────────┐    │
+│   │                         Kinesis Replication Stream                      │    │
+│   └────────────────────────────────┬────────────────────────────────────────┘    │
+└────────────────────────────────────┼────────────────────────────────────────────┘
+                                     │ Replication
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              Replica Region (EU-West)                            │
+│                                                                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐  │
+│   │  Search      │    │  Booking    │    │  Payment    │    │  PostgreSQL     │  │
+│   │  (Read, AA)  │    │  (Standby,  │    │  (Standby,  │    │  (Read-only     │  │
+│   │              │    │   DR)       │    │   DR)       │    │   Replica)      │  │
+│   └─────────────┘    └─────────────┘    └─────────────┘    └─────────────────┘  │
+│                                                                                   │
+│   Regional PMS integrations (local phones/faxes)                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Active-Active for Search**: Search traffic is read-heavy (50:1 ratio of searches to bookings). Search replicas in each region serve local traffic independently. The Elasticsearch index is replicated via the Kinesis stream (INVENTORY_UPDATED events).
+
+**Active-Passive for Bookings**: Write operations (booking creation, cancellation) go to the primary region's PostgreSQL master. The replica region has a read-only PostgreSQL replica. If the primary fails, traffic is failovered to the replica.
+
+**Why not active-active writes**: Double-booking prevention requires a single authoritative source of truth for inventory counts. Two writers (one per region) updating the same availability record would require distributed locking or optimistic concurrency control, both of which add complexity and reduce throughput. Active-passive avoids this.
+
+**Failover procedure**:
+1. Detect primary region failure (health check timeout: 30s).
+2. Promote PostgreSQL replica to primary (switchover).
+3. Update DNS (Route53 failover record).
+4. Resume booking operations. Estimated RTO: 2-3 minutes.
+
+### Channel Sync Flow
+
+```
+Channel (Expedia/Booking.com/GDS)
+         │
+         │ HTTPS webhook / polling (every 30s)
+         ▼
+┌──────────────────┐     Invalid auth / rate limited     ┌──────────────┐
+│  Channel Proxy   │ ─────────────────────────────────►  Alerting      │
+│  (per-channel)   │                                     │ (PagerDuty)   │
+└────────┬─────────┘                                     └──────────────┘
+         │ Valid request
+         ▼
+┌──────────────────┐     Error (malformed)                     ┌──────────────┐
+│  Channel Parser  │ ───────────────────────────────────────►  Dead Letter   │
+│                  │                                           │ Queue          │
+└────────┬─────────┘                                           └──────────────┘
+         │
+         ▼
+┌──────────────────┐     Concurrency conflict                  ┌──────────────┐
+│  Inventory       │ ───────────────────────────────────────►  Retry (exponential │
+│  Service         │                                             backoff, max 5)│
+└────────┬─────────┘                                           └──────────────┘
+         │
+         ▼
+   Inventory updated
+         │
+         ▼
+   ┌──────────────────┐
+   │ Publish event to │
+   │ Kinesis (SYNC)   │
+   └──────────────────┘
+```
+
+**Why per-channel proxy**: Each channel partner has different authentication methods (OAuth, API key, SFTP), different request formats, different rate limits, and different error semantics. Isolating each integration in a dedicated proxy service prevents a buggy Expedia sync from affecting Booking.com.
+
+**Why 30-second polling**: Channel partners don't support push-based webhooks reliably. Polling at 30s provides acceptable freshness (inventory is updated within 30s of a booking) while not overwhelming channel partner APIs.
+
+### Availability Index Update Flow
+
+```
+PostgreSQL (availability table)
+         │ COMMIT
+         ▼
+   ┌──────────────────┐
+   │ CDC (Debezium)   │  Change Data Capture from PostgreSQL WAL
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │ Kinesis Stream   │  inventory-changes
+   └────────┬─────────┘
+            │
+     ┌──────┼──────┐
+     ▼      ▼      ▼
+ Elastic-  Loy-  Notification
+ search    alty  Service
+ Indexer   Service
+     │      │      │
+     ▼      ▼      ▼
+  Index    Points  Email /
+ updated    accrued SMS sent
+```
+
+The CDC (Change Data Capture) layer reads PostgreSQL's WAL (Write-Ahead Log) and emits changes to Kinesis. Three consumers process these:
+
+1. **Elasticsearch Indexer**: Updates the search index with new availability counts.
+2. **Loyalty Service**: Updates loyalty tier eligibility and points.
+3. **Notification Service**: Sends "room available" alerts if the user had a saved search.
+
+**Why CDC over application-layer pub/sub**: Decouples the source of truth (PostgreSQL) from downstream consumers. Even application bugs that bypass the service layer (e.g., direct DB admin updates, bulk migrations) are captured.

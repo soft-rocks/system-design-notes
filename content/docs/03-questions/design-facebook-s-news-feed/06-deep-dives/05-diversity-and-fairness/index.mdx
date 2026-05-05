@@ -1,0 +1,158 @@
+---
+title: "Deep Dive: Diversity and Fairness"
+description: "Diversity constraints, fairness for content creators, and anti-gaming measures in Facebook News Feed"
+---
+
+## Diversity Constraints
+
+Diversity constraints ensure the feed doesn't become repetitive, stale, or dominated by a single author or content type. They are applied **after** ML scoring, as a post-processing step.
+
+**Constraints applied (in order):**
+
+```
+Ranked posts (by ML score)
+    │
+    ▼
+Step 1: Per-author cap (max 2 consecutive posts from same author)
+    │
+    ▼
+Step 2: Per-content-type cap (max 30% video, max 30% photo, max 20% links)
+    │
+    ▼
+Step 3: Per-source diversity (max 10% from new/suggested sources)
+    │
+    ▼
+Step 4: Chronological bump (ensure at least 1 post from last 5 minutes)
+    │
+    ▼
+Final feed (top 30)
+```
+
+**Per-author cap (max 2 consecutive):**
+
+```python
+def apply_author_cap(posts: List[RankedPost], max_consecutive: int = 2) -> List[RankedPost]:
+    result = []
+    author_counts = defaultdict(int)
+    overflow = []  # Posts that didn't make the top 30 due to cap
+    
+    for post in posts:
+        if author_counts[post.author_id] &gt;= max_consecutive:
+            overflow.append(post)
+            continue
+        result.append(post)
+        author_counts[post.author_id] += 1
+        if len(result) == 30:
+            break
+    
+    # Fill overflow with dropped posts (ensuring diversity still holds)
+    for post in overflow:
+        if len(result) &gt;= 30:
+            break
+        if author_counts[post.author_id] < max_consecutive:
+            result.append(post)
+            author_counts[post.author_id] += 1
+    
+    return result[:30]
+```
+
+**Why consecutive, not total:**
+- Users tolerate seeing the same author multiple times if they're separated by other content
+- A total cap would unfairly penalize prolific authors (journalists, influencers)
+- Consecutive cap balances relevance with variety
+
+**Content type diversity:**
+
+| Content Type | Max Share | Why |
+| --- | --- | --- |
+| Video (incl. Reels) | 30% | High engagement but time-consuming |
+| Photo | 30% | Balanced engagement/consumption |
+| Text only | 20% | Low consumption barrier, but less engaging |
+| Link | 10% | Takes user off-platform |
+| Story | 5% | Ephemeral, different UX |
+| Suggested | 10% | New sources to explore |
+
+**Implementation:** Tracked as a running counter during the diversity filtering step. Each post type maintains a counter of its count in the output feed. When a type hits its cap, posts of that type are deferred to the overflow pool.
+
+**Tradeoff:** Diversity constraints reduce pure relevance. If the top-30 posts by ML score would all be from photos, the constraint forces in some videos and links, potentially lowering the average score by 5–10%. This is intentional — user satisfaction is not maximized by pure relevance.
+
+## Fairness for Content Creators
+
+The feed must be fair enough that creators feel incentivized to keep creating content, even if they're not superstars.
+
+**Problem: The "rich get richer" feedback loop**
+
+Popular authors get more impressions → more engagement → higher ML scores → even more impressions. New or small authors struggle to break through.
+
+**Mitigation 1: Explore/Exploit tradeoff**
+
+10% of feed slots are reserved for "exploration" — content from authors the user hasn't engaged with before but who are in their social graph.
+
+```
+Explore/Exploit split:
+┌─────────────────────────────────────────────┐
+│  Slot 1–27  → Exploit (top ML-ranked posts) │
+│  Slot 28    → Explore (new author, same     │
+│               content type as slot 27)       │
+│  Slot 29    → Explore (different type)       │
+│  Slot 30    → Test (A/B test new source)    │
+└─────────────────────────────────────────────┘
+```
+
+**Mitigation 2: Recency boost for new authors**
+
+New authors (account < 30 days old, < 100 followers) get a 2x engagement recency boost for their first 50 posts. This is a fixed multiplier, not learned — it's a system-level fairness guarantee.
+
+```
+adjusted_score = ml_score * (1 + exploration_boost)
+where:
+  exploration_boost = 0.2 if author.is_new and author.post_count < 50
+  exploration_boost = 0.0 otherwise
+```
+
+**Mitigation 3: Engagement velocity normalization**
+
+Authors with many followers naturally get more raw engagement. To prevent this from dominating the ranking, engagement signals are normalized per-follower:
+
+```
+normalized_likes = raw_likes / sqrt(author_follower_count)
+normalized_comments = raw_comments / sqrt(author_follower_count)
+```
+
+The square root normalization (not linear) prevents two problems:
+- Too weak (log): Big authors never compete with small ones
+- Too strong (1/sqrt): Small authors get disproportionate boost
+
+## Anti-Gaming Measures
+
+If the ranking system is well-defined, bad actors will try to game it. Three primary attack vectors:
+
+**Attack Vector 1: Engagement manipulation (bot farms)**
+
+Bots like and comment on posts to artificially inflate engagement velocity.
+
+**Defense:**
+- **Velocity anomaly detection:** Posts with >10x normal engagement in the first 5 minutes are flagged and their velocity feature is capped at the 95th percentile for their author tier
+- **Bot detection model:** Separate model predicts P(bot_engagement) using account age, login geography, posting patterns, and network analysis
+- **Suppression:** If P(bot_engagement) > 0.8, the engagement signals are ignored entirely
+
+**Attack Vector 2: Clickbait optimization**
+
+Authors learn that sensational thumbnails and headlines get more clicks, degrading content quality over time.
+
+**Defense:**
+- **Negative feedback weighting:** Hide, unfollow, and "See fewer posts from this author" signals are weighted 5x more heavily than positive signals in the engagement velocity calculation
+- **Dwell time verification:** If a user clicks a link but returns to the feed within 2 seconds, the click is discounted
+- **Content quality signal:** Separate ML model (NLP + image analysis) predicts "clickbait probability" and applies a downward score adjustment
+
+**Attack Vector 3: Engagement bait (explicit calls to action)**
+
+Posts that say "Like this if you agree!" or "Tag a friend who..." manipulate engagement.
+
+**Defense:**
+- **NLP detection:** Scans post text for known engagement bait patterns ("like this", "tag someone", "share if", "comment below")
+- **Score penalty:** If detected, the post's engagement velocity features are capped at 50% of raw value
+- **Repeat offender degradation:** Authors with >3 engagement-bait posts in 7 days get their overall content reach reduced by 20% for 30 days
+
+**Defense-in-depth philosophy:**
+No single defense is perfect. The layered approach ensures that defeating one guard requires defeating all of them, and the cost of doing so exceeds the benefit.

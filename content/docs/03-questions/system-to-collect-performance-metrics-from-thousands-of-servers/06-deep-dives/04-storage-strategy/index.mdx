@@ -1,0 +1,167 @@
+---
+title: "Deep Dive: Storage Strategy"
+description: "Columnar storage design, partitioning, and tiered retention for the metrics collection system"
+---
+
+## Schema Design
+
+The storage layer uses a column-oriented approach optimized for time-series workloads. We choose between HBase and Cassandra based on operational familiarity — both provide similar capabilities for this use case. The schema below uses HBase conventions but translates directly to Cassandra.
+
+### Raw Metrics Table
+
+```
+Table: raw_metrics
+Partition Key:   series_key (UUID)
+Clustering Key:  timestamp DESC
+
+Columns:
+  value            double      // The metric value
+  ingest_time      timestamp   // When the system received this value
+  source_type      byte        // 0=agent_push, 1=collector_scrape
+
+Row size estimate:
+  ~5,000 data points per series × 24 hours (10s interval)
+  5,000 × (16 + 8 + 8 + 1) bytes ≈ 560 KB per series
+  20M series × 560 KB ≈ 11.2 TB raw data (before compression)
+  Estimated after columnar compression: ~3–5 TB
+```
+
+**Clustering key order (DESC):** Most queries ask for the most recent data first. Descending order means the latest rows are at the beginning of the row, enabling fast scans without reading tombstones from old data.
+
+### Aggregated Metrics Table
+
+```
+Table: aggregated_metrics
+Partition Key:   series_key (UUID)
+Clustering Key:  timestamp DESC
+
+Columns:
+  avg              double      // Average over the window
+  min              double      // Minimum value
+  max              double      // Maximum value
+  count            long        // Number of data points in window
+  rate             double      // Rate-of-change per second
+  p50              double      // 50th percentile (histograms)
+  p95              double      // 95th percentile
+  p99              double      // 99th percentile
+
+Row size: ~200 bytes per window
+  288 windows/day (5-min intervals) × 200 bytes ≈ 57 KB per series
+  20M series × 57 KB ≈ 1.1 TB (90-day retention)
+```
+
+### Daily Rollups Table
+
+```
+Table: daily_rollups
+Partition Key:   series_key (UUID)
+Clustering Key:  day (date, integer YYYYMMDD)
+
+Columns:
+  daily_avg        double
+  daily_max        double
+  daily_min        double
+  daily_count      long        // Total data points rolled up
+  daily_rate       double      // Average rate-of-change
+
+Row size: ~32 bytes × 365 days ≈ 11.6 KB per series
+  20M series × 11.6 KB ≈ 232 GB (1-year retention)
+```
+
+## Partitioning Strategy
+
+Partitioning by `series_key` creates hot-spot problems if series_keys are not uniformly distributed. We address this with a two-level approach.
+
+### Series Key Hash Distribution
+
+```
+series_key = MD5(metric_name + "|" + sorted(label_key=value)...)
+shard_id = CRC32(series_key) % num_shards
+```
+
+With 20M series_keys and 64 HBase/Cassandra region servers, each server manages ~312K series. This is well-distributed because MD5 and CRC32 both produce uniform hash distributions.
+
+### Hot Spot Mitigation
+
+Some series are inherently hotter than others:
+- **High-cardinality services**: A popular service with many instances may generate thousands of series_keys
+- **Aggregation queries**: Queries like `avg(cpu_usage)` fan-out to all 20M series_keys simultaneously
+
+**Mitigation strategies:**
+
+1. **Salted partition keys for hot series**: If a single series_key accounts for >1% of total ingestion rate, append a salt prefix to create N sub-series. Reassemble on read. This works only for counter-type metrics where values can be summed.
+
+2. **Query fan-out parallelism**: The query service uses Go goroutines to parallelize reads. Each goroutine reads a batch of series_keys from a single shard, reducing per-shard load. With 50 query instances and 1s timeout, we can handle ~500 concurrent fan-out operations.
+
+3. **Hot series pre-aggregation**: Frequently queried series (top 1% by query count) are pre-aggregated at sub-5-minute granularity (e.g., 30-second windows) to reduce query-time computation.
+
+### Region Sizing
+
+| Region | Series | Raw Storage (24h) | Aggregated (90d) | Daily Rollup (1y) |
+| --- | --- | --- | --- | --- |
+| Per server (64 total) | ~312K | ~175 GB | ~17 GB | ~3.6 GB |
+| Total | 20M | ~5.6 TB | ~1.1 TB | ~232 GB |
+
+With HBase region servers running on 64GB-256GB RAM machines, the total region server count scales with raw storage needs. The 5.6 TB raw store is the dominant cost — compressed to ~2–3 TB with columnar encoding (dictionary encoding for label keys, delta-of-delta for timestamps, PFor for values).
+
+## Tiered Retention
+
+Automatic data expiration is enforced via TTL at the storage level, but we also implement a compaction strategy to reclaim space proactively.
+
+### TTL Management
+
+| Tier | TTL | Expiration Mechanism |
+| --- | --- | --- |
+| raw_metrics | 24 hours | HBase CellTTL / Cassandra TTL |
+| aggregated_metrics | 90 days | HBase ColumnTTL / Cassandra TTL |
+| daily_rollups | 1 year | HBase ColumnTTL / Cassandra TTL |
+
+TTL expiration is lazy — data is marked for deletion when the TTL expires and is physically removed during compaction. This means the actual disk usage may exceed the calculated sizes for up to one compaction cycle.
+
+### Compaction Strategy
+
+**HBase:**
+- **Major compaction**: Nightly, merges all SSTables for a region, removing expired TTL entries. Runs during low-traffic hours.
+- **Minor compaction**: Continuous, combines small SSTables. Does NOT remove expired data (that's major compaction's job).
+- **Compaction policy**: `maxSize=2GB, minSize=256MB` — prevents runaway SSTables while avoiding excessive small-file overhead.
+
+**Cassandra:**
+- **Automatic compaction**: Size-tiered compaction (STCS) for time-series data. SSTables of similar size are grouped and merged.
+- **Tombstone cleanup**: Periodic cleanup of deletion markers (TTL expirations). Threshold: 10,000 tombstones per partition triggers a warning.
+
+### Storage Cost Over Time
+
+```
+Month 1:
+  raw_metrics:  500 GB/day × 30 days = 15 TB (rolling 24h)
+  aggregated:   15 GB/day × 30 days = 450 GB (rolling 90d, building up)
+  daily:        0.5 GB/day × 30 days = 15 GB (rolling 1y, building up)
+
+Month 3 (steady state):
+  raw_metrics:  500 GB/day (capped at 24h)
+  aggregated:   1.1 TB (90d steady state)
+  daily:        45 GB (90d into 1y retention)
+
+Month 12 (steady state):
+  raw_metrics:  500 GB/day
+  aggregated:   1.1 TB
+  daily:        232 GB (1y steady state)
+
+Total steady state: ~1.8–2.5 TB compressed
+```
+
+### Migration Strategy
+
+As data ages through tiers, the compaction process naturally moves it from high-granularity to low-granularity storage:
+
+```
+Day 0:  Raw data written → raw_metrics table
+Day 0:  Aggregation job runs → 5-min rollups written → aggregated_metrics table
+Day 1:  Aggregation job runs → 1h rollups written (reads from 5-min rollups)
+Week 1: Aggregation job runs → daily rollups written (reads from 1h rollups)
+Month 3: Daily rollups continue building up over the year
+
+Old raw data expires (24h TTL) → space reclaimed during major compaction
+```
+
+The aggregation pipeline reads from the tier immediately below it, creating a cascading downsample chain. This avoids recomputing rollups from raw data at query time, which would be too expensive for complex aggregations.

@@ -1,0 +1,79 @@
+---
+title: Data Flow
+description: Request check, token refill, and config propagation flows for the API rate limiter
+---
+
+## Request Check Flow
+
+```
+Client → API Gateway → Rate Limiter Service → Redis Cluster → Response
+```
+
+1. Client sends API request with API key in header.
+2. API Gateway extracts `client_id`, `scope_type`, `scope_value` from the request.
+3. Gateway sends gRPC `CheckRateLimit` request to the local Rate Limiter Service.
+4. Rate Limiter Service performs a **read-modify-write** in Redis:
+   a. **Policy lookup**: `GET policy:\{tier\}` from Redis cache (TTL 30s, refreshed on miss).
+   b. **Token refill calculation**: `elapsed = now - lastRefill`; `refill = elapsed * policy.scopes[window].rate`; `tokens = min(capacity, tokens + refill)`.
+   c. **Atomic check-and-consume**: Lua script in Redis atomically checks `tokens &gt;= cost`, deducts if allowed, writes updated `tokens` and `lastRefill`.
+   d. Lua script returns `\{allowed, remaining_tokens, reset_timestamp\}`.
+5. Rate Limiter Service returns gRPC response to gateway.
+6. Gateway adds `X-RateLimit-*` headers to the HTTP response and returns to client.
+7. If denied, gateway returns `429 Too Many Requests` with `Retry-After`.
+
+### Concurrency Safety
+
+The critical path is a **single Lua script** in Redis that performs the entire check-and-consume atomically:
+```lua
+-- KEYS[1] = "rl:\{clientId\}:\{scopeType\}:\{window\}"
+-- ARGV[1] = cost, ARGV[2] = now_ms, ARGV[3] = rate, ARGV[4] = capacity, ARGV[5] = lastRefill
+local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'lastRefill')
+local tokens = tonumber(bucket[1]) or capacity
+local lastRefill = tonumber(bucket[2]) or now_ts
+local elapsed = (ARGV[2] - lastRefill) / 1000
+tokens = math.min(capacity, tokens + elapsed * tonumber(ARGV[3]))
+local allowed = 0
+local remaining = 0
+if tokens &gt;= tonumber(ARGV[1]) then
+  tokens = tokens - tonumber(ARGV[1])
+  allowed = 1
+end
+remaining = math.floor(tokens)
+redis.call('HMSET', KEYS[1], 'tokens', tostring(tokens), 'lastRefill', tostring(ARGV[2]))
+redis.call('EXPIRE', KEYS[1], 3600)
+return \{allowed, remaining\}
+```
+
+This ensures no request exceeds the limit regardless of how many Rate Limiter instances call concurrently.
+
+## Token Refill Flow
+
+Token refill is **lazy** — it happens at check time, not via a background scheduler. This avoids:
+- Complex timer coordination across nodes
+- Race conditions between refill and check operations
+- Additional writes to the store
+
+The refill math is purely deterministic: `tokens = min(burst, current_tokens + elapsed_seconds * rate)`.
+
+Since the Lua script executes atomically, two concurrent checks both compute refill from the same `lastRefill` timestamp and arrive at the same result.
+
+## Config Propagation Flow
+
+```
+Admin Console → Config Store (etcd / Redis PubSub) → Rate Limiter Nodes (gRPC stream)
+```
+
+1. Admin updates a policy via REST API.
+2. API Gateway writes the policy to the **Config Store** (etcd for strong consistency).
+3. Config Store emits a change event.
+4. Each Rate Limiter Service instance subscribes to etcd watch (gRPC long-poll stream).
+5. On receiving a change event, the instance loads the updated policy into its **local in-memory cache**.
+6. The local cache has a 30s TTL as a fallback — stale policies expire even if the watch drops.
+
+### Config Cache Coherency
+
+```
+Rate Limiter Node local cache (in-memory)
+  └── GET policy:\{tier\} → hit → use
+  └── GET policy:\{tier\} → miss → fetch from etcd → cache for 30s
+```

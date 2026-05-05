@@ -1,0 +1,81 @@
+---
+title: Raft Replication & Leader Election
+description: Raft consensus for each partition, leader election, and log replication
+---
+
+## Why Raft Over Primary-Replica
+
+Primary-replica replication is simpler but has critical shortcomings for a distributed key-value store:
+
+- **Split-brain**: If the primary fails but network partitions isolate it, two primaries can serve conflicting writes. Primary-replica requires external coordination (ZooKeeper) to prevent this.
+- **Manual failover**: Leader election is not automatic; operators must intervene or implement custom detection logic.
+- **No consistency guarantee**: Replicas may apply writes out of order if the primary crashes mid-replication.
+
+Raft provides linearizable consistency, automatic leader election, and split-brain protection within the Raft group itself — no external coordination needed.
+
+## Per-Partition Raft Groups
+
+Each virtual partition is an independent Raft group with typically 3 nodes:
+
+```
+Raft Group for partition P:123 (nodes 1, 5, 7)
+
+  Node 1 (Leader) ──┐
+                    ├── Raft AppendEntries ──► Node 5 (Follower)
+  Node 7 (Follower) ─┘
+
+Client writes key="x" -> partition P:123 -> Node 1 (leader)
+Node 1 replicates to Node 5 and Node 7
+Quorum (2 of 3) commits -> Node 1 acks client
+```
+
+**Why one Raft group per partition instead of one global Raft group?**
+
+A single global Raft group would serialize all writes across all partitions, creating a throughput bottleneck. Per-partition Raft groups allow parallel writes to different partitions, scaling throughput linearly with the number of partitions. The tradeoff is more Raft state to manage — each group has its own log, election state, and commit index.
+
+## Leader Election
+
+When a leader crashes or becomes unreachable, followers elect a new leader:
+
+```
+Follower detects missing heartbeats (3 x 100ms = 300ms)
+  -> Increments its term number
+  -> Votes for itself
+  -> Requests votes from all other nodes
+  -> If majority grants vote -> becomes leader
+  -> Sends initial AppendEntries to establish authority
+  -> Clients receive new leader address from metadata cache
+```
+
+**Election safety**: A candidate can only win an election if it has all committed entries. Raft's term-number-based voting ensures that a node with a more up-to-date log always gets more votes (because nodes that voted for the previous leader will not vote again until the new term).
+
+**Why 3 nodes instead of 5?**
+
+3 nodes tolerate 1 failure with minimum latency overhead (1 round-trip vs 2 for 5 nodes). 5 nodes tolerate 2 failures but add ~40% more replication latency. For a key-value store prioritizing low latency, 3 is the sweet spot. For systems prioritizing availability (e.g., database clusters), 5 is preferred.
+
+## Log Replication
+
+Every write goes through the Raft log before being applied to the memtable:
+
+```
+Leader receives client write: key="user:123", value="..."
+  -> Append to local Raft log
+  -> AppendEntries RPC to followers (with the new log entry)
+  -> Followers append to their Raft logs, write WAL, ack
+  -> Leader commits when majority ack (entry index = commit_index)
+  -> Leader applies entry to memtable
+  -> Leader acks client
+  -> Followers apply entry to memtable on next heartbeat
+```
+
+**Batching for throughput**: Individual Raft entries are tiny (a key-value pair + metadata), so sending one RPC per write is wasteful. Leaders batch multiple writes into a single AppendEntries RPC. A typical batch contains 32-256 entries, batched within a configurable timeout (1-10ms) or size limit (4-64KB).
+
+**Why fsync the WAL before Raft ack?**
+
+The Raft log is in memory. If a node crashes before persisting, committed entries are lost. The WAL ensures that committed entries survive a crash. Without the WAL, Raft's durability guarantee is only "until the next reboot" — acceptable for cache systems but not for durable key-value stores.
+
+verification
+[] ## Why Raft Over Primary-Replica
+[] ## Per-Partition Raft Groups
+[] ## Leader Election
+[] ## Log Replication

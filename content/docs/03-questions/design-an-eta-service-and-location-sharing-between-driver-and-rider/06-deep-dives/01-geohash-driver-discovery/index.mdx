@@ -1,0 +1,73 @@
+---
+title: "GeoHash Driver Discovery"
+description: "How to efficiently find nearby available drivers at scale"
+---
+
+## GeoHash vs Geohash Cell Approach
+
+GeoHash encodes lat/lng into a variable-length string where longer prefixes indicate closer proximity. A GeoHash of 5 characters (~2.4km accuracy) for 37.7749/-122.4194 is `9q8yy`. Two locations with the same 5-character prefix are within ~2.4km of each other.
+
+**Alternative: Geohash Cell (Square Grid)**
+Geohash cells divide the world into fixed-size rectangles at each level. Level 4 cells are ~5km × 5km. This is simpler than GeoHash because cells don't wrap at antimeridian or poles.
+
+**Why GeoHash**: The standard `GEORADIUS` implementations in Redis and other stores accept GeoHash as a search primitive. The key advantage is that a single string prefix lookup can identify neighboring cells — the eight neighbors of a GeoHash can be computed by converting to decimal, adding/subtracting offsets, then converting back to GeoHash. This is used for multi-level search (see below).
+
+## Redis GEOSEARCH Implementation
+
+Redis 3.2+ provides `GEOADD` and `GEORADIUS`/`GEOSEARCH` commands natively. This is the core building block.
+
+```
+GEOADD drivers:set 37.7749 -122.4194 "driver:1234"
+GEOADD drivers:set 37.7849 -122.4094 "driver:5678"
+
+GEORADIUS drivers:set -122.4194 37.7749 5 km WITHDIST WITHCOORD SORT ASC
+```
+
+**Why Redis GEOADD**:
+- O(log N) insert (uses sorted sets internally)
+- GEORADIUS runs in O(N + log M) where N is the number of items in the range and M is the total items in the set
+- Atomic: all drivers in a radius are discovered in a single operation
+- Per-driver memory: ~72 bytes (double for position + 64-bit score + member string)
+- 10M drivers × 72 bytes = ~720MB — well within Redis memory budget
+
+**Scaling concern**: A single GEOADD call per driver every few seconds creates high write throughput. For 10M drivers updating every 30s, that's ~333K writes/sec. With Redis Cluster sharded across 50 nodes, each node handles ~6.7K writes/sec — trivial.
+
+## Multi-Level Precision Search
+
+A fixed-radius search (e.g., always 5km) is wasteful when few drivers are available (returns many irrelevant results) or too small (returns zero results in rural areas).
+
+**Two-pass approach:**
+
+```
+Pass 1: GEORADIUS radius=2km → if ≥ 3 drivers, rank and pick best
+Pass 2: GEORADIUS radius=5km → if ≥ 5 drivers, rank and pick best
+Pass 3: GEORADIUS radius=10km → fallback if still few results
+```
+
+This avoids searching a huge area when nearby drivers exist, and only expands when necessary. The key insight is that the cost of GEORADIUS is dominated by the number of results returned (N in O(N + log M)), not the search radius itself. Expanding from 2km to 10km typically returns 2-3× more results, not 25×.
+
+**Optimization with GeoHash prefix caching**: Cache the most recent GeoHash prefix per driver. When the driver's position hasn't changed GeoHash prefix, skip the GEOADD entirely (the driver is already in the correct Redis slot). This eliminates redundant writes.
+
+## Ranking Beyond Proximity
+
+Proximity alone (distance) is insufficient for matching. The ranking function should weigh:
+
+```
+score = w1 × (1 / normalized_eta_to_pickup)
+      + w2 × driver_rating
+      + w3 × vehicle_type_match
+      + w4 × driver_acceptance_rate
+      - w5 × time_since_last_acceptance
+```
+
+**Why ETA, not distance**: ETA from driver to pickup (not just distance) accounts for traffic, one-way streets, and highway access. This is the "time-to-pickup" metric the rider actually cares about.
+
+**Driver rating**: A 4.5+ rating threshold ensures quality. Weighted at ~20% of total score.
+
+**Vehicle type match**: Critical for premium tiers (e.g., XL vehicles for 6+ passengers). If the rider selected XL, only XL-capable drivers are considered, making this a hard filter (not a score).
+
+**Acceptance rate**: Drivers with low acceptance rates may waste rider time. A historical acceptance rate (last 100 offers) helps filter chronic decliners.
+
+**Time since last acceptance**: Freshness matters. A driver who accepted an offer 60 seconds ago is more likely to still be en route than one who accepted 5 minutes ago (they may have already picked up another rider).
+
+**Implementation**: The ranking is computed in-memory on the Matching Service after GEOADD returns results. It's a CPU-bound operation on a small dataset (typically &#60;50 drivers), so it completes in &lt;1ms.

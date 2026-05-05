@@ -1,0 +1,297 @@
+---
+title: API / System Interface
+description: RESTful API endpoints, security requirements, observability, versioning, and integration points for the URL shortening service.
+---
+
+### 1. Short URL Creation API
+
+**Endpoint**: `POST /api/shorten`
+
+**Request**:
+
+```json
+{
+  "original_url": "https://example.com/very/long/path?param=value",
+  "custom_alias": "my-brand", // optional
+  "expires_in": 86400, // optional: seconds until expiration (default: null = never expires)
+  "metadata": \{ "campaign": "summer2024" \} // optional
+}
+```
+
+**Response** (Success - 201 Created):
+
+```json
+{
+  "short_url": "https://tiny.url/abc123",
+  "id": "abc123",
+  "original_url": "https://example.com/very/long/path?param=value",
+  "custom_alias": "my-brand", // present if provided
+  "expires_at": "2026-04-23T10:00:00Z" // present if expires_in was provided
+}
+```
+
+**Response** (Error):
+
+- `400 Bad Request`: Invalid URL format, custom alias too long/short, invalid metadata
+- `409 Conflict`: Custom alias already exists
+- `429 Too Many Requests`: Rate limit exceeded
+- `403 Forbidden`: Custom alias blocked by blacklist
+- `500 Internal Server Error`: System failure
+
+**Rate Limit**: 100 requests/minute per IP, 1,000 requests/minute per API key
+
+**Idempotency**: Accept `Idempotency-Key` header to prevent duplicate creation
+
+**Performance Target**: P95 < 100ms
+
+### 2. Redirect API
+
+**Endpoint**: `GET /\{short_code\}`
+
+**Request**:
+
+- HTTP GET request to `https://tiny.url/\{short_code\}`
+- Supports HTTP headers: `Accept`, `User-Agent`, `Referer`
+- Preserves query parameters from original URL
+
+**Response**:
+
+- `301 Moved Permanently`: Standard redirect for SEO-friendly behavior (default)
+- `302 Found`: Temporary redirect (for analytics tracking)
+- Headers:
+  - `Location`: Full original URL
+  - `X-Short-URL-ID`: `abc123` (for logging/monitoring)
+  - `Cache-Control`: `no-store, no-cache, must-revalidate` (prevent browser caching of redirect — `no-cache` alone does not prevent caching of the 302; `no-store` is required)
+
+**Additional Behavior**:
+
+- If URL is expired: `410 Gone`
+- If URL is disabled: `404 Not Found`
+- If URL doesn't exist: `404 Not Found`
+- If URL is blacklisted: `403 Forbidden`
+- If URL has custom metadata: `X-Short-URL-Metadata: \{...\}` (optional; only for authenticated API key holders, not public redirects)
+
+**Performance Target**: P95 < 50ms (critical path)
+
+### 3. Analytics API
+
+**Endpoint**: `GET /api/analytics/\{short_code\}`
+
+**Request**:
+
+- Requires authentication (API key or user session)
+- Optional query parameters:
+  - `start_time`: ISO8601 timestamp
+  - `end_time`: ISO8601 timestamp
+  - `granularity`: `hour`, `day`, `week` (default: `day`)
+
+**Response**:
+
+```json
+{
+  "short_code": "abc123",
+  "original_url": "https://example.com/very/long/path?param=value",
+  "total_clicks": 125000,
+  "clicks_by_country": {
+    "US": 45000,
+    "IN": 32000,
+    "GB": 21000,
+    "CA": 12000,
+    "DE": 8000
+  },
+  "clicks_by_device": {
+    "mobile": 78000,
+    "desktop": 42000,
+    "tablet": 5000
+  },
+  "clicks_by_browser": {
+    "Chrome": 85000,
+    "Safari": 25000,
+    "Firefox": 12000,
+    "Edge": 3000
+  },
+  "time_series": [
+    {
+      "timestamp": "2026-04-22T00:00:00Z",
+      "clicks": 5000
+    },
+    {
+      "timestamp": "2026-04-23T00:00:00Z",
+      "clicks": 7500
+    }
+  ],
+  "last_clicked": "2026-04-23T10:00:00Z"
+}
+```
+
+**Rate Limit**: 10 requests/minute per API key
+
+**Performance Target**: P95 < 200ms (aggregations may be cached)
+
+### 4. Custom Alias Validation API
+
+**Endpoint**: `GET /api/validate/\{alias\}`
+
+**Request**:
+
+- `GET /api/validate/my-brand`
+
+**Response**:
+
+- `200 OK`: Alias is available
+- `409 Conflict`: Alias is already in use
+- `400 Bad Request`: Alias invalid format (too short/long, contains invalid characters)
+- `403 Forbidden`: Alias blocked by blacklist
+
+**Performance Target**: P95 < 20ms
+
+### 5. URL Deletion API (Admin)
+
+**Endpoint**: `DELETE /api/admin/urls/\{short_code\}`
+
+**Request**:
+
+- Requires admin authentication
+- Optional query parameter: `force=true` to bypass expiration checks
+
+**Response**:
+
+- `204 No Content`: Successfully deleted
+- `404 Not Found`: URL doesn't exist
+- `403 Forbidden`: Unauthorized access
+- `400 Bad Request`: Invalid parameters
+
+### 6. Bulk URL Creation API (Enterprise)
+
+**Endpoint**: `POST /api/bulk/shorten`
+
+**Request**:
+
+```json
+[
+  {
+    "original_url": "https://example.com/long1",
+    "custom_alias": "link1"
+  },
+  {
+    "original_url": "https://example.com/long2",
+    "custom_alias": "link2"
+  }
+]
+```
+
+**Response**:
+
+```json
+[
+  {
+    "original_url": "https://example.com/long1",
+    "short_url": "https://tiny.url/link1",
+    "status": "success",
+    "error": null
+  },
+  {
+    "original_url": "https://example.com/long2",
+    "short_url": "https://tiny.url/link2",
+    "status": "success",
+    "error": null
+  }
+]
+```
+
+**Rate Limit**: 100 requests/minute per API key
+
+**Performance Target**: P95 < 500ms for batch of 100 URLs
+
+### 7. Health Check API
+
+**Endpoint**: `GET /health`
+
+**Response**:
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-04-22T10:00:00Z",
+  "version": "2.1.0",
+  "dependencies": {
+    "database": "healthy",
+    "cache": "healthy",
+    "analytics_queue": "healthy",
+    "blacklist_service": "healthy"
+  }
+}
+```
+
+### API Design Principles
+
+1. **Consistent Error Handling**: Always return structured JSON errors with clear codes and messages
+2. **Idempotency**: All write operations support `Idempotency-Key` header
+3. **Pagination**: All listing endpoints support `limit` and `offset` parameters
+4. **Caching**: All read endpoints support `If-None-Match` and `If-Modified-Since` headers
+5. **Rate Limiting**: Enforced at API gateway level with configurable policies
+6. **Authentication**: API keys required only for analytics and enterprise endpoints (creation is anonymous)
+7. **HTTPS Only**: All endpoints require TLS 1.2+ (TLS 1.3 preferred; TLS 1.2 acceptable with strong cipher suites only)
+8. **CORS**: Configure CORS policy to allow trusted domains only
+9. **Logging**: All API requests logged with request ID for traceability
+10. **Versioning**: API versioned in URL path (`/api/v1/...`) with 12-month deprecation policy
+
+### Performance and Scaling Requirements
+
+- **Redirect API**: Must handle ~23,000 requests/second with < 50ms P95 latency (peak 90,000+ RPS accounting for 4x peak multiplier)
+- **Creation API**: Must handle 600+ requests/second with < 100ms P95 latency
+- **Analytics API**: Must support 100+ concurrent queries with < 200ms P95 latency
+- **Blacklist Check**: Must be sub-20ms per check (cached in memory)
+- **Rate Limiting**: Must handle ~24,000 checks/second with sub-10ms latency
+- **Throughput**: System must sustain 10M+ daily active users and 2B+ redirects/day
+
+### Security Requirements
+
+1. **Input Validation**: All URLs must be validated against RFC 3986
+2. **Content Filtering**: Block known malicious domains and patterns
+3. **Rate Limiting**: Prevent abuse and DDoS attacks
+4. **CORS Policy**: Restrict to trusted origins only
+5. **HTTPS Enforcement**: All endpoints must use TLS 1.3+
+6. **API Key Management**: Secure storage and rotation
+7. **Admin Access**: Multi-factor authentication required for admin endpoints
+8. **Audit Logging**: All admin actions logged with user context
+9. **DDoS Protection**: Integrated with cloud provider's DDoS protection
+10. **Data Sanitization**: All user input must be sanitized before storage
+
+### Observability Requirements
+
+1. **Metrics**: Expose Prometheus metrics for all critical operations
+2. **Tracing**: Implement distributed tracing (Jaeger/Zipkin) for request flow
+3. **Logs**: Structured JSON logs with request ID correlation
+4. **Alerting**: Real-time alerts for:
+   - Latency spikes (> 100ms P95)
+   - Error rate > 1%
+   - Rate limit violations
+   - Database connection issues
+   - Blacklist hits
+5. **Dashboards**: Real-time monitoring dashboards for:
+   - Traffic volume
+   - Success/error rates
+   - System health
+   - Storage usage
+   - Analytics trends
+
+### API Versioning Strategy
+
+- Current version: `v1`
+- Backward compatibility maintained for 12 months after deprecation
+- Deprecated endpoints marked with `Deprecation` header
+- New features introduced in new endpoints, not breaking existing ones
+- Versioned in URL path: `/api/shorten` (current: v1), `/api/v1/analytics/...`, etc. — creation API is unversioned for ergonomics; analytics and admin APIs carry explicit `/v1/` prefix.
+- All changes documented in changelog
+- Client libraries maintained for major versions
+
+### Integration Points
+
+1. **Authentication Service**: For user management and API key validation
+2. **Blacklist Service**: For URL filtering (could be external)
+3. **Analytics Pipeline**: For ingestion of click events
+4. **Monitoring System**: For health checks and alerting
+5. **Configuration Service**: For dynamic configuration of rate limits, TTLs, etc.
+6. **Caching Layer**: For URL mapping and blacklist lookups
+7. **Message Queue**: For async processing of analytics and cleanup tasks

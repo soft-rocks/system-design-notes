@@ -1,0 +1,180 @@
+---
+title: "API Design"
+description: "Endpoint specification for URL shortening service"
+---
+
+### API Design
+
+#### Endpoint Specification
+
+| Method   | Endpoint                      | Description                      | Rate Limit                         |
+| -------- | ----------------------------- | -------------------------------- | ---------------------------------- |
+| `POST`   | `/api/v1/links`               | Create a short URL               | 100/min (IP), 1000/min (API key)   |
+| `GET`    | `/\{short_code\}`               | Redirect to original URL         | 10K/hour per IP (DDoS/abuse mitigation) |
+| `GET`    | `/api/v1/links`               | List user's links (paginated)    | 100/min                            |
+| `GET`    | `/api/v1/links/\{short_code\}`  | Get link details + analytics     | 100/min                            |
+| `PUT`    | `/api/v1/links/\{short_code\}`  | Update link metadata / target    | 50/min                             |
+| `DELETE` | `/api/v1/links/\{short_code\}`  | Delete a link                    | 50/min                             |
+| `GET`    | `/api/v1/validate/\{alias\}`    | Check custom alias availability  | 100/min                            |
+| `POST`   | `/api/v1/bulk`                | Bulk URL creation (enterprise)   | 100/min                            |
+| `GET`    | `/health`                     | Health check                     | No limit                           |
+
+**Naming convention:** All API endpoints use `/api/v1/` prefix. The redirect endpoint `GET /\{short_code\}` is intentionally outside the API namespace — it's a direct path served by the HTTP handler, not the API layer.
+
+#### Request/Response Examples
+
+**POST /api/v1/links — Create short URL**
+
+```json
+// Request
+{
+  "original_url": "https://example.com/very/long/path?param=value",
+  "custom_alias": "my-brand",       // optional
+  "expires_at": "2026-12-31T23:59:59Z", // optional, ISO8601
+  "metadata": \{ "campaign": "summer" \} // optional, max 1KB
+}
+
+// Response 201 Created
+{
+  "short_url": "https://t.ly/abc123",
+  "short_code": "abc123",
+  "original_url": "https://example.com/very/long/path?param=value",
+  "created_at": "2026-04-23T10:00:00Z",
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+
+// Response 409 Conflict (alias taken)
+{
+  "error": "CONFLICT",
+  "message": "Custom alias 'my-brand' is already taken"
+}
+
+// Response 400 Bad Request
+{
+  "error": "VALIDATION_ERROR",
+  "message": "Invalid URL format: missing scheme",
+  "details": {
+    "field": "original_url",
+    "issue": "url_scheme_required"
+  }
+}
+```
+
+**Key naming decisions:**
+- `original_url` (not `url` or `target_url`): Explicit about what the field contains — the user-provided URL that we shorten. Consistent across all endpoints.
+- `short_code` (not `id`): The human-readable 8-character code. `id` is used internally (auto-incrementing integer) but never exposed in the API.
+- `expires_at` (not `expires_in`): Absolute timestamp (ISO8601) rather than relative seconds. Avoids client-server clock skew issues.
+
+**GET /api/v1/links/\{short_code\} — Get link details**
+
+```json
+{
+  "short_url": "https://t.ly/abc123",
+  "short_code": "abc123",
+  "original_url": "https://example.com/very/long/path?param=value",
+  "created_at": "2026-04-23T10:00:00Z",
+  "status": "active",
+  "metadata": \{ "campaign": "summer" \},
+  "analytics": {
+    "total_clicks": 125000,
+    "last_clicked": "2026-04-23T09:45:00Z"
+  }
+}
+```
+
+**GET /api/v1/validate/\{alias\} — Check alias availability**
+
+```json
+// 200 OK — available
+\{ "available": true \}
+
+// 409 Conflict — taken
+\{ "available": false, "short_url": "https://t.ly/existing" \}
+
+// 403 Forbidden — blocked by blacklist
+\{ "available": false, "blocked": true \}
+```
+
+#### Error Response Format
+
+All errors follow a consistent structure:
+
+```json
+{
+  "error": "ERROR_CODE",
+  "message": "Human-readable description",
+  "details": {} // optional, structured error context
+}
+```
+
+| HTTP Status | Error Code | Description |
+| --- | --- | --- |
+| 400 | `VALIDATION_ERROR` | Invalid input (bad URL format, alias too short) |
+| 400 | `RATE_LIMIT` | Rate limit exceeded (alternative to 429) |
+| 403 | `FORBIDDEN` | Blocked by blacklist or unauthorized |
+| 404 | `NOT_FOUND` | Short code doesn't exist |
+| 409 | `CONFLICT` | Custom alias already taken |
+| 410 | `GONE` | URL has expired |
+| 429 | `TOO_MANY_REQUESTS` | Rate limit exceeded |
+| 500 | `INTERNAL_ERROR` | Unexpected server error |
+
+#### API Versioning
+
+- **URL path versioning:** `/api/v1/...`. Version is immutable in the path — clients must update to `/api/v2/` when breaking changes are introduced.
+- **Backward compatibility:** Non-breaking changes (new optional fields, new endpoints) are added to the current version. Existing contracts are never modified.
+- **Deprecation policy:** Deprecated versions are announced 12 months in advance. The `Sunset` header is included in responses from deprecated versions:
+  ```
+  Sunset: Sat, 01 Jan 2027 00:00:00 GMT
+  ```
+- **Current version:** `v1`. The redirect endpoint `GET /\{short_code\}` is version-agnostic — short codes are format-stable.
+
+#### Authentication
+
+- **API keys:** Required for all `/api/v1/` endpoints except `/health`.
+  ```
+  Authorization: Bearer sk_live_abc123...
+  ```
+- **Key prefix:** `sk_live_` (production), `sk_test_` (sandbox). Keys are hashed (bcrypt) before storage — never stored in plaintext.
+- **Anonymous shorten:** `POST /api/v1/links` accepts unauthenticated requests with strict IP-based rate limiting (100/min). API-key-authenticated requests get higher limits (1000/min).
+
+#### Idempotency
+
+All write operations (`POST`, `PUT`, `DELETE`) accept an `Idempotency-Key` header:
+
+```
+Idempotency-Key: req-abc123-unique-id
+```
+
+- If the same key is submitted within 24 hours, the original response is returned (not a new operation).
+- The idempotency key is stored in Redis with a 24-hour TTL.
+- This protects against client retries (network timeouts, UI double-clicks).
+
+#### Pagination
+
+All listing endpoints support cursor-based pagination:
+
+```
+GET /api/v1/links?limit=50&cursor=abc123
+```
+
+- `limit`: 1-100 (default 20)
+- `cursor`: opaque cursor from previous response (not offset-based, avoids performance issues on large datasets)
+
+```json
+{
+  "data": [...],
+  "next_cursor": "xyz789",
+  "has_more": true
+}
+```
+
+#### CORS Policy
+
+```
+Access-Control-Allow-Origin: https://app.t.ly
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key
+Access-Control-Max-Age: 3600
+```
+
+Only the web app origin is allowed. Server-to-server API calls use API key authentication (no CORS needed).

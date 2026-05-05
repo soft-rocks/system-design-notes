@@ -1,0 +1,94 @@
+---
+title: "Deep Dive: Fan-out Strategy"
+description: "Hybrid push-pull fan-out, candidate set management, and celebrity handling for Facebook News Feed"
+---
+
+## Hybrid Push-Pull Decision Tree
+
+The decision tree is based on author follower count and determines fan-out strategy.
+
+| Author Followers | Strategy | Fan-out Cost | Example |
+| --- | --- | --- | --- |
+| < 500 | Pure Push | ~500 writes/post | Regular user |
+| 500–5,000 | Push (close) + Pull (rest) | ~200 writes/post | Active community member |
+| 5,000–50,000 | Push (close only) + Pull | ~50 writes/post | Local news page |
+| > 50,000 | Pull-only | 0 writes/post (lazy) | Meta, BuzzFeed, NFL |
+
+**How "close" is determined:**
+- Friends the user interacted with in the last 7 days
+- Friends in the user's Top 50 (most frequent interaction)
+- Co-group members (same active groups)
+- Photo tags together
+
+The thresholds are not static. They adapt dynamically based on:
+- Current system load (raise thresholds during peak traffic)
+- Author post frequency (burst detection → temporary push expansion)
+- User activity level (inactive users get fewer push writes)
+
+## Candidate Set Management
+
+The candidate set is a per-user Redis sorted set: `feed_candidates:\{user_id\}`
+
+**Schema:**
+- Member: `post_id`
+- Score: `post_created_at` (Unix timestamp, used for recency window)
+- TTL: 14 days (auto-expire stale candidates)
+
+**Push Fan-out (write path):**
+```
+Fan-out Service:
+  1. Get author's followers (GraphStore, ~50ms)
+  2. For each active follower (Redis check: last_seen < 7d):
+     - ZADD feed_candidates:\{user_id\} \{post_created_at\} \{post_id\}
+     - Batch: 100 ZADD operations per request
+  3. Rate limit: max 10K ZADDs/sec per Redis node
+```
+
+**Redis capacity planning:**
+- 1B users × ~500 candidates average × ~200 bytes = ~100 TB
+- Solution: Multi-tier storage
+  - Hot (active in 24h): Full candidate set in Redis (~300M users = ~60 TB)
+  - Warm (active in 7d): Partial set in Redis (~500M users = ~40 TB, compressed)
+  - Cold (inactive): No candidate set, pull from PostStore on read
+
+**Pull discovery (read path):**
+When a user's candidate set is empty or depleted:
+```
+CandidateService:
+  1. Query PostStore for posts from followed authors (last 14 days)
+  2. Filter by privacy, snoozed, unfollowed
+  3. Return candidate posts directly (bypass Redis)
+```
+
+## Celebrity Handling
+
+Celebrities (>50K followers) are handled with **pull-only fan-out**, which fundamentally changes how their content appears in feeds.
+
+**Push vs Pull trade-offs:**
+
+| Aspect | Push | Pull |
+| --- | --- | --- |
+| Post appearance latency | < 10 seconds | On next feed render |
+| Write cost at publish | Follower_count × post_size | 0 (single write to PostStore) |
+| Read cost per viewer | 0 (pre-fetched) | 10–50ms (query + merge) |
+| Consistency | Strong (same set for all) | Eventual (depends on render time) |
+| Storage | Follower_count × N posts | Single copy |
+
+**Why pull-only for celebrities:**
+- A post by @NFL (100M followers) → 100M Redis writes per post. At 1K posts/day, that's 100B writes/day — impossible.
+- Pull stores only one copy in PostStore. The 100M readers each pay 10–50ms at render time, which is acceptable.
+
+**Celebrity pull optimization:**
+```
+CandidateService (pull path for celebrity posts):
+  1. Check PostStore for posts from followed authors with follower_count > 50K
+  2. Use Elasticsearch for fast query: 
+     "post_type: photo, created_at: [now-14d TO now], author.followers: > 50K"
+  3. Return posts sorted by created_at, then merged with Redis candidates
+  4. Score merged list in Rank Service
+```
+
+**Hybrid celebrity pages (5K–50K followers):**
+- Push to "close" followers only (those who engaged recently)
+- Pull for everyone else
+- This ensures super-fans always see content from pages they care about, while the bulk of followers discover content organically

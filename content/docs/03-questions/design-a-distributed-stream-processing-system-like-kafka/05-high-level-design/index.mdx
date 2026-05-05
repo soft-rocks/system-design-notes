@@ -1,0 +1,118 @@
+---
+title: High Level Design
+description: Architecture, components, and technology choices for distributed stream processing system
+---
+
+## Architecture Overview
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        Producer / Consumer Pool                                │
+│                                                                                │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐    ┌──────────┐                  │
+│  │Producer 1│   │Producer N│   │Consumer A│    │Consumer B│                  │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘    └────┬─────┘                  │
+│       │ gRPC/UDP      │ gRPC/UDP      │ gRPC            │ gRPC                  │
+│       └───────────────┴───────────────┴────────────────┘                        │
+│                          │ Load Balancer (DNS / sidecar)                        │
+└──────────────────────────┼──────────────────────────────────────────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │   Broker    │◄── Leader for partitions 0-33
+                    │   Node 1    │
+                    │  ┌────────┐ │
+                    │  │ Log    │ │── Sequential disk writes (mmap)
+                    │  │ Segment│ │
+                    │  └────────┘ │
+                    └──────┬──────┘
+                           │ Replication
+                    ┌──────▼──────┐      ┌──────▼──────┐
+                    │   Broker    │◄────►│   Broker    │
+                    │   Node 2    │      │   Node 3    │
+                    │  Follower   │      │  Follower   │
+                    └──────┬──────┘      └──────┬──────┘
+                           │                    │
+              ┌────────────┼────────────────────┼────────────┐
+              │            │                    │            │
+      ┌───────▼──────┐ ┌──▼───────┐    ┌───────▼──────┐ ┌──▼───────┐
+      │   Broker 4   │ │ Broker 5 │...│  Broker 98   │ │ Broker 99│
+      │  (various    │ │ (various │   │  (various    │ │ (various │
+      │   roles)     │ │   roles) │   │   roles)     │ │   roles) │
+      └──────────────┘ └──────────┘   └──────────────┘ └──────────┘
+                           │
+                    ┌──────▼──────┐
+                    │ Controller  │
+                    │ (one broker)│── Manages partition leadership, topic CRUD
+                    └─────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │ Coordination│
+                    │ (ZooKeeper  │
+                    │  or Raft)   │
+                    └─────────────┘
+```
+
+### Design Rationale
+
+- **Partition-per-broker distribution**: Partitions are spread across all brokers. Each broker is the leader for some partitions and follower for others. This ensures load is balanced.
+- **Sequential disk writes**: Messages are appended to a log file via sequential writes. Modern disks can sustain ~500MB/s sequential write — far exceeding random I/O. Memory-mapped files (mmap) eliminate kernel userspace copies.
+- **Async replication**: Followers pull from the leader asynchronously, keeping producer latency low. ISR management ensures consistency without sacrificing throughput.
+- **Controller + coordination store**: One broker acts as controller (via leader election in coordination store). It handles partition assignment, leader election, and topic lifecycle. Standby controllers take over on failure.
+
+## Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Cluster Management                           │
+│                                                                     │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
+│  │  Coordinator │    │   Controller │    │  Metadata    │          │
+│  │  (group mgmt)│    │  (leader     │    │  Store       │          │
+│  │              │    │   election)  │    │  (ZK / Raft) │          │
+│  └──────┬───────┘    └──────┬───────┘    └──────────────┘          │
+│         │                   │                                        │
+│         └────────┬──────────┘                                        │
+│                  │                                                   │
+│  ┌───────────────▼──────────────────────────────────────┐           │
+│  │                   Broker Cluster                      │           │
+│  │                                                      │           │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐           │           │
+│  │  │  Broker  │  │  Broker  │  │  Broker  │  ...      │           │
+│  │  │   1      │  │   2      │  │   3      │           │           │
+│  │  │──────────│  │──────────│  │──────────│           │           │
+│  │  │ Log     │  │ Log     │  │ Log     │             │           │
+│  │  │ Segment │  │ Segment │  │ Segment │             │           │
+│  │  │ (mmap)  │  │ (mmap)  │  │ (mmap)  │             │           │
+│  │  └──────────┘  └──────────┘  └──────────┘           │           │
+│  │                                                      │           │
+│  │  ┌──────────┐  ┌──────────┐                          │           │
+│  │  │  Index  │  │  Index  │  │  ...                 │           │
+│  │  │ (offset  │  │ (offset  │                          │           │
+│  │  │  → pos)  │  │  → pos)  │                          │           │
+│  │  └──────────┘  └──────────┘                          │           │
+│  └──────────────────────────────────────────────────────┘           │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────┐           │
+│  │              Log Compaction Service                   │           │
+│  │  (background thread, runs per-broker)                │           │
+│  └──────────────────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Technology Choices
+
+| Component | Choice | Rationale | Alternatives Considered |
+|---|---|---|---|
+| **Message storage** | Sequential disk + mmap | Sequential writes max out disk bandwidth; mmap eliminates copy overhead; direct I/O bypasses page cache | In-memory (no persistence), RocksDB (adds complexity for no gain) |
+| **Coordination** | ZooKeeper or Raft | Mature leader election, session management, and distributed locks | Etcd (similar but less mature), custom Paxos (error-prone) |
+| **Replication protocol** | Asynchronous pull | Followers pull from leader — simpler failure model, backpressure naturally handled | Push-based (leader must track each follower's readiness) |
+| **Message format** | Binary (Protocol Buffers) | Compact serialization, strong typing, small wire size | JSON (too large), Avro (requires schema registry) |
+| **Consumer offset storage** | Internal topic (__consumer_offsets) | Durable, replicable, queryable | ZooKeeper (single point of contention, deprecated in Kafka) |
+| **Load balancing** | DNS + client-side routing | Producers and consumers know leader for each partition from metadata; no single proxy bottleneck | Reverse proxy (adds latency, single point of failure) |
+
+### Why Sequential Disk over SSD or Memory?
+
+At 1B messages/sec × 1KB = 1TB/s, memory-only is impossible (would require 1TB of RAM). SSDs provide high IOPS but sequential disk writes still win because:
+1. **Bandwidth matters more than IOPS** for sequential append workloads — spinning disks sustain ~250MB/s per drive with linear scaling; adding 100 drives = 25GB/s, well above 1TB/s peak.
+2. **Cost**: HDDs are 10x cheaper per TB than SSDs. At 10TB/day storage, cost savings are significant.
+3. **mmap optimization**: The OS page cache holds hot data; writes go through the page cache and are flushed by the OS at its optimal time.

@@ -1,0 +1,164 @@
+---
+title: "High Level Design"
+description: "High-level architecture for the performance metrics collection system — ingestion, aggregation, query, and alerting"
+---
+
+## Architecture Overview
+
+The system follows a **publish-subscribe** architecture with a three-tier storage model: raw → aggregated → daily rollups.
+
+```
+Tier 1: Ingestion Layer
+├── Collector Service (10 instances): TCP/UDP ingestion, validation, dedup
+├── Kafka (metrics-write topic): durable event stream, partitioned by series_key
+└── Dedup Cache (Redis): per-series_key + timestamp window dedup
+        │
+        ▼
+Tier 2: Processing Layer
+├── Aggregation Service (Flink): tumbling window aggregators
+├── Aggregation Writer: writes to HBase/Cassandra
+└── Label Index (Cassandra): metric_name + labels → series_key mapping
+        │
+        ▼
+Tier 3: Serving Layer
+├── Query Service (50 instances): query parsing, shard routing, result merge
+├── Query Cache (L1 local + L2 Redis): 2m TTL
+├── Alert Evaluator: poll-based rule evaluation every 30s
+└── Alert Dispatcher: webhook, PagerDuty, Slack, email
+```
+
+**Key design decisions:**
+
+1. **Kafka as the durable backbone**: All metrics pass through Kafka, providing durability, replayability, and natural decoupling between ingestion and aggregation. This means aggregation can be rebuilt from Kafka if needed — no data loss.
+
+2. **Columnar storage for time-series data**: HBase/Cassandra with series_key as partition key and timestamp as clustering key. Column families store raw values separately from aggregated values. This enables efficient time-range scans and automatic TTL-based expiration.
+
+3. **Window-based aggregation with late-arrival tolerance**: 5-minute tumbling windows with 1-minute grace period. Late data is re-aggregated from raw store. This balances freshness against complexity.
+
+4. **Query-time downsampling**: The query service determines the appropriate granularity based on the time range requested. Recent queries hit the raw store; historical queries automatically use aggregated or daily rollup stores.
+
+## Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Agents (10,000)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  Node 1      │  │  Node 2      │  │  Node N      │          │
+│  │  (statsd)    │  │  (OTel)      │  │  (exporter)  │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+└─────────┼─────────────────┼──────────────────┼─────────────────┘
+          │ TCP/UDP push    │                  │
+          ▼                 ▼                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Ingestion Layer                               │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────┐      │
+│  │            Collector Service (10 instances)             │      │
+│  │                                                       │      │
+│  │  1. Parse & validate payload                          │      │
+│  │  2. Redis dedup (setnx, TTL 60s)                      │      │
+│  │  3. Write to Kafka (partition = hash(series_key))     │      │
+│  └───────────────┬───────────────────────────────────────┘      │
+└──────────────────┼──────────────────────────────────────────────┘
+                   │
+                   │ topic: metrics-write (partitioned by series_key)
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Processing Layer                              │
+│                                                                  │
+│  ┌─────────────────────────────┐    ┌─────────────────────────┐ │
+│  │  Aggregation Service        │    │  Label Index            │ │
+│  │  (Flink Streaming)          │    │  (Cassandra)            │ │
+│  │                             │    │                         │ │
+│  │  • 5min tumbling window     │    │  PARTITION: metric_name │ │
+│  │  • 1min late-arrival tol    │    │  CLUSTERING: label_set  │ │
+│  │  • Compute: avg/min/max     │    │  VALUE: series_key[]    │ │
+│  │  • Merge histogram buckets  │    │                         │ │
+│  │  • Compute percentiles      │    │  Enables:               │ │
+│  └──────────┬──────────────────┘    │  • Reverse label lookup │ │
+│             │                       │  • Series discovery     │ │
+│             ▼                       └─────────────────────────┘ │
+│  ┌─────────────────────────────┐                                │
+│  │  Aggregation Writer         │                                │
+│  │                             │                                │
+│  │  • Write 5min rollups       │                                │
+│  │    → aggregated_store (90d) │                                │
+│  │  • Write 1h rollups         │                                │
+│  │    → aggregated_store (90d) │                                │
+│  │  • Write 24h rollups        │                                │
+│  │    → daily_rollups (1y)     │                                │
+│  └──────────┬──────────────────┘                                │
+└─────────────┼───────────────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Storage Layer                                 │
+│                                                                  │
+│  ┌──────────────────┐    ┌──────────────────┐                   │
+│  │ raw_metrics      │    │ aggregated_store │                   │
+│  │ (HBase/Cass)     │    │ (HBase/Cass)     │                   │
+│  │ TTL: 24h         │    │ TTL: 90d         │                   │
+│  │ 10s granularity  │    │ 5min granularity │                   │
+│  └──────────────────┘    └──────────────────┘                   │
+│                                                                  │
+│  ┌──────────────────┐                                            │
+│  │ daily_rollups    │                                            │
+│  │ (HBase/Cass)     │                                            │
+│  │ TTL: 1y          │                                            │
+│  │ 24h granularity  │                                            │
+│  └──────────────────┘                                            │
+└──────────────────────────────────────────────────────────────────┘
+              ▲
+              │
+              │ query
+┌─────────────┼───────────────────────────────────────────────────┐
+│                    Serving Layer                                 │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────┐      │
+│  │            Query Service (50 instances)                 │      │
+│  │                                                       │      │
+│  │  1. Parse query → identify metric + labels            │      │
+│  │  2. Lookup series_keys from Label Index               │      │
+│  │  3. Select store tier (raw / aggregated / rollup)     │      │
+│  │  4. Fan-out reads to all shards                       │      │
+│  │  5. Merge, downsample, compute                        │      │
+│  │  6. Cache result (L1 local 2m, L2 Redis 5m)           │      │
+│  └───────────────┬───────────────────────────────────────┘      │
+└──────────────────┼──────────────────────────────────────────────┘
+                   │
+         ┌─────────┴─────────┐
+         ▼                   ▼
+  ┌──────────────┐    ┌──────────────┐
+  │ Dashboard    │    │  Alert       │
+  │ Users        │    │  Evaluator   │
+  └──────────────┘    │              │
+                      │ • Poll 30s   │
+                      │ • Evaluate   │
+                      │ • Fire alerts│
+                      └──────┬───────┘
+                             │
+                             ▼
+                      ┌──────────────┐
+                      │  Alert       │
+                      │  Channels    │
+                      │ (PagerDuty,  │
+                      │  Slack, etc) │
+                      └──────────────┘
+```
+
+## Technology Choices
+
+### Technology Choices
+
+| Component | Choice | Why |
+| --- | --- | --- |
+| **Ingestion Protocol** | TCP (primary) + UDP (fallback) | TCP ensures delivery; UDP for non-critical metrics at higher throughput. Keep-alive connections reduce per-message overhead. |
+| **Message Queue** | Apache Kafka | Durable, ordered, replayable stream. Partitioning by series_key ensures all data for a metric goes to the same consumer. |
+| **Raw Storage** | HBase (Cassandra) | Columnar storage, excellent for time-series data with natural time-based pruning. Built-in TTL for automatic data expiration. |
+| **Aggregation Engine** | Apache Flink | Stream processing with exactly-once semantics, windowed aggregations, and late-arrival handling. |
+| **Label Index** | Cassandra secondary index | Supports complex label-based lookups to find series_keys matching arbitrary filter combinations. |
+| **Query Service** | Go (high throughput) | Low-latency, high-concurrency goroutines for fan-out reads and result merging. |
+| **Query Cache** | Local + Redis (L1/L2) | L1 for single-instance cache (2m), L2 for cross-instance shared cache (5m). |
+| **Dedup Cache** | Redis | Fast setnx operation with TTL for deduplication within 60-second window. |
+| **Alert Evaluator** | Go (poll-based) | Simple, reliable, and easy to debug. Poll every 30s rather than complex rule-engine streaming. |
+| **Monitoring** | Prometheus + Grafana (self-monitoring) | The system monitors itself using the same tooling it provides. |

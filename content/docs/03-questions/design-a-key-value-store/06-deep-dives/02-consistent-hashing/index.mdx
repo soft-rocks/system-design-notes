@@ -1,0 +1,75 @@
+---
+title: Consistent Hashing & Partitioning
+description: Hash ring, virtual partitions, and rebalancing strategies
+---
+
+## The Hash Ring
+
+Consistent hashing maps keys to a fixed hash space (typically 2^32 = ~4.3 billion slots). Each slot is assigned to a physical node. To look up which node owns a key:
+
+```
+1. hash(key) = slot in [0, 2^32)
+2. Find the node responsible for that slot
+3. Route request to that node
+```
+
+The responsibility mapping changes only when nodes join or leave. Each node owns a contiguous range of slots:
+
+```
+Node 1: slots [0x00000000, 0x2AAAAAAA)
+Node 2: slots [0x2AAAAAAA, 0x55555555)
+Node 3: slots [0x55555555, 0x80000000)
+...
+```
+
+**Why consistent hashing over modulo partitioning?**
+
+With hash modulo N partitions (N = node count), adding a node changes N, which changes the modulo for ALL keys. This means 100% of data must be migrated — devastating during scaling. With consistent hashing, adding a node only affects its own slice: keys that previously mapped to the adjacent node's range now map to the new node. Only ~1/N of keys need to move.
+
+## Virtual Partitions
+
+A physical node owns a contiguous range of hash slots, but the range is divided into many virtual partitions (typically 500-2000 per node). Each virtual partition is an independent Raft group.
+
+```
+Node 1: vP0-vP499  (500 virtual partitions)
+Node 2: vP500-vP999 (500 virtual partitions)
+Node 3: vP1000-vP1499 (500 virtual partitions)
+```
+
+**Why virtual partitions instead of one partition per node?**
+
+With only 3 partitions (one per node), rebalancing is too coarse — adding a 4th node forces one node to give away 1/3 of its partitions, which is a massive data transfer. With 1000 virtual partitions, adding a node affects only ~500 partitions (~50% of the new node's capacity), allowing smooth load distribution.
+
+**Tradeoff: virtual partition count**
+
+| Virtual Partitions | Migration Granularity | Raft Group Overhead | Metadata Cache Size |
+|---|---|---|---|
+| 100 | Coarse (large migrations) | Low (few groups) | Small |
+| 1000 | Balanced | Moderate | Medium |
+| 10000 | Fine (small migrations) | High (many groups) | Large |
+
+Production default: 1000 virtual partitions per node.
+
+## Rebalancing
+
+When a node joins or leaves, the rebalancer recalculates the virtual partition assignment:
+
+```
+Step 1: Remove the leaving node's virtual partitions from the ring
+Step 2: Assign them to remaining nodes (balance by count, not by data volume)
+Step 3: New node gets virtual partitions from the under-represented range
+Step 4: For each reassigned virtual partition, trigger data migration
+```
+
+**Data migration strategy:**
+
+For each reassigned virtual partition, the old leader streams SSTable files to the new leader in the background. The metadata cache is updated atomically once migration completes. During migration, reads for that partition are served from both old and new leaders (with a fallback lookup). Writes go only to the new leader once the Raft group is formed.
+
+**Why not migrate by data volume instead of partition count?**
+
+Migrating by count ensures even Raft group distribution, but nodes with larger data (more SSTable files) may be over-represented. Most systems accept this imbalance — Raft performance depends on log length, not file count, and 1000 virtual partitions provides enough granularity that volume imbalance is negligible.
+
+verification
+[] ## The Hash Ring
+[] ## Virtual Partitions
+[] ## Rebalancing

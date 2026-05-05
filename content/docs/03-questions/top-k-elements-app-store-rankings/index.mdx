@@ -1,0 +1,16 @@
+---
+title: Top-K Elements — App Store Rankings
+description: System design for computing and serving dynamic app store rankings at scale.
+---
+
+This document covers the system design for ranking apps in an app store (like Apple App Store or Google Play Store) at massive scale.
+
+## Contents
+
+- [Requirements](01-requirements/) — Functional, non-functional requirements and scale assumptions
+- [Core Entities](02-core-entities/) — App, Signal, RankingScore, Category, RankingEntry
+- [API / System Interface](03-api-system-interface/) — Query API, admin API, internal service interfaces
+- [Data Flow](04-data-flow/) — Signal ingestion, score computation, ranking update, query serving
+- [High Level Design](05-high-level-design/) — Architecture, component diagram, technology choices
+- [Deep Dives](06-deep-dives/) — Score formula, time decay, anti-gaming, caching strategy
+

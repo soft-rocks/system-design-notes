@@ -1,0 +1,140 @@
+---
+title: Alerting System
+description: Deep dive into the alerting system for the metrics platform
+---
+
+## Rule Evaluation Engine
+
+### Evaluation Cycle
+
+The Alerting Service runs a **pull-based evaluation loop**:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Alerting Service (single coordinator, standby standby)   │
+│                                                         │
+│  for each cycle (every 60s):                            │
+│    for each rule in Rule Registry:                      │
+│      query = buildCQL(rule.metricFilter, rule.condition) │
+│      result = cassandra.execute(query)                   │
+│      if result triggers(rule.condition):                 │
+│        fireAlert(rule, result)                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+- **Coordinator**: one Alerting Service instance is the coordinator (etcd leader election). Standby instances take over on failure.
+- **Rule Registry**: all active rules are loaded in-memory from Cassandra on startup. Refreshed every 60s (same as evaluation cycle).
+- **Query generation**: each rule's metric filter + condition is translated into one or more CQL queries. Simple thresholds become single queries; complex expressions (e.g., `rate(cpu.usage) > 80 for 5m`) become 2–3 queries with in-process computation.
+
+### Rule-to-Query Translation
+
+| Rule Expression | Generated Query |
+|---|---|
+| `cpu.usage > 90` | `SELECT avg_value FROM metrics_rollup_minute WHERE metric_id='cpu.usage' AND avg_value > 90 ORDER BY timestamp DESC LIMIT 1` |
+| `http.errors > 100 for 5m` | Query 5 consecutive minute rollups, sum errors, check if sum > 100 |
+| `rate(memory.bytes) > 1MB/s` | Query 2 consecutive minutes, compute `(val2 - val1) / 60` |
+
+## Evaluation Window and Windowing
+
+### Problem: Sliding Window Semantics
+
+A rule like "fire if `avg(cpu.usage) > 90` for 5 minutes" means: **all** data points in the last 5 minutes must exceed 90. This requires a sliding window of the last 5 data points (one per minute).
+
+### Implementation: Materialized Window Table
+
+```sql
+CREATE TABLE alert_evaluation_window (
+    rule_id TEXT,
+    evaluation_time BIGINT,
+    metric_value DOUBLE,
+    triggered BOOLEAN,
+    PRIMARY KEY (rule_id, evaluation_time)
+) WITH CLUSTERING ORDER BY (evaluation_time DESC)
+   AND default_time_to_live = 600;  -- 10min window
+```
+
+On each evaluation cycle:
+1. Query the current metric value.
+2. Insert into `alert_evaluation_window`.
+3. Count how many consecutive `triggered = true` entries exist (from most recent).
+4. If count &gt;= 5 (5 minutes), fire the alert.
+5. On `triggered = false`, the consecutive count resets.
+
+This avoids in-memory state for the Alerting Service — window state is durable and survives restarts.
+
+## Deduplication and Suppression
+
+### Deduplication
+
+If the same condition is already firing, do not send duplicate alerts:
+
+```
+Rule fires (triggered=true) → send alert → start cooldown
+Cooldown: 5 minutes (configurable per rule)
+After cooldown: allow re-evaluation
+If still triggered: send "still firing" (lower severity)
+If cleared then re-triggered: send "new alert" (highest severity)
+```
+
+### Suppression Windows
+
+Prevent alert storms by suppressing alerts for recently-triggered rules:
+
+```
+Rule A fires at 10:00
+Rule B has suppression_of = ["Rule A"], suppression_window = 30min
+Rule B triggers at 10:05 → suppressed (Rule A was active within 30min)
+Rule B triggers at 10:40 → fired (Rule A suppression window expired)
+```
+
+Suppression is tracked in a lightweight Cassandra table:
+```sql
+CREATE TABLE alert_suppression (
+    rule_id TEXT,
+    suppressed_until BIGINT,
+    PRIMARY KEY (rule_id)
+) WITH default_time_to_live = 1800;
+```
+
+### Deduplication and Suppression Flow
+
+```
+Rule evaluates → value exceeds threshold
+  ├─ Check cooldown → still in cooldown? → skip
+  ├─ Check suppression → any rules active? → suppress
+  └─ Fire alert → send to notification pipeline → start cooldown
+```
+
+## Alert Firing Pipeline
+
+```
+AlertFireEvent → Kafka (alert-events) → Notification Router → Dispatchers
+```
+
+1. **AlertFireEvent**: serialized alert payload written to Kafka topic `alert-events`.
+2. **Notification Router**: consumes from Kafka, applies routing rules:
+   - Severity-based routing: P1 → PagerDuty + Slack + email, P2 → Slack + email, P3 → email only.
+   - Team-based routing: labels on the metric determine the on-call team (from a separate team registry).
+3. **Dispatchers**: per-channel handlers (PagerDuty API, Slack webhook, SMTP).
+
+This decoupling ensures that a notification service outage does not cause alert loss — Kafka persists the events until dispatch succeeds.
+
+### Alert Payload
+
+```json
+{
+  "alert_id": "alert-abc-123",
+  "rule_id": "rule-cpu-high",
+  "rule_name": "CPU Usage High",
+  "severity": "CRITICAL",
+  "fired_at": "2026-05-02T10:00:00.000Z",
+  "value": 94.5,
+  "threshold": 90,
+  "duration_seconds": 300,
+  "labels": \{"host": "web-3", "region": "us-east"\},
+  "annotations": {
+    "summary": "CPU usage above 90% on web-3",
+    "runbook_url": "https://wiki.internal/runbooks/cpu-high"
+  }
+}
+```

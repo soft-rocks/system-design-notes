@@ -1,0 +1,154 @@
+---
+title: High Level Design
+description: Architecture overview, component diagram, and technology choices for the Netflix screen-limit system.
+---
+
+## Architecture Overview
+
+The Netflix Screen Limit System follows a **multi-region active-active** architecture with **in-memory state for hot-path operations** and **relational storage for authoritative account data**. The design prioritizes low-latency limit checks while maintaining eventual consistency across regions.
+
+```
+                    ┌─────────────────────────────────────────────────┐
+                    │                  INTERNET                        │
+                    │              (CDN / Edge DNS)                    │
+                    └────────────────┬────────────────────────────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              │                      │                      │
+     ┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+     │   EU-West Edge   │   │  US-East Edge   │   │  APAC-South Edge │
+     │   Region         │   │   (Primary)     │   │   Region         │
+     │                  │   │                 │   │                  │
+     │ ┌──────────────┐ │   │ ┌──────────────┐│   │ ┌──────────────┐ │
+     │ │Stream Limit  │ │   │ │Stream Limit  ││   │ │Stream Limit  │ │
+     │ │Service (N)   │ │   │ │Service (N)  │ │   │ │Service (N)  │ │
+     │ └──────┬───────┘ │   │ └──────┬───────┘│   │ └──────┬───────┘ │
+     │        │         │   │        │        │   │        │        │
+     │ ┌──────▼───────┐ │   │ ┌──────▼───────┐│   │ ┌──────▼───────┐ │
+     │ │  Redis       │ │   │ │  Redis     │ │   │ │  Redis       │ │
+     │ │  Replica     │ │   │ │  Cluster   │ │   │ │  Replica     │ │
+     │ │              │ │   │ │(Primary)   │ │   │ │              │ │
+     │ └──────────────┘ │   │ └──────┬───────┘│   │ └──────────────┘ │
+     └──────────────────┘   └────────┼────────┘   └──────────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+     ┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+     │  RDS Replica     │   │  RDS Primary    │   │  RDS Replica     │
+     │  (EU-West)       │   │  (US-East)      │   │  (APAC-South)    │
+     └──────────────────┘   └────────┬────────┘   └──────────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+     ┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+     │   Kafka          │   │   Kafka         │   │   Kafka         │
+     │   (EU-West)      │   │   (US-East)     │   │   (APAC-South)   │
+     └──────────────────┘   └────────┬────────┘   └──────────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+     ┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+     │  Billing         │   │  Auth           │   │  Device Mgmt    │
+     │  Service         │   │  Service        │   │  Service        │
+     └──────────────────┘   └─────────────────┘   └─────────────────┘
+```
+
+**Key architectural decisions**:
+1. **In-memory Redis for stream counts**: A relational DB cannot handle 20M ops/sec with < 5ms latency. Redis provides O(1) atomic counter operations and sub-millisecond latency.
+2. **Primary-region Redis writes**: Avoids the complexity of multi-region active-active Redis with conflict resolution. The ~200ms cross-region write penalty is acceptable because the hot path is the read (local replica).
+3. **Fail-open circuit breaker**: When downstream services fail, the service defaults to allowing playback. This is the correct failure mode — Netflix loses revenue when paying customers can't watch, but only loses a small amount from over-limit streams.
+4. **Eventual consistency, not strong**: It's acceptable to allow 1 extra stream briefly during a region failover. The business impact of 1 extra stream is negligible compared to denying content to a paying customer.
+
+## Component Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    Stream Limit Service                          │
+│                                                                  │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐   │
+│  │   REST API   │───▶│ LimitService │───▶│  Local PlanCache │   │
+│  │   Layer      │    │  (core)      │    │  (LRU, 60s TTL)  │   │
+│  └──────────────┘    └──────┬───────┘    └──────────────────┘   │
+│                             │                                    │
+│              ┌──────────────┼──────────────┐                    │
+│              │              │              │                    │
+│      ┌───────▼──────┐ ┌────▼─────┐ ┌──────▼───────┐            │
+│      │ RedisClient  │ │KafkaPub  │ │ AnalyticsSub │            │
+│      │ (write)      │ │          │ │ (event log)  │            │
+│      └──────────────┘ └──────────┘ └──────────────┘            │
+│              │                                                      │
+│      ┌───────▼──────┐                                              │
+│      │ RedisClient  │                                              │
+│      │ (read)       │                                              │
+│      └──────────────┘                                              │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐        │
+│  │  CircuitBreaker (fail-open when failure_rate > 5%)  │        │
+│  └──────────────────────────────────────────────────────┘        │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐        │
+│  │  BackgroundWorker: TTL cleanup, counter reconciliation│        │
+│  └──────────────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────┘
+
+         │                │                │
+         ▼                ▼                ▼
+   ┌──────────┐    ┌──────────┐    ┌──────────┐
+   │  Redis   │    │  Kafka   │    │   RDS    │
+   │  Cluster │    │  Topics  │    │  Primary │
+   └──────────┘    └──────────┘    └──────────┘
+```
+
+**Component responsibilities**:
+
+| Component | Responsibility |
+|---|---|
+| REST API Layer | Request parsing, validation, authentication (JWT decode), response serialization |
+| LimitService | Core business logic: capacity check, session management, plan tier lookup |
+| Local PlanCache | LRU cache of account plan tiers. TTL: 60s. Invalidate on PlanChanged event. |
+| RedisClient (write) | Writes to primary Redis cluster in US-East. Handles cross-region latency. |
+| RedisClient (read) | Reads from local Redis replica. Falls back to primary if replication lag > 500ms. |
+| KafkaPub | Publishes StreamStarted, StreamEnded, DeviceProfileCreated events. Fire-and-forget on hot path. |
+| AnalyticsSub | Subscribes to StreamEnded events for analytics pipeline. |
+| CircuitBreaker | Monitors downstream failure rate. Opens (allow-all mode) when failure_rate > 5% for 30s. |
+| BackgroundWorker | Periodic TTL cleanup, counter reconciliation (fix negative counts), stale session purge |
+
+## Technology Choices
+
+### Redis (not Memcached, not DynamoDB)
+| Criteria | Redis | Memcached | DynamoDB |
+|---|---|---|---|
+| Atomic counters | INCR/DECR — native | Not available | Not sub-ms latency |
+| Key expiration | Built-in | Built-in | TTL supported |
+| Sets for enumeration | SADD/SREM/SMEMBERS — O(1) | Not available | Not native |
+| Multi-region replication | Read replicas | Manual | Global tables (complex) |
+| **Winner** | **✓** | | |
+
+### RDS PostgreSQL (not MongoDB, not MySQL)
+| Criteria | PostgreSQL | MongoDB | MySQL |
+|---|---|---|---|
+| Strong consistency for plan data | ✓ | Best-effort | ✓ |
+| JSONB for flexible device metadata | ✓ | ✓ | Limited |
+| CDC with Debezium | Excellent | Good | Good |
+| Read replicas | Async, mature | Limited | Mature |
+| **Winner** | **✓ (tie with MySQL, PG chosen for ecosystem)** | | |
+
+### Kafka (not RabbitMQ, not SQS)
+| Criteria | Kafka | RabbitMQ | SQS |
+|---|---|---|---|
+| Event replay for state rebuild | ✓ — log-based | ✗ — queue | ✗ — queue |
+| Multi-region replication | MirrorMaker 2 | Manual | Cross-region queues |
+| Ordering guarantees | Per-partition | Per-queue | Per-queue |
+| Throughput | Millions/sec | Thousands/sec | Tens of thousands/sec |
+| **Winner** | **✓** | | |
+
+### Multi-Region Active-Active (not active-passive)
+| Criteria | Active-Active | Active-Passive |
+|---|---|---|
+| Read latency | Low (local) | Higher (cross-region failover read) |
+| Disaster recovery | No single point | Single region is primary |
+| Complexity | Moderate (eventual consistency) | Low |
+| Cost | Higher (3 regions) | Lower (1 active + 1 warm standby) |
+| **Winner** | **✓ (Netflix scale justifies 3 regions)** | | |
+
+**Why not active-passive**: Netflix has users in every region. An active-passive design would force all EU-West users to hit US-East for limit checks (~200ms RTT), which fails the < 5ms p99 requirement. Active-active with local reads and primary writes gives the best latency/complexity tradeoff.

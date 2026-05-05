@@ -1,0 +1,133 @@
+---
+title: Redis Session Architecture
+description: Deep dive into the Redis-based session tracking design — TTL mechanics, key structure, memory management, and consistency guarantees.
+---
+
+## TTL Design
+
+### Why HSETEX Over Separate EXPIRE
+
+The core of our session tracking uses `HSETEX` — a single atomic Redis command that sets a hash field and its TTL simultaneously:
+
+```
+HSETEX streams:\{user_id\} \{device_id\} \{session_id\} 300
+```
+
+This eliminates a critical race condition present with the alternative approach:
+
+```
+# Alternative (RAINY DAY):
+HSET streams:\{user_id\} \{device_id\} \{session_id\}
+EXPIRE streams:\{user_id\} 300
+
+# Race: If EXPIRE fails after HSET, the key lives forever.
+# If HSET fails after EXPIRE, the key is TTL'd but empty.
+```
+
+With `HSETEX`, the field and its TTL are set atomically. There is no window where a field exists without a TTL or a key with a TTL but no field. This is the single most important Redis design decision for this system.
+
+### The 5-Minute Window Tradeoff
+
+The 300-second TTL on each hash field means a stream session survives up to 5 minutes of inactivity. This is a deliberate design choice:
+
+| TTL | Pros | Cons |
+|-----|------|------|
+| 30s | Quick cleanup, accurate count | Paused content expires, bad UX |
+| 120s | Balanced | Still catches casual pauses |
+| **300s** | **Matches Netflix's 5-min pause tolerance** | **Up to 1 extra false-positive stream** |
+| 600s | Very generous | Multiple false positives likely |
+
+5 minutes aligns with the "resume watching" expectation — a viewer who paused 4 minutes ago is still watching. The cost of one false-positive stream (allowing 5/4) is a fraction of the cost of blocking a real viewer (4/4 getting denied).
+
+### Heartbeat Reset Strategy
+
+Every 30 seconds, the client sends a heartbeat that resets the TTL on the **specific device field**, not the entire user hash:
+
+```
+# Correct: resets only the device field's TTL
+HSETEX streams:\{user_id\} \{device_id\} \{session_id\} 300
+
+# Incorrect: would reset ALL fields' TTL, including other users' streams on same device
+EXPIRE streams:\{user_id\} 300
+```
+
+Resetting the entire hash TTL would be less precise and would prevent us from knowing which specific device is stale during cleanup operations.
+
+## Key Structure
+
+### Redis Data Model Choice
+
+We use a **Redis hash** (not strings or sorted sets) because:
+
+| Data Structure | Atomic Count (HLEN vs SCARD vs ...) | Atomic TTL per field | O(1) Count | Delete per field |
+|----------------|-----------------------------------|---------------------|------------|------------------|
+| **Hash** | `HLEN` — O(1) | `HSETEX` — yes | Yes | `HDEL` — O(1) |
+| Sorted Set | `SCARD` — O(1) | No (member TTL not supported) | Yes | `ZREM` — O(log N) |
+| Strings (one per device) | `KEYS` or metadata — no | `EXPIRE` per key — race | No | `DEL` — O(1) |
+
+The hash gives us atomic field-level TTL with O(1) counting in a single command.
+
+### Key Naming Convention
+
+```
+streams:\{user_id\}      → Hash containing \{device_id: session_id\} entries
+geo:\{ip\}:users         → Set of user_ids streaming from this IP (sharing detection)
+plan:\{user_id\}         → Local cache key: \{plan_type, max_streams\}
+devices:\{user_id\}      → Set of registered device_ids (device management)
+```
+
+The `streams:\{user_id\}` key has at most 4 entries (Premium limit), making `HLEN` effectively constant-time. Even for a Basic plan user with 2 entries, this is a single hash lookup in Redis.
+
+### Key Expiration Behavior
+
+When the last field of a hash expires, Redis automatically deletes the entire key. This means:
+
+- A user with 0 active streams has no `streams:\{user_id\}` key at all
+- Memory is reclaimed immediately — no background cleanup job needed
+- `HLEN streams:\{user_id\}` on a non-existent key returns `0` (not an error)
+
+This is why the Redis approach is dramatically simpler than any database-based alternative.
+
+## Memory Management
+
+### Memory Footprint
+
+For peak operation with 8M active streams:
+
+| Item | Count | Size Each | Total |
+|------|-------|-----------|-------|
+| `streams:\{user_id\}` hashes | 300M users, ~50M active | ~200 bytes (avg 2 entries) | ~10 GB |
+| `geo:\{ip\}:users` sets | ~50M IPs, avg 3 users each | ~100 bytes | ~5 GB |
+| `devices:\{user_id\}` sets | 500M users, avg 5 devices | ~500 bytes | ~250 GB |
+| Plan cache (local, in-process) | 500M entries, 99% hit rate | ~100 bytes (in memory) | ~50 GB (distributed) |
+
+The active stream state (~10 GB + ~5 GB) fits easily in a Redis Cluster with 20-30 shards. The device metadata (~250 GB) is stored in the User Service database, not in Redis.
+
+### Memory Eviction Policy
+
+We configure Redis with `maxmemory-policy noeviction` for the stream hash cluster. This means:
+
+- If memory is full, Redis returns errors instead of evicting data
+- For stream sessions, this is acceptable: if we can't track a stream, we should fail safe (block) rather than fail open (allow extra streams)
+- In practice, with 10 GB active state on a 50 GB cluster, this is extremely unlikely to trigger
+
+For the geo index used in sharing detection, we use `noeviction` as well since stale geo data leads to missed detection rather than false positives.
+
+### Cluster Sharding Strategy
+
+Streams are sharded by `user_id`:
+
+```
+# Redis Cluster key slot
+slot = CRC16("streams:\{user_id\}") % 16384
+```
+
+This ensures all streams for a single user are always on the same shard. A user's streams are never split across shards, so `HLEN` always returns the correct count.
+
+Cross-shard operations are avoided entirely:
+
+- `HLEN` operates on a single key → single shard
+- `HSETEX` operates on a single key → single shard
+- `HDEL` operates on a single key → single shard
+
+No `EVAL` scripts or multi-key operations are needed for the hot path, which keeps p99 latency sub-millisecond even under heavy load.

@@ -1,0 +1,36 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for API rate limiter
+---
+
+## Functional Requirements
+
+- **Token bucket algorithm**: configurable rate limits per client identity (API key, IP address, user ID)
+- **Multiple rate limit scopes**: enforce separate limits for per-second, per-minute, per-hour, and per-day windows
+- **Tiered quotas**: different rate limits per subscription tier (free, pro, enterprise)
+- **Distributed enforcement**: rate limit decisions must be consistent across multiple API gateway instances
+- **Graceful degradation**: return `429 Too Many Requests` with a `Retry-After` header; include informative error bodies
+- **Configuration management**: dynamically adjust limits without service restart (hot-reload via config store or etcd)
+- **Rate limit headers**: include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` in every response for transparency
+- **Burst handling**: allow bursts up to a configurable bucket size even when long-term rate is lower
+- **Whitelist/blacklist**: skip rate limiting for trusted clients; block abusive ones entirely
+- **Client identification**: support flexible identification strategies — API key, JWT subject, IP address, or composite key
+
+## Non-Functional Requirements
+
+- **Sub-millisecond overhead**: rate limit check must not add >1ms to request p99 latency
+- **Exactly-once semantics**: concurrent requests from the same client must never exceed the configured limit — no double-counting, no under-counting
+- **High availability**: rate limiter must have the same uptime as the API itself; no single point of failure
+- **Horizontal scalability**: support adding more rate limiter nodes without manual data rebalancing
+- **Auditability**: log rate-limited requests (client, endpoint, limit, timestamp) for analytics and billing
+- **State consistency**: no client can exceed their limit even under network partitions or partial failures
+
+## Scale Assumptions
+
+| Metric | Value |
+|---|---|
+| Daily requests | 100M (~1,150 QPS average, ~5,000 QPS peak) |
+| Registered API clients | 1M |
+| Rate limit check latency | p99 < 1ms |
+| Gateway instances | 10 (rate limit decisions consistent across all) |
+| Peak burst | 10x sustained for < 5 seconds |

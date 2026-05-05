@@ -1,0 +1,210 @@
+---
+title: "API / System Interface"
+description: "APIs and system interfaces for the most shared articles tracking system"
+---
+
+## REST API — Event Ingestion
+
+### Single Event Ingest
+
+```
+POST /api/v1/shares
+Content-Type: application/json
+Idempotency-Key: <uuid>
+
+{
+  "article_id": "art_12345",
+  "source": "twitter",
+  "user_id": "user_789"
+}
+```
+
+**Response**: `201 Created` with `\{ "event_id": "evt_abc123" \}`
+
+**Idempotency**: The `Idempotency-Key` header ensures that retries from network failures do not create duplicate counts. The system stores the mapping for 24 hours.
+
+### Batch Ingest
+
+```
+POST /api/v1/shares/batch
+Content-Type: application/json
+Idempotency-Key: <uuid>
+
+{
+  "events": [
+    \{ "article_id": "art_1", "source": "email", "user_id": "u1" \},
+    \{ "article_id": "art_2", "source": "facebook", "user_id": "u2" \}
+  ]
+}
+```
+
+- Max 1000 events per request.
+- Returns `\{ "accepted": 2, "rejected": 0, "errors": [] \}`.
+- Designed for the client SDK to batch share events locally before sending.
+
+### Query API
+
+```
+GET /api/v1/trending/top-k?window=5m&k=10&category=tech&source=twitter
+```
+
+| Parameter   | Required | Values                        | Description                   |
+| ----------- | -------- | ----------------------------- | ----------------------------- |
+| `window`    | Yes      | `5m`, `1h`, `24h`             | Sliding window size           |
+| `k`         | Yes      | 1–100                         | Number of results             |
+| `category`  | No       | `tech`, `sports`, `politics`  | Filter by article category    |
+| `source`    | No       | `twitter`, `facebook`, `email`| Filter by sharing source      |
+
+**Response**:
+
+```json
+{
+  "articles": [
+    {
+      "rank": 1,
+      "article_id": "art_12345",
+      "title": "AI Breakthrough in Language Models",
+      "category": "tech",
+      "count": 4823,
+      "shares_by_source": {
+        "twitter": 2100,
+        "facebook": 1500,
+        "email": 800,
+        "direct_link": 423
+      }
+    }
+  ],
+  "window": "5m",
+  "query_time": 1714672200000
+}
+```
+
+### Real-Time Stream (Optional)
+
+```
+GET /api/v1/trending/top-k/stream?window=5m&k=10
+```
+
+Server-Sent Events (SSE) endpoint that pushes leaderboard updates every 5 seconds. Useful for a live "Trending Now" dashboard.
+
+## Internal Service Interfaces
+
+```
+┌─────────────────┐     POST /shares/batch     ┌─────────────────────┐
+│  Client SDK     │ ──────────────────────────► │  Ingestion Gateway  │
+│  (Web/Mobile)   │                              │  (Load Balancer)    │
+└─────────────────┘                              └──────────┬──────────┘
+                                                            │
+                                                    validates, dedupes
+                                                            │
+                                                            ▼
+                                              ┌─────────────────────────┐
+                                              │   ShareEventConsumer    │
+                                              │   (Kafka Producer)      │
+                                              └────────────┬────────────┘
+                                                           │
+                                                    Kafka topic: share-events
+                                                           │
+                                              ┌────────────┴────────────┐
+                                              │                         │
+                                              ▼                         ▼
+                                    ┌──────────────────┐    ┌──────────────────┐
+                                    │  CounterService  │    │  Stream Writer   │
+                                    │  (Redis/Tair)    │    │  (Kafka/WAL)     │
+                                    │                  │    │  for durability  │
+                                    └────────┬─────────┘    └──────────────────┘
+                                             │
+                                     GetTopK(query)
+                                             │
+                                             ▼
+                                    ┌──────────────────┐
+                                    │   TopKService    │
+                                    │  (aggregation + │
+                                    │   ranking)       │
+                                    └────────┬─────────┘
+                                             │
+                                     Enrich results
+                                             │
+                                             ▼
+                                    ┌──────────────────┐
+                                    │ ArticleEnricher  │
+                                    │ (cache + remote  │
+                                    │  Article Service)│
+                                    └──────────────────┘
+```
+
+### Service Contracts
+
+#### ShareEventConsumer
+
+```
+onShareEvent(event: ShareEvent):
+    1. Deserialize event
+    2. Write to Kafka (for durability + audit)
+    3. Publish to aggregation pipeline (per granularity)
+```
+
+#### CounterService
+
+```
+increment(article_id: string, granularity: Granularity, bucket_key: string):
+    - Redis INCRBY atomic operation
+    - Returns new count
+
+getCount(article_id: string, granularity: Granularity, bucket_key: string): int
+    - Redis GET
+    - O(1) lookup
+```
+
+#### TopKService
+
+```
+getTopK(window: Window, k: int, filters: Map): TopKResult[]:
+    1. Resolve bucket keys for the window
+    2. SCAN all article counters for this granularity
+    3. Keep top K using a min-heap of size K
+    4. Return ranked list
+```
+
+## External Integrations
+
+### Social Media Webhooks
+
+```
+POST /webhooks/twitter/shares      // Twitter sharing callback
+POST /webhooks/facebook/shares     // Facebook sharing callback
+POST /webhooks/linkedin/shares     // LinkedIn sharing callback
+```
+
+Webhooks deliver share events from social platforms. The system must handle:
+- Event deduplication (platforms may retry webhooks)
+- Signature verification (HMAC-SHA256)
+- Backpressure (rate limiting from platforms)
+
+### Email Gateway
+
+When a user forwards an article via email:
+1. Article URL is rewritten with a tracking parameter: `?shared_by=uuid&source=email`
+2. When the recipient clicks through, the share event is recorded.
+3. This is an **indirect** share count — the original forwarder's share is counted.
+
+### Client SDK
+
+```javascript
+import \{ ShareTracker \} from '@company/share-tracker';
+
+const tracker = new ShareTracker({
+  apiKey: 'client_key_xxx',
+  flushInterval: 5000,   // Batch flush every 5 seconds
+  maxBatchSize: 50,
+});
+
+// Track a share when user clicks "Share on Twitter"
+tracker.trackShare({
+  article_id: 'art_12345',
+  source: 'twitter',
+  user_id: 'user_789',
+});
+```
+
+The SDK batches events locally and sends them in a single HTTP POST to the ingestion gateway.

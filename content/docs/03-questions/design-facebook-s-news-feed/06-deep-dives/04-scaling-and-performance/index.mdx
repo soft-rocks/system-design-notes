@@ -1,0 +1,152 @@
+---
+title: "Deep Dive: Scaling and Performance"
+description: "Sharding strategy, multi-layer caching, and latency optimization for Facebook News Feed"
+---
+
+## Sharding Strategy
+
+The system is sharded by user_id for serving layers and by author_id for storage layers. Each shard handles a fraction of the total load.
+
+**Redis Candidate Sets (sharded by user_id):**
+
+```
+user_id → hash(user_id) % num_shards → Redis Node
+```
+
+- 64 Redis nodes in production, each handling ~15M user candidate sets
+- Each set: ~500 post_ids × ~200 bytes ≈ 100KB
+- Memory per node: ~1.5 TB → 64 × 1.5 TB ≈ 96 TB total
+- Hot partition mitigation: Re-shard dynamically when a node exceeds 1.5x average
+
+**Post Store (sharded by author_id + time):**
+
+```
+Partition key: author_id
+Clustering key: created_at DESC
+```
+
+- Each author gets their own partition, naturally bounded by post frequency
+- Cassandra handles partition growth automatically
+- Reads: Single-partition reads for "get posts by author X" (fast, O(1))
+- Writes: Append-only (single partition per post)
+
+**Graph Store (sharded by user_id):**
+
+```
+Partition key: user_id
+Columns: friend_ids[], page_follows[], group_memberships[]
+```
+
+- Each user's graph is read together (no cross-partition joins)
+- Read replicas per shard: 10:1 read-to-write ratio handled by replica scaling
+- Graph writes (follow/unfollow) are rare events — handled with Cassandra's strong consistency
+
+**Kafka (sharded by author_id):**
+
+```
+Partition key: author_id
+Guarantee: All events for an author go to the same partition → ordered fan-out
+```
+
+- 512 partitions, each handled by a consumer in the Fan-out Service
+- Consumer groups: 1 group for fan-out, 1 group for real-time service, 1 for analytics
+
+## Caching Layers
+
+Four caching layers, each at a different granularity:
+
+| Layer | What | Where | TTL | Hit Rate |
+| --- | --- | --- | --- | --- |
+| **1. Response Cache** | Full feed render result | Redis (shared) | 30s | 60% (inactive users) |
+| **2. Feature Cache** | ML feature vectors per user-post pair | Redis (local to Rank Service) | 5min | 85% |
+| **3. Graph Cache** | Follower count, friend list, snooze status | Memcached (local to Feed Service) | 1h | 95% |
+| **4. Post Cache** | Post content (author, type, media) | Redis (per-feed-service instance) | 1min | 90% |
+
+**Why multiple layers:**
+
+A single feed render requires: 1 post content read + 1 graph read + 100 feature reads per candidate. Without caching, each render would generate 300+ reads. With caching, most reads are served from L1/L2 caches.
+
+**Cache invalidation strategy:**
+
+| Event | Invalidated |
+| --- | --- |
+| New post published | Response cache for all followers of author |
+| Reaction on post | Feature cache (engagement velocity changes) |
+| User unfollows | Graph cache (follow status) + response cache |
+| User snoozes author | Graph cache + all cached renders containing author's posts |
+
+**Cache stampede prevention:**
+
+When many users request the same feed simultaneously (e.g., after waking up), the response cache could suffer a stampede on TTL expiration.
+
+**Solution:** Staggered TTLs (30s ± 10s random jitter) + lock-based refresh:
+```
+if (cache.get(user_id, cursor) == null) {
+    lock = redis.setnx("lock:feed:" + user_id, 1, expire=5s);
+    if (lock) {
+        feed = render_feed(user_id);
+        cache.set(user_id, feed, ttl=random(20,40));
+        cache.del("lock:feed:" + user_id);
+    } else {
+        // Wait and retry (up to 3 times)
+        feed = cache.get(user_id, cursor); // stale but better than miss
+    }
+}
+```
+
+## Latency Optimization
+
+Target: &lt;1 second p99 end-to-end for feed render.
+
+**Latency breakdown per request:**
+
+| Step | Budget | Actual (p50) | Actual (p99) |
+| --- | --- | --- | --- |
+| API Gateway → Feed Service | 10ms | 2ms | 8ms |
+| Response cache lookup | 5ms | 1ms | 3ms |
+| Graph fetch (friends, pages, groups) | 20ms | 5ms | 15ms |
+| Candidate fetch (Redis batch) | 50ms | 15ms | 40ms |
+| Post content fetch (Redis batch) | 50ms | 10ms | 30ms |
+| Feature extraction (100 candidates × 100 features) | 100ms | 30ms | 80ms |
+| ML scoring (100 candidates) | 50ms | 15ms | 45ms |
+| Diversity filtering + sort | 20ms | 3ms | 10ms |
+| Response serialization | 5ms | 1ms | 3ms |
+| **Total** | **310ms** | **82ms** | **234ms** |
+
+**Optimization techniques used:**
+
+**1. Batched Redis calls:**
+```go
+// Bad: N round-trips
+for post_id in candidate_ids {
+    post = redis.get("post:" + post_id)
+}
+
+// Good: Single round-trip
+posts = redis.mget("post:" + id1, "post:" + id2, ..., "post:" + idN)
+```
+
+**2. Concurrent fetching:**
+```go
+// Graph, candidates, and features fetched in parallel
+var wg sync.WaitGroup
+wg.Add(3)
+go func() \{ defer wg.Done(); graph = fetchGraph(user_id) \}()
+go func() \{ defer wg.Done(); candidates = fetchCandidates(user_id) \}()
+go func() \{ defer wg.Done(); features = fetchFeatures(user_id, candidates) \}()
+wg.Wait()
+```
+
+**3. ML model optimization:**
+- Model size: 25M parameters, quantized to INT8 → 100MB → fits in L3 cache
+- Batch scoring: Score all 100 candidates in a single model invocation (not 100 separate calls)
+- Early exit: If a post scores below 0.01, skip feature extraction (save ~20% of feature computation)
+
+**4. Connection pooling:**
+- Feed Service maintains 500 connections to Redis per instance
+- 100 Feed Service instances → 50,000 connections total
+- Avoids connection establishment latency per request
+
+**5. Colocation:**
+- Feed Service, Rank Service, and Redis placed in the same availability zone
+- Reduces network hop latency from ~5ms (cross-AZ) to ~0.5ms (same AZ)

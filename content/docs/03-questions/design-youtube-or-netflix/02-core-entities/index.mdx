@@ -1,0 +1,95 @@
+---
+title: Core Entities
+description: Core entities for YouTube/Netflix streaming platform design
+---
+
+## Entity Definitions
+
+### User
+| Field | Type | Notes |
+|-------|------|-------|
+| `userId` | UUID | Primary key |
+| `email` | String | Auth identifier |
+| `passwordHash` | String | bcrypt/argon2 |
+| `displayName` | String | Display name |
+| `avatarUrl` | String | CDN path |
+| `subscribedChannelIds` | Set\<UUID\> | Subscriptions |
+| `createdAt` | Timestamp | Account creation |
+
+### Video
+| Field | Type | Notes |
+|-------|------|-------|
+| `videoId` | UUID | Primary key |
+| `uploaderId` | UUID (FK) | Content owner |
+| `title` | String | Indexed for search |
+| `description` | Text | |
+| `tags` | String[] | |
+| `thumbnailUrl` | String | Auto-generated |
+| `status` | Enum | PENDING / PROCESSING / PUBLISHED / REJECTED / DELETED |
+| `durationMs` | Long | Video length in ms |
+| `visibility` | Enum | PUBLIC / UNLISTED / PRIVATE |
+| `createdAt` | Timestamp | Upload time |
+| `publishedAt` | Timestamp | Publish time |
+
+### VideoVariant
+| Field | Type | Notes |
+|-------|------|-------|
+| `variantId` | UUID | Primary key |
+| `videoId` | UUID (FK) | Parent video |
+| `resolution` | Enum | 360p / 480p / 720p / 1080p / 4K |
+| `bitrateBps` | Long | Encoding bitrate |
+| `codec` | Enum | H.264 / H.265 / VP9 |
+| `storageUrl` | String | Object storage path (S3/GCS) |
+| `manifestUrl` | String | HLS/DASH playlist CDN URL |
+
+### TranscodeJob
+| Field | Type | Notes |
+|-------|------|-------|
+| `jobId` | UUID | Primary key |
+| `videoId` | UUID (FK) | Source video |
+| `status` | Enum | QUEUED / RUNNING / COMPLETED / FAILED |
+| `targetResolutions` | String[] | Requested output variants |
+| `startedAt` | Timestamp | |
+| `completedAt` | Timestamp | |
+
+### Comment
+| Field | Type | Notes |
+|-------|------|-------|
+| `commentId` | UUID | Primary key |
+| `videoId` | UUID (FK) | Parent video |
+| `authorId` | UUID (FK) | Commenter |
+| `text` | String | |
+| `createdAt` | Timestamp | |
+| `parentId` | UUID (nullable) | Self-join for replies |
+
+### AnalyticsEvent
+| Field | Type | Notes |
+|-------|------|-------|
+| `analyticsId` | UUID | Primary key |
+| `videoId` | UUID (FK) | Nullable for anonymous |
+| `userId` | UUID (nullable) | Session user |
+| `event` | Enum | VIEW / LIKE / DISLIKE / COMMENT / SHARE |
+| `timestamp` | Timestamp | Event time |
+| `watchDurationMs` | Long | For VIEW events |
+
+### RecommendationEntry
+| Field | Type | Notes |
+|-------|------|-------|
+| `modelId` | UUID | Model version key |
+| `userId` | UUID (FK) | Target user |
+| `candidateVideoIds` | UUID[] | Ranked shortlist |
+| `featureVersion` | String | A/B testing bucket |
+| `updatedAt` | Timestamp | Last refresh |
+
+## Relationships
+
+```
+User 1 ───N Video (uploaderId)
+Video 1 ───N VideoVariant (videoId)
+Video 1 ───N TranscodeJob (videoId)
+Video 1 ───N Comment (videoId)
+User 1 ───N Comment (authorId)
+Video 1 ───N AnalyticsEvent (videoId)
+User 1 ───N AnalyticsEvent (userId)
+User 1 ───N RecommendationEntry (userId)
+```

@@ -1,0 +1,86 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for a distributed message queue like RabbitMQ.
+---
+
+## Functional Requirements
+
+### Message Production
+
+Publishers send messages to exchanges; messages are routed to queues via bindings (direct, topic, fanout, headers).
+
+### Message Consumption
+
+Consumers pull/push messages from queues; ack/nack/reject lifecycle for delivery confirmation.
+
+### Queue Management
+
+Declare/bind/unbind/delete queues; durability (durable/transient), auto-delete when last consumer disconnects.
+
+### Exchange Types
+
+| Type | Routing Rule |
+|------|-------------|
+| **direct** | Exact key match |
+| **topic** | Pattern match with wildcards (`*` = one word, `#` = zero or more words) |
+| **fanout** | Broadcast to all bound queues |
+| **headers** | Header-based routing (AMQP header matching) |
+| **default** | direct exchange (implicit) |
+
+### Delivery Guarantees
+
+| Mode | Behavior |
+|------|----------|
+| **Zero duplication** | Consumer ack → message removed; nack with requeue → redelivered |
+| **At-least-once** | nack + requeue on failure; possible duplicates during crash |
+| **At-most-once** | No ack; message auto-acked on dispatch; lost on consumer crash |
+
+### Dead Letter Queues
+
+Messages nacked without requeue or expired by TTL moved to DLQ; per-queue or global DLQ.
+
+### Flow Control
+
+- Publisher throttling via consumer back-pressure (QOS prefetch)
+- Publisher confirm mode: broker acks individual/bulk messages
+- Transaction mode: channel-level transactions (txStart/txCommit/txRollback)
+
+### Persistence
+
+- Durable queues + persistent messages survive broker restart
+- Memory/disk threshold triggers GC of message indexes
+
+### Clustering
+
+- Multiple nodes share queues
+- Mirrors across nodes for HA
+- Shard-by-queue model
+
+### Monitoring & Management
+
+- HTTP API for queue/exchange declaration, metrics (msg rates, consumer count, disk/memory)
+- Web UI for visual inspection
+
+---
+
+## Non-Functional Requirements
+
+| Metric | Target |
+|--------|--------|
+| Throughput | 100K messages/sec per node (≤ 1KB body) |
+| Delivery latency | p99 < 5ms (single hop, within region) |
+| Durability | Zero message loss across broker restart |
+| Availability | 99.99% |
+| Scale | 100K queues/node, 10K pending/queue, 100K consumers/node |
+| Data retention | Message TTL (per-message or per-queue), max queue length |
+| Multi-tenant | Virtual hosts (isolated namespaces), ACL per vhost |
+
+---
+
+## Scale Assumptions
+
+- **Publishers/Consumers:** 1,000 publishers, 5,000 consumers across enterprise
+- **Message rate:** 100K messages/sec peak; 10K messages/sec sustained
+- **Message size:** average 500 bytes; max 128KB
+- **Retention:** 1 min to 7 days (TTL), average 1 hour
+- **Cluster size:** 3-12 nodes per deployment; typically 3 nodes for HA

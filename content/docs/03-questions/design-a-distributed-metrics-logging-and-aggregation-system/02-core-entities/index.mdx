@@ -1,0 +1,61 @@
+---
+title: Core Entities
+description: Core entities for distributed metrics logging and aggregation system
+---
+
+## Entity Definitions
+
+### Metric
+| Field | Type | Notes |
+|-------|------|-------|
+| `metricID` | String | Unique metric identifier (namespace + name, e.g., `http.requests.total`) |
+| `type` | Enum | COUNTER / GAUGE / HISTOGRAM / SUMMARY |
+| `unit` | String | Optional unit (bytes, seconds, count) |
+| `createdAt` | Timestamp | First seen timestamp |
+
+### MetricSample
+| Field | Type | Notes |
+|-------|------|-------|
+| `metricID` | String | Referenced metric |
+| `timestamp` | Timestamp | When the metric was recorded (millisecond precision) |
+| `value` | Double | The metric value |
+| `labels` | Map | Key-value label pairs (host, service, region, etc.) |
+| `ingestID` | String | Deduplication ID (sender + timestamp + metricID) |
+
+### MetricRollup
+| Field | Type | Notes |
+|-------|------|-------|
+| `metricID` | String | Referenced metric |
+| `labels` | Map | Label set (same granularity as raw samples) |
+| `windowStart` | Timestamp | Start of aggregation window |
+| `windowEnd` | Timestamp | End of aggregation window |
+| `level` | Enum | MINUTE / HOUR / DAY |
+| `min` | Double | Minimum value in window |
+| `max` | Double | Maximum value in window |
+| `avg` | Double | Average value in window |
+| `sum` | Double | Sum of values in window |
+| `count` | Long | Number of samples in window |
+| `p50` | Double | 50th percentile (histogram/summary only) |
+| `p95` | Double | 95th percentile (histogram/summary only) |
+| `p99` | Double | 99th percentile (histogram/summary only) |
+
+### AlertRule
+| Field | Type | Notes |
+|-------|------|-------|
+| `ruleID` | String | Unique rule identifier |
+| `name` | String | Human-readable rule name |
+| `metricFilter` | Query | Metric name + label selector |
+| `condition` | Expression | `rate > threshold for N minutes` |
+| `severity` | Enum | INFO / WARNING / CRITICAL |
+| `actions` | List | Webhook, pager, email destinations |
+| `enabled` | Boolean | Whether rule is active |
+
+## Relationships
+
+```
+Metric ──[1:N]──► MetricSample (a metric has many raw samples)
+Metric ──[1:N]──► MetricRollup (a metric has many rollups across windows)
+MetricSample ──[1:1]──► MetricRollup (rollup derived from samples within a window)
+AlertRule ──[1:N]──► AlertFire (rule generates fire events)
+AlertRule ──uses──► Metric (filters on metric + labels)
+```

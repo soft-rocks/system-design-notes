@@ -1,0 +1,105 @@
+---
+title: Core Entities
+description: Entity definitions and relationships for the Netflix screen-limit system.
+---
+
+## Entity Definitions
+
+### Account
+The top-level entity representing a Netflix subscriber account.
+
+| Field | Type | Description |
+|---|---|---|
+| `account_id` | UUID | Primary key |
+| `plan_tier` | enum \{BASIC, STANDARD, PREMIUM\} | Current billing tier |
+| `stream_limit` | int | Derived from plan_tier (1, 2/3, 4) |
+| `status` | enum \{ACTIVE, PAST_DUE, CANCELLED, PAUSED\} | Account status |
+| `max_device_count` | int | Default 10 |
+| `created_at` | timestamp | Creation time |
+| `updated_at` | timestamp | Last update time |
+
+**Why plan_tier is stored alongside stream_limit**: plan_tier is the business attribute (shown in billing UI), stream_limit is the operational attribute (used in hot-path checks). Storing both avoids computation during limit checks.
+
+### StreamSession
+A live playback session. One per device, per video, per time window.
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | UUID | Primary key |
+| `account_id` | FK → Account | Owning account |
+| `device_id` | string | Registered device identifier |
+| `video_id` | string | Content being played (optional) |
+| `started_at` | timestamp | Playback start |
+| `stopped_at` | timestamp, nullable | Playback end |
+| `status` | enum \{PLAYING, PAUSED, COMPLETED, ABORTED\} | Session state |
+| `region` | string | Geo region of playback |
+| `last_heartbeat_at` | timestamp | TTL-based liveness detection |
+
+**Design rationale**: We store one StreamSession per active playback, not one per device. If a device plays Video A then Video B without stopping, that's one session with video_id changing. This is cheaper than per-video sessions because we only need to count active sessions, not enumerate them.
+
+### DeviceProfile
+A registered device linked to an account. Persists across playback sessions.
+
+| Field | Type | Description |
+|---|---|---|
+| `device_profile_id` | UUID | Primary key |
+| `account_id` | FK → Account | Owning account |
+| `device_id` | string | Unique device identifier (long-lived token) |
+| `platform` | enum \{IOS, ANDROID, WEB, SMART_TV, ROKU, APPLE_TV, GAME_CONSOLE, OTHER\} | Device platform |
+| `app_version` | string | App version string |
+| `display_name` | string | User-set label (e.g., "Living Room TV") |
+| `last_active_at` | timestamp | Last activity |
+| `registered_at` | timestamp | Device registration time |
+| `is_active` | boolean | Soft delete flag |
+
+**Design rationale**: The device_id is a long-lived token generated on first app install and persisted in secure storage. It survives app reinstallation. This enables the "Manage Access Devices" UI where users see and can remove devices.
+
+### PlanVersion
+Tracks plan tier history for downgrading logic (grace period enforcement).
+
+| Field | Type | Description |
+|---|---|---|
+| `plan_version_id` | UUID | Primary key |
+| `account_id` | FK → Account | Owning account |
+| `tier` | enum \{BASIC, STANDARD, PREMIUM\} | Plan tier |
+| `effective_from` | timestamp | When this tier took effect |
+| `effective_until` | timestamp, nullable | When this tier ended |
+| `stream_limit` | int | Stream limit for this tier |
+| `is_current` | boolean | Currently active version |
+
+**Why plan history exists**: When a user downgrades mid-session (Premium → Standard), the system needs to know what limit was in effect when the session started. For simplicity, the current limit applies immediately for new streams, and existing streams are grandfathered. The PlanVersion entity mainly supports billing audit and the UI.
+
+### DownloadQuota
+Tracks download usage per account and per device.
+
+| Field | Type | Description |
+|---|---|---|
+| `quota_id` | UUID | Primary key |
+| `account_id` | FK → Account | Owning account |
+| `device_id` | string | Device identifier |
+| `current_download_count` | int | Active downloads on this device |
+| `account_download_count` | int | Total downloads across all devices |
+| `account_limit` | int | Default 100 |
+| `device_limit` | int | Default 30 |
+| `updated_at` | timestamp | Last update |
+
+**Design rationale**: This is a separate entity from StreamSession because download limits are independent of streaming limits. Downloads use different storage infrastructure (S3-backed CDN vs. video streaming CDN) and have different semantics (expiry, DRM).
+
+## Relationships
+
+### Account → StreamSession (1:N, soft)
+An account has 0 to N concurrent active StreamSessions. Only sessions where status = PLAYING or PAUSED count toward the limit. Abandoned sessions (no heartbeat for > 5 min) are cleaned up by a background task and no longer count.
+
+**Why this is "soft"**: The relationship exists only in the in-memory store (Redis) for performance. The relational DB does not track active sessions in real time — it's the source of truth for device profiles and plan data, not for live stream counts.
+
+### Account → DeviceProfile (1:N)
+An account has 1 to N registered DeviceProfiles. The relationship is hard — stored in the relational DB. The count is bounded by max_device_count (typically 10). Unregistering a device sets is_active = false (soft delete) rather than deleting the row (preserves audit history).
+
+### Account → PlanVersion (1:N)
+An account has a timeline of PlanVersion records. Exactly one record has is_current = true at any time. This is a standard slowly changing dimension (type 2) pattern.
+
+### Account → DownloadQuota (1:1 per device)
+An account has N DownloadQuota records, one per device. Account-level and device-level counts are computed from this table but cached in a denormalized form for write performance.
+
+### StreamSession ↔ DeviceProfile (1:1 via device_id)
+Each active StreamSession is associated with a device_id that should match an active DeviceProfile. This is an implied relationship (enforced by the application, not by DB FK) because StreamSession records are ephemeral and not stored in the relational DB.

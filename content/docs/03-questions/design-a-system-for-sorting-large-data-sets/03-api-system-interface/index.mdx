@@ -1,0 +1,123 @@
+---
+title: API / System Interface
+description: Sort job submission, status, cancellation, result retrieval, and internal services.
+---
+
+## Submit Sort Job
+
+**REST API:**
+
+`POST /v1/jobs` — Submit a new sort job
+
+**Request body:**
+
+```json
+{
+  "input": {
+    "type": "files",
+    "paths": ["s3://bucket/data/*.parquet"],
+    "schema": {
+      "columns": [
+        \{"name": "id", "type": "long"\},
+        \{"name": "name", "type": "string"\},
+        \{"name": "timestamp", "type": "timestamp"\}
+      ]
+    }
+  },
+  "sort_keys": [
+    \{"column": "timestamp", "order": "DESC"\},
+    \{"column": "name", "order": "ASC", "null_order": "NULLS_LAST"\}
+  ],
+  "partial": false,
+  "top_k": null,
+  "filter": "timestamp &gt;= '2026-01-01T00:00:00Z'",
+  "output": {
+    "type": "file",
+    "path": "s3://bucket/sorted/output.parquet"
+  }
+}
+```
+
+**Response:** `\{"job_id": "sort-abc123", "status": "submitted", "estimated_duration_minutes": 15\}`
+
+**Features:**
+- **Top-K mode:** Set `top_k` to use partial sort with max-heap of size K (no full sort needed)
+- **Filter pushdown:** For Parquet/ORC inputs, filter predicates are pushed to columnar readers for early row elimination
+
+## Job Status & Progress
+
+**Get status:**
+
+`GET /v1/jobs/\{job_id\}`
+
+```json
+{
+  "job_id": "sort-abc123",
+  "status": "merging",
+  "progress": 0.72,
+  "bytes_processed": 7200000000000,
+  "bytes_total": 10000000000000,
+  "records_processed": 7200000000,
+  "spill_files_created": 48,
+  "merge_partitions_active": 4,
+  "estimated_completion": "2026-05-03T12:15:00Z",
+  "phase": "global_merge",
+  "workers": 10,
+  "workers_active": 8,
+  "workers_failed": 0
+}
+```
+
+**Stream progress:**
+
+`GET /v1/jobs/\{job_id\}/events` — SSE stream of progress events
+- Events: `phase_start`, `spill_done`, `merge_start`, `merge_done`, `progress_update`
+
+**Job lifecycle states:**
+
+```
+submitted → queued → reading → spilling → merging → done
+                                    → failed
+                                    → cancelled
+```
+
+## Cancel Job
+
+`POST /v1/jobs/\{job_id\}:cancel`
+
+**Graceful cancellation:**
+1. Coordinator sends cancellation signal to all workers
+2. Workers finish current chunk (do not start new one)
+3. Intermediate spill files cleaned up
+4. Job status → `cancelled`
+5. Timeout: 5s for ack, then force-kill
+
+## Retrieve Result
+
+**Poll for completion:**
+
+`GET /v1/jobs/\{job_id\}/result` — Blocks until result is ready (with timeout)
+
+```json
+{
+  "output_path": "s3://bucket/sorted/output.parquet",
+  "size_bytes": 9500000000,
+  "record_count": 10000000000,
+  "checksum": "sha256:abc123..."
+}
+```
+
+**Streaming output:**
+
+`GET /v1/jobs/\{job_id\}/stream?from_offset=N` — Consume sorted records in order with backpressure.
+
+## Internal Service Interfaces
+
+| Service | Methods | Responsibility |
+|---------|---------|----------------|
+| `JobScheduler` | `AssignTasks/RebalanceTasks` | Task assignment and rebalancing |
+| `SortWorker` | `ReadAndSpill/MergeSpills/Shuffle` | Sort execution on data node |
+| `Coordinator` | `CreateJob/MonitorProgress/CancelJob` | Job lifecycle management |
+| `MergeCoordinator` | `AssignMergeGroups/MergeGroup` | Global merge orchestration |
+| `CheckpointStore` | `SaveCheckpoint/LoadCheckpoint` | Fault recovery state |
+| `ResultStore` | `PublishResult/ConsumeResult` | Result delivery |

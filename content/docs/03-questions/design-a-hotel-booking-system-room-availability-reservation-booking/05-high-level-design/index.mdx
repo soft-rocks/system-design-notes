@@ -1,0 +1,181 @@
+---
+title: High Level Design
+description: Architecture overview, service decomposition, and technology choices for the hotel booking system.
+---
+
+## Architecture Overview
+
+```
+                          ┌─────────────────────────────────────────────────────────┐
+                          │                       API Gateway                        │
+                          │          (Auth, Rate Limiting, Routing)                  │
+                          └────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────────┘
+                               │     │     │     │     │     │     │     │
+              ┌────────────────┘     │     │     │     │     │     │     └────────────────┐
+              ▼                      ▼     ▼     ▼     ▼     ▼     ▼     ▼               ▼
+        ┌──────────┐          ┌──────────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌────────┐
+        │  Search  │          │  Booking │ │Rate  │ │Invent│ │Guest │ │Pay- │ │Chann│ │Notific│
+        │ Service  │          │ Service  │ │Engine│ │ary Svc│ │Svc   │ │ment  │ │el Svc│ │ion Svc│
+        │ (AA)     │          │ (AP core)│ │      │ │      │ │      │ │Svc   │ │      │ │        │
+        └────┬─────┘          └────┬─────┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └───┬────┘
+             │                     │           │        │        │        │         │         │
+             ▼                     ▼           ▼        ▼        ▼        ▼         ▼         ▼
+        ┌──────────┐          ┌──────────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐   ┌─────┐  ┌─────┐
+        │Elastic-  │          │PostgreSQL│  │Post-│  │Post-│  │Post-│  │Stripe│   │Kafka│  │Send-│
+        │search    │          │(Master)  │  │greSQL│  │greSQL│  │greSQL│ │(ext) │   │(bus) │  │Grid │
+        │          │          │(Read Rep.)│  │(Rate)│  │(Inv) │  │(Guest│ │      │   │      │  │     │
+        └──────────┘          └──────────┘  └─────┘  └─────┘  └─────┘  └─────┘   └─────┘  └─────┘
+             ▲                                                      Redis (cache)
+             │
+        ┌────┴──────────────┐
+        │   Debezium CDC    │  WAL capture from PostgreSQL
+        │   (Kinesis)       │
+        └────────┬──────────┘
+                 │
+         ┌───────┼───────┐
+         ▼       ▼       ▼
+      ES Index  Loyalty  Notification
+      (async consumers)
+```
+
+### Key Design Decisions
+
+**1. Active-Active for reads, Active-Passive for writes**
+
+Search traffic is read-heavy (50:1 search-to-booking ratio) and serves globally. Each region runs its own Elasticsearch cluster, replicated via CDC from the primary. Booking writes require strong consistency — a single PostgreSQL master prevents double-booking.
+
+**2. Room-type-level availability as the atomic unit**
+
+Availability is tracked at the room_type level (count of available rooms), not per room instance. Individual room assignment is deferred to check-in. This dramatically reduces write contention: instead of competing on one of 50 specific rooms, all guests compete on "50 available Deluxe Kings." Room-instance booking is supported but not the default.
+
+**3. Blockhold pattern for checkout flow**
+
+The gap between "browsing rooms" and "confirming booking" is filled with a blockhold — an atomic, temporary inventory reservation with a TTL (15 minutes). It prevents another user from booking the last room while the guest enters payment details. If the guest abandons checkout, the blockhold expires and the room returns to inventory.
+
+**4. CDC for data distribution**
+
+Change Data Capture from PostgreSQL's WAL feeds downstream consumers (Elasticsearch indexer, loyalty service, notification service). This decouples the source of truth from consumers — even direct DB updates or bulk migrations are captured, ensuring eventual consistency without application-level pub/sub complexity.
+
+## Service Decomposition
+
+### API Gateway
+
+Single entry point for all client requests. Handles:
+- Authentication (JWT validation for guests, mTLS for partners)
+- Rate limiting (per-user and per-partner)
+- Request validation and schema enforcement
+- Routing to appropriate microservice
+
+Routes: `GET /search` → Search Service, `POST /reservations` → Booking Service, `GET/POST /guests` → Guest Service.
+
+### Search Service
+
+Elasticsearch-backed search for properties and room types.
+
+- **Read path**: Query ES directly with geo_distance, range filters, full-text search. Cache popular queries in Redis (5-min TTL, ~60% hit rate).
+- **Write path**: Consumer of INVENTORY_UPDATED events. Rebuilds ES documents when availability changes.
+- **Scaling**: Stateless pods behind a load balancer. ES cluster sharded by room_type_id.
+
+### Booking Service
+
+The critical write path — orchestrates the reservation creation workflow:
+
+1. **Price Lock**: Calls Rate Engine to re-validate price and create a RateHold (15-min TTL).
+2. **Blockhold**: Calls Inventory Service to atomically decrement available_rooms via `SELECT FOR UPDATE`.
+3. **Payment**: Calls Payment Service to pre-authorize the guest card.
+4. **Reservation**: INSERTs the reservation record into PostgreSQL.
+5. **Blockhold Release**: Marks the blockhold as CONVERTED.
+6. **Event Publishing**: Publishes RESERVATION_CREATED and INVENTORY_UPDATED to Kafka.
+7. **Async downstream**: Notification, loyalty, index update (handled by event consumers).
+
+Idempotency enforcement via a unique constraint on the `idempotency_key` column. Concurrent requests for the same key are deduplicated.
+
+### Inventory Service
+
+Manages availability counts per room_type per date.
+
+- **Atomic operations**: `AcquireBlockhold` uses `UPDATE ... WHERE available_rooms > 0` with row-level locking. Second concurrent request gets zero rows affected → returns 409 CONFLICT.
+- **Blockhold table**: Stores temporary holds with expires_at timestamps. Cleaned up by a cron job every 5 minutes.
+- **Room blocking**: Supports maintenance blocks, VIP holds, and group blocks that reduce available inventory.
+- **Data store**: PostgreSQL (strong consistency required).
+
+### Rate Engine
+
+Real-time price computation for the hot path.
+
+- Reads DailyRate from PostgreSQL, applies dynamic multipliers, promo codes, length-of-stay discounts.
+- **RateHold**: Separate table for checkout price locking. A consumed rate hold is not re-evaluated even if the underlying DailyRate changes.
+- **Not the batch engine**: Rate Engine handles per-request computation. PricingEngine (separate service) handles bulk re-rating on a schedule.
+
+### PricingEngine (Batch)
+
+CPU-intensive demand-based re-rating. Runs every 6 hours.
+
+- Consumes demand signals: local events, weather forecasts, competitor pricing, historical booking velocity.
+- Writes updated DailyRate records to PostgreSQL in bulk.
+- Publishes RATE_CHANGED events to Kafka for search index refresh.
+
+### Payment Service
+
+Stripe (or Adyen fallback) integration wrapper.
+
+- **Flow**: Authorize → Capture → Refund (full/partial).
+- **Circuit breaker**: If Stripe times out (>5s), returns 503 with retry-after header. Fails over to Adyen.
+- **PCI-DSS compliant**: Never touches raw card data. All card info is stored as encrypted tokens in the payment processor.
+- **Idempotent**: txn_id deduplication prevents duplicate captures.
+
+### Channel Service
+
+Multi-protocol translation layer for OTA partners (Expedia, Booking.com, GDS, Airbnb).
+
+- **Per-channel proxy**: Each partner has isolated auth, rate limiting, request formatting, and error handling. A buggy Expedia sync cannot affect Booking.com.
+- **Polling**: 30-second intervals per partner (channel partners don't reliably support push webhooks).
+- **Webhook push**: For partners with push support, registers webhook endpoints for real-time availability updates.
+- **Idempotent**: sync_event_id deduplication prevents double-counting bookings from the same external reservation.
+
+### Guest Service
+
+Guest profiles, preferences, and loyalty management.
+
+- Separated from authentication (auth handled by a separate identity service).
+- Loyalty tier: Bronze → Silver → Gold → Platinum based on annual spend and visit frequency.
+- Preferences stored as JSON: room floor, bed type, view, accessibility needs, pillow type.
+
+### Notification Service
+
+Consumer of reservation lifecycle events.
+
+- **Channels**: Email (SendGrid), SMS (Twilio), Push (APNs/FCM).
+- **Template-based**: Confirmation, modification, cancellation, pre-arrival reminder (24h), check-out receipt.
+- **Retry**: Exponential backoff (3 attempts). Dead letter queue for permanent failures.
+
+## Technology Choices
+
+| Component | Technology | Rationale |
+|---|---|---|
+| Primary DB | PostgreSQL | ACID compliance for inventory, payments, reservations. Row-level locking prevents double-booking. Logical replication for read replicas. Table partitioning on date columns. |
+| Search | Elasticsearch | Geospatial + faceted search at ~100ms. PostGIS alternative would be 2-5s. Purpose-built for this workload. |
+| Cache | Redis | Search query cache (5-min TTL), session store, rate limiting tokens. Cluster mode for horizontal scaling. |
+| Event Bus | Kafka | Reservation lifecycle, inventory changes, pricing updates. Consumer groups for parallel processing. 7-day event retention, 7-year audit log retention. |
+| Payments | Stripe | PCI-DSS tokenization, auth/capture/refund, split payments. Circuit breaker with Adyen fallback. |
+| CDC | Debezium | PostgreSQL WAL capture. Decouples data distribution from application logic. Ensures all downstream consumers converge. |
+| Infra | EKS/GKE + Terraform | Multi-region deployment. Route53 health checks for failover. Helm charts for service deployment. |
+| Observability | Prometheus + Grafana + Jaeger | Metrics, dashboards, distributed tracing. Bookings per second, inventory sync lag, payment failure rate, p95 latency per service. |
+
+### Multi-Region Deployment
+
+```
+            ┌──────────────────────┐         ┌──────────────────────┐
+            │   US-East (Primary)  │◄───────►│  EU-West (Replica)   │
+            │                      │Replica  │                      │
+            │  PostgreSQL Master   │  Stream  │  PostgreSQL Replica  │
+            │  Booking Service     │         │  Booking (Standby)   │
+            │  Rate Engine         │         │  Rate Engine (Standby)│
+            │                      │         │                      │
+            │  Elasticsearch (A)   │         │  Elasticsearch (B)   │
+            │  Redis Cluster (A)   │         │  Redis Cluster (B)   │
+            └──────────────────────┘         └──────────────────────┘
+
+            APAC region serves as warm standby with ES + Redis only.
+            Booking service starts on PG replica promotion (~2-3 min RTO).
+```

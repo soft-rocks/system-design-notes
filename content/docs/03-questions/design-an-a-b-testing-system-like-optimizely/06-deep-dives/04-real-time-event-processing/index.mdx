@@ -1,0 +1,68 @@
+---
+title: Real-Time Event Processing
+description: Stream processing pipeline, event deduplication, and late/out-of-order event handling.
+---
+
+## Stream Processing Pipeline
+
+The ingestion pipeline flows: SDK → Ingestion API → Kafka → Flink → ClickHouse.
+
+### Ingestion API
+
+The Ingestion API handles:
+- Schema validation (reject malformed events)
+- Rate limiting per API key (prevent one client from overwhelming the system)
+- Request deduplication (idempotency key per SDK request batch)
+- Server-side timestamp assignment (override client timestamps to correct for clock skew)
+- Partition routing (key by experimentId for ordered processing within each experiment)
+
+### Kafka topic design
+
+| Property | Value | Rationale |
+|----------|-------|-----------|
+| Topic name | experiment-events | Single topic for all experiments |
+| Partitions | 64 (one per AZ × region) | Scales with ingestion throughput |
+| Partition key | experimentId | Events for same experiment are ordered |
+| Retention | 90 days | Enough for experiment lifecycle |
+| Replication factor | 3 | Durability guarantee |
+| Min ISR | 2 | Write survives one node failure |
+
+### Flink job design
+
+- **Source:** Kafka consumer group `flink-aggregation` consuming from `experiment-events`
+- **State:** Keyed state by `\{experimentId, variantId, event_name, event_date\}` for running counters
+- **Windowing:** Tumbling windows of 1 minute per `\{experimentId, variantId, event_name\}`
+- **Sink:** ClickHouse batch writer (100ms flush interval or 10,000 rows, whichever comes first)
+- **Checkpointing:** Every 30s, Flink checkpoint to state backend (S3) for exactly-once semantics
+- **Backpressure handling:** If Flink falls behind, dynamically increase partitions (up to 256)
+
+## Event Deduplication
+
+Events may be duplicated at three points: SDK retransmission (network failure), ingestion retry (Kafka ack timeout), and stream processing (checkpoint recovery).
+
+### Deduplication strategy
+
+- **At ingestion:** Each SDK batch includes an idempotency key (UUID). Ingestion API tracks recent keys in a Redis set with 5-minute TTL. Duplicates are silently dropped at ingestion.
+- **At stream processing:** Flink maintains a bloom filter in keyed state for `\{eventId\}` seen in the current 1-hour window. Bloom filter size: 8MB per key, false positive rate ~0.1%. This handles checkpoint-recovery duplicates.
+- **At aggregation (ClickHouse):** ClickHouse has a `ReplacingMergeTree` table that deduplicates by `event_id` during compaction. This is the final safety net for any events that slipped through earlier stages.
+
+**Cost trade-off:** Deduplication at ingestion saves storage (duplicates never enter Kafka). Deduplication at stream processing handles the rare case of Kafka retry. ClickHouse-level dedup is the safety net. Each layer adds latency/storage cost, so we use a layered defense with decreasing granularity.
+
+## Late & Out-of-Order Events
+
+Client events may arrive out of order due to:
+- SDK buffer delay (event collected but not sent for 5 seconds)
+- Network reordering (TCP packet reordering)
+- Offline mode (events queued locally while offline, flushed when connectivity returns)
+- Clock skew (client clock not synced with server time)
+
+### Solution: Server-side timestamping with watermarks
+
+- The ingestion API overwrites the client timestamp with a server-side timestamp (`now_utc`). This eliminates clock skew.
+- Flink uses the server-side timestamp as the event time attribute.
+- Watermark: `Watermark = current_event_time - 5 minutes`. Events arriving more than 5 minutes late are sent to a "late events" side output stream.
+- Late events are accumulated in a separate ClickHouse table and joined back during aggregation (nightly batch job reconciles late events).
+
+**Practical impact:** With a 5-minute watermark, 99.9% of events are processed in real-time. The 0.1% that are late are handled by the nightly reconciliation job, which runs at 3 AM UTC and updates the aggregated results with corrected counts.
+
+**SDK offline behavior:** When the SDK detects no network, it stores events locally (SQLite on mobile, IndexedDB on web) with the original client timestamp and event properties. When connectivity returns, events are flushed in chronological order. The server-side timestamp overwrites the client time at ingestion, so offline events get the correct ingestion time.

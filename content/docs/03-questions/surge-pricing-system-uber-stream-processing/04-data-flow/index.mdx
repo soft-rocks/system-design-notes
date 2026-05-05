@@ -1,0 +1,149 @@
+---
+title: Data Flow
+description: Data flow for Uber's surge pricing system — write path (event ingestion + surge calculation), read path (rider app lookup + historical query), and sync/replication patterns.
+---
+
+## Write Path
+
+### Event Ingestion Write Path
+
+```mermaid
+sequenceDiagram
+    participant D as Driver App
+    participant R as Rider App
+    participant GW as API Gateway
+    participant LB as Load Balancer
+    participant SP as Stream Processor
+    participant KAFKA as Kafka
+    participant ZS as ZoneState Store (Redis)
+    participant SC as Surge Calculator
+    participant SM as Surge Multiplier Store
+
+    D->>GW: POST /driver/location (GPS)
+    R->>GW: POST /ride/request
+    GW->>KAFKA: driver.location event
+    GW->>KAFKA: ride.request event
+
+    SP->>KAFKA: Consume events
+    SP->>ZS: Increment active_drivers
+    SP->>ZS: Increment pending_requests
+    SP->>ZS: Update demand_ratio
+
+    Note over SC: Every 60s per active zone
+    SC->>ZS: Read ZoneState (all features)
+    SC->>SC: Compute surge multiplier
+    SC->>SM: Write SurgeMultiplier
+    SC->>KAFKA: Publish surge.calculated
+    SC->>KAFKA: Publish surge.changed (if changed)
+```
+
+1. Driver sends GPS data, rider sends ride request → API gateway → Kafka.
+2. Stream processor reads events, updates `ZoneState` in Redis.
+3. Every 60 seconds, the surge calculator reads the latest `ZoneState` for each active zone.
+4. Calculator applies the pricing algorithm → produces `SurgeMultiplier`.
+5. If multiplier changed > 0.1x from previous, publish `surge.changed` to Kafka.
+
+### Surge Calculation Write Path (Per Zone)
+
+```mermaid
+flowchart TD
+    A[Kafka: zone.state.updated] --> B[Surge Calculator Worker]
+    B --> C\{New algorithm version?\}
+    C -->|Yes| D[Load new model]
+    C -->|No| E[Read ZoneState from Redis]
+    D --> E
+    E --> F[Apply pricing algorithm]
+    F --> G\{Multiplier changed?\}
+    G -->|Yes, delta > 0.1| H[Write to SM Store]
+    G -->|No| I[Skip - no-op]
+    H --> J[Publish surge.calculated]
+    H --> K[Publish surge.changed]
+```
+
+## Read Path
+
+### Rider App Surge Lookup
+
+```mermaid
+sequenceDiagram
+    participant APP as Rider App
+    participant CDN as CDN (edge cache)
+    participant REDIS as Redis (surge cache)
+    participant SE as Surge Engine
+    participant SM as Surge Multiplier Store
+
+    APP->>CDN: GET /surge/\{h3\} (TTL 30s)
+    CDN-->>APP: Cached surge (if available)
+
+    APP->>REDIS: GET surge:\{h3\}
+    alt Cache hit
+        REDIS-->>APP: \{multiplier: 1.5\}
+    else Cache miss
+        REDIS->>SE: gRPC GetSurge
+        SE->>SM: Read latest multiplier
+        SM-->>SE: \{multiplier: 1.5, updated_at: ...\}
+        SE->>REDIS: Set (TTL 30s)
+        SE-->>APP: \{multiplier: 1.5\}
+    end
+```
+
+1. Rider app requests surge for zone → checks edge CDN first (30s TTL).
+2. If not on CDN, check Redis zone-level cache.
+3. On cache miss, query the surge multiplier store for latest value.
+4. Cache result in Redis (30s) and CDN (30s) for subsequent requests.
+
+### Historical Surge Query
+
+```mermaid
+flowchart LR
+    A[GET /surge/history/\{h3\}?range=24h] --> B[Query ClickHouse]
+    B --> C[Aggregate: avg, max, min multiplier]
+    C --> D[Return chart data]
+```
+
+- ClickHouse (columnar) stores all `PricingEvent` records.
+- Pre-aggregated by hour for fast chart rendering.
+
+## Sync/Replication Flow
+
+### Cache Consistency Pattern
+
+```mermaid
+flowchart TD
+    A[Surge multiplier updated] --> B[Write SM Store]
+    B --> C[Publish surge.changed event]
+    C -->|Kafka| D[Redis: Update zone cache]
+    C -->|Kafka| E[CDN: Invalidate stale entries]
+
+    D --> F[Next GET reads fresh value]
+    E --> G[Next CDN miss re-fetches from Redis]
+```
+
+### Regional Data Flow
+
+```mermaid
+flowchart TB
+    subgraph RegionA["Region A (Primary)"]
+        A_SP[Stream Processor]
+        A_SC[Surge Calculator]
+        A_SM[Surge Multiplier Store]
+        A_Kafka[Kafka]
+    end
+    subgraph RegionB["Region B (Replica)"]
+        B_SP[Stream Processor]
+        B_SC[Surge Calculator]
+        B_SM[Surge Multiplier Store]
+        B_Kafka[Kafka]
+    end
+
+    A_SM -->|CDC| A_Kafka
+    A_Kafka -->|MirrorMaker| B_Kafka
+    B_Kafka --> B_SM
+
+    A_SP -.->|GPS events from EU drivers| A_Kafka
+    B_SP -.->|GPS events from APAC drivers| B_Kafka
+```
+
+- Each region computes its own surge multipliers from local GPS events.
+- Multiplier store is replicated to replicas for read redundancy.
+- Cross-region failover: replica region promotes its local calculator if primary is down.

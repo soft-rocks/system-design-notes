@@ -1,0 +1,64 @@
+---
+title: Time Decay
+description: Exponential decay model, half-life configuration, and windowed aggregation.
+---
+
+## Decay Model
+
+Exponential decay ensures recent events contribute more to the ranking score than older ones.
+
+```
+decayed_value = raw_value × e^(-λ × age_days)
+```
+
+where:
+- `age_days = (now - event_timestamp) / 86400000` (in days)
+- `λ = ln(2) / half_life` (decay constant)
+- `half_life = 7 days` (default)
+
+**Decay factor examples (half-life = 7 days):**
+
+| Age | Decay factor | Effective weight |
+|-----|-------------|-----------------|
+| 0 days (now) | 1.00 | 100% |
+| 1 day | 0.90 | 90% |
+| 7 days (1 half-life) | 0.50 | 50% |
+| 14 days (2 half-lives) | 0.25 | 25% |
+| 30 days | 0.09 | 9% |
+| 90 days | 0.001 | < 0.1% |
+
+**Why exponential?** Exponential decay provides smooth, continuous weighting. The integral (total contribution) converges, preventing any single historical event from dominating forever.
+
+## Half-Life Configuration
+
+The half-life parameter controls how quickly signals lose influence:
+
+| Use Case | Half-life | Rationale |
+|----------|----------|-----------|
+| Downloads | 7 days | Recent downloads are a strong adoption signal |
+| Ratings | 30 days | Ratings are more stable; older ratings still matter |
+| Revenue | 14 days | Revenue trends matter but don't vanish instantly |
+| Crash-free rate | 3 days | Recent crashes are critical; old ones are likely fixed |
+| Retention | 30 days | Long-term retention is the most stable signal |
+
+**Configuration:** Half-lives are stored in a config store, loaded at startup by ScoreCalculator. Changes take effect on next 15-minute cycle.
+
+## Windowed Aggregation
+
+Signals are aggregated in 15-minute windows to match the ranking update cadence:
+
+```
+Window: [12:00:00, 12:15:00)
+
+Aggregates for (app_id=com.game1, signal=downloads, region=US, window=12:00):
+  sum = Σ(decayed_value) of all download events in window
+  count = number of download events in window
+  avg = sum / count
+```
+
+**Why not use a single running average?** Windowed aggregation preserves temporal granularity. Each 15-minute window is an independent data point, enabling:
+- Trend detection (comparing current vs. previous window)
+- Burst detection (sudden spike in downloads → possible gaming)
+- Smooth ranking transitions (each window produces a new score, not a gradual drift)
+
+**Storage:** Redis key `signal:\{app_id\}:\{type\}:\{region\}:\{window\}` — e.g., `signal:com.game1:downloads:US:2026-05-03T12:00`

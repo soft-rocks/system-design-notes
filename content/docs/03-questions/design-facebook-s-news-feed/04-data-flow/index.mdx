@@ -1,0 +1,193 @@
+---
+title: "Data Flow"
+description: "Data flow for the Facebook News Feed — write path, read path, and real-time updates"
+---
+
+## Write Path
+
+When a user publishes a post, the system must make it visible to followers' feeds within seconds.
+
+```mermaid
+flowchart TD
+    subgraph Client["Client App"]
+        C["POST /api/v1/feed/post"]
+    end
+
+    subgraph Publishing["Publishing Service"]
+        direction TB
+        P1["1. Validate post\n(auth, size, content moderation)"]
+        P2["2. Store post in PostStore\n(Cassandra/HBase)"]
+        P3["3. Generate post_id"]
+        P4["4. Write media to CDN/S3"]
+    end
+
+    subgraph KafkaPub["Kafka Producer"]
+        K["Topic: post-events\nPartition key: author_id\nPayload: \{ post_id, author_id,\n  post_type, created_at, privacy \}"]
+    end
+
+    subgraph Fanout["Fan-out Service"]
+        direction TB
+        F1["1. Fetch author's followers\n(~500 friends x 200 pages = ~70K)"]
+        F2["2. Per follower:\n  a. Check follow status\n  b. Check privacy filter\n  c. Push: Redis for active users\n  d. Pull: PostStore for inactive"]
+        F3["3. High-follower authors (>50K)\n   → Pull-only"]
+        F4["4. Index post in Elasticsearch"]
+    end
+
+    subgraph PostStore["PostStore (Cassandra)"]
+        T["Table: posts\nPartition: author_id + created_at\nColumns: post_id, post_type, content, privacy"]
+    end
+
+    Client --> Publishing
+    Publishing --> P1 --> P2 --> P3 --> P4
+    P4 --> KafkaPub
+    K --> Fanout
+    Fanout --> F1 --> F2 --> F3
+    Fanout --> PostStore
+```
+
+### Push vs. Pull Decision
+
+The system uses a **hybrid fan-out** strategy:
+
+| Author Follower Count | Strategy | Why |
+| --- | --- | --- |
+| < 500 | **Push** | Cheap to fan out eagerly |
+| 500–5,000 | **Mixed** | Push to close friends, pull for pages |
+| 5,000–50,000 | **Mixed** | Push only to very close connections |
+| > 50,000 | **Pull-only** | Too expensive to push; fans out on read |
+
+This reduces fan-out writes by ~60% because the top 1% of authors account for ~40% of all posts but have ~80% of all followers.
+
+## Read Path
+
+When a user opens the app and requests their feed.
+
+```mermaid
+flowchart TD
+    subgraph Client["Client App"]
+        C["GET /api/v1/feed/home?limit=20&cursor="]
+    end
+
+    subgraph Gateway["Feed Gateway"]
+        direction TB
+        G1["1. Check response cache\n(same user + same cursor)"]
+        G2\{"Cache hit?"\}
+        G3["Return cached result\n(TTL 30s)"]
+    end
+
+    subgraph FeedFetch["Feed Service (fetch)"]
+        direction TB
+        FF1["1. Fetch user's social graph\n→ GraphStore: friends, pages, groups"]
+        FF2["2. Retrieve candidates\n→ Redis/Tair: pushed posts\n→ PostStore: pull-only posts\n→ Elasticsearch: pages/groups"]
+        FF3["3. Get ~700 candidate posts\nin one batch"]
+        FF4["4. Fetch engagement signals\n→ Redis for real-time counts"]
+        FF5["5. Apply cursor filter\n6. Limit to ~1,000 candidates"]
+    end
+
+    subgraph Ranking["Rank Service"]
+        direction TB
+        R1["1. Extract ~100 features\nper candidate (user-post affinity,\ntime decay, engagement velocity, etc.)"]
+        R2["2. Score using Two-Tower\nDNN model (&lt;5ms/post)\nOutput: P(user will engage)"]
+        R3["3. Apply diversity:\n   Max 2 posts per author\n   Max 30% same content type\n   Max 10% from suggested sources"]
+        R4["4. Sort by score descending\n5. Return top 30"]
+    end
+
+    subgraph Finalize["Feed Service (finalize)"]
+        direction TB
+        FI1["1. Enrich posts with\nmedia URLs, author info"]
+        FI2["2. Serialize and return"]
+        FI3["3. Write to response cache\n(TTL 30s)"]
+        FI4["4. Emit analytics to Kafka"]
+    end
+
+    Client --> Gateway
+    Gateway --> G1
+    G1 --> G2
+    G2 -->|"Yes"| G3
+    G2 -->|"No"| FeedFetch
+    G3 --> Client
+    FeedFetch --> Ranking
+    Ranking --> Finalize
+    Finalize --> Client
+
+    FF1 --> FF2 --> FF3 --> FF4 --> FF5
+    R1 --> R2 --> R3 --> R4
+    FI1 --> FI2 --> FI3 --> FI4
+```
+
+### Feature Categories for Ranking
+
+| Category | Example Features |
+| --- | --- |
+| User affinity | How often does this user engage with this author's content? |
+| Post type preference | Does this user prefer photos/videos over text? |
+| Relationship strength | How frequently does this user interact with this author? |
+| Time decay | How old is the post? (exponential decay with time) |
+| Engagement velocity | How many reactions in the first hour? |
+| Content diversity | How many posts from the same author already in feed? |
+| Author reach | How many total followers does this author have? |
+| Content freshness | How recently was the post published? |
+
+## Real-time Update Path
+
+New posts and engagement updates must reach followers within seconds.
+
+```mermaid
+flowchart LR
+    subgraph Fanout["Fan-out completes\n(post in feed set)"]
+        F["publish to Kafka"]
+    end
+
+    subgraph RTService["Real-time Service\n(subscribers to post-events topic)"]
+        R["consume events"]
+    end
+
+    subgraph SSE["SSE Gateway"]
+        S["push event"]
+    end
+
+    subgraph Client["Client App"]
+        C["Receives update:\n\{ type: 'new_post',\n  post_id: '...',\n  author: '...' \}\nInserts post at top of feed"]
+    end
+
+    Fanout -->|Kafka| RTService
+    RTService --> SSE
+    SSE --> Client
+```
+
+### Engagement Updates
+
+When a reaction, comment, or share occurs:
+
+```mermaid
+flowchart LR
+    subgraph Client2["Client"]
+        U["User clicks 'Like'"]
+    end
+
+    subgraph ReactionSvc["Reaction Service"]
+        direction TB
+        RS1["POST /reaction"]
+        RS2["Update Redis counter\natomic INCR"]
+        RS3["Publish to Kafka\nengagement-events topic"]
+    end
+
+    subgraph RT["Real-time Service"]
+        R["fan out to followers'\nSSE connections"]
+    end
+
+    subgraph Followers["Followers' Clients"]
+        FC["\{ type: 'reaction_added',\n  post_id: '...',\n  count: 43 \}"]
+    end
+
+    Client2 --> ReactionSvc
+    ReactionSvc --> RS1 --> RS2 --> RS3
+    RS3 --> RT
+    RT --> Followers
+```
+
+The system uses **SSE (Server-Sent Events)** for feed updates because:
+- Simpler than WebSocket (HTTP-based, easier to proxy/load-balance)
+- Automatic reconnection on disconnect
+- One-directional (server → client is all we need)
+- Compatible with existing HTTP infrastructure

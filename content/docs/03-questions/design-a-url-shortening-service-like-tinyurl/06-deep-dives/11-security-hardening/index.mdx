@@ -1,0 +1,90 @@
+---
+title: Security Hardening
+description: "Defense-in-depth: input validation, DDoS protection, enumeration prevention, authentication, and audit logging"
+---
+
+### Security Hardening
+
+#### Challenge
+
+Protecting against DDoS, enumeration, phishing, and data leaks.
+
+#### Solution: Defense-in-Depth Strategy
+
+1. **Input Validation**:
+
+```python
+import idna
+from urllib.parse import urlparse
+
+def validate_url(url: str) -> bool:
+    # Length guard before parsing
+    if not url or len(url) > 4096:
+        return False
+
+    # Parse first (don't regex-match before parsing — use the parser)
+    parsed = urlparse(url)
+
+    # Scheme must be http or https
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+
+    # Encode IDN to punycode; reject if invalid (blocks homograph attacks)
+    try:
+        host = parsed.netloc.split(":")[0]  # strip port
+        if host:
+            encoded = idna.encode(host).decode("ascii")
+        else:
+            return False
+    except (idna.IDNAError, UnicodeError):
+        return False
+
+    # Block known malicious TLDs
+    bad_tlds = \{".onion"\}  # Tor hidden services
+    if any(host.endswith(tld) for tld in bad_tlds):
+        return False
+
+    return True
+```
+
+2. **DDoS Protection**:
+
+- Cloudflare WAF with rate limiting
+- IP reputation blocking
+- CAPTCHA challenge on high-frequency requests
+- Anycast network to absorb traffic spikes
+
+3. **Enumeration Prevention**:
+
+- Return `404 Not Found` for invalid short codes (not 403)
+- Rate limit on redirect endpoint (10K/hour per IP — see Section 08) to prevent enumeration flooding
+- Randomized response times (±50ms) — prevents timing attacks that distinguish existing vs. non-existing codes
+- No API documentation exposing short code structure
+
+4. **Data Sanitization**:
+
+- Escape all output in redirects
+- Sanitize metadata fields
+- Use content-security-policy headers
+
+5. **Authentication**:
+
+- API keys rotated every 90 days
+- JWT tokens for user sessions
+- MFA for admin endpoints
+- OAuth2 for enterprise clients
+
+6. **Audit Logging**:
+
+- Log all admin actions (who, what, when)
+- Immutable logs stored in S3 with versioning
+- Log retention: 7 years
+
+7. **Penetration Testing**:
+
+- Quarterly external pentests
+- Bug bounty program
+- Automated scanners (OWASP ZAP)
+

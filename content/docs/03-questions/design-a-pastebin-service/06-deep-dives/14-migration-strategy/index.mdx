@@ -1,0 +1,205 @@
+---
+title: Migration Strategy
+description: Deep dive into zero-downtime migration approaches for shard rebalancing, schema evolution, and deferred compression.
+---
+
+### Migration Strategy
+
+#### Challenge
+
+All migrations must complete with **zero downtime** — no rejected writes, no readable data gaps. The system runs at ~1M writes/day and ~100M reads/day, so every migration path must maintain both write and read availability at 99.9%. Key migration categories:
+
+1. **Shard rebalancing** (N -> N+1): Adding shards changes the routing function `hash % N` -> `hash % (N+1)`, remapping every row. Must migrate rows without disrupting live traffic.
+2. **Schema evolution**: Adding columns (e.g., `title`, `language`) to an existing table. The `pastes` table is young, but schema changes are inevitable as the service evolves.
+3. **Deferred compression migration**: Section 1 notes that blob compression can be added later without client impact. This is a data migration that must be safe and reversible.
+4. **Database version upgrades**: PostgreSQL major version upgrades (e.g., 15 -> 16) require logical replication or dual-primary setups.
+5. **Service-level migration**: Replacing or adding Paste Service instances during rolling deployments.
+
+**Migration principle**: Every migration follows the **double-write pattern** — the old and new code paths run in parallel during transition, and the migration is a configuration change (feature flag), not a coordinated rollout.
+
+#### Solution: Feature-Flagged Dual-Write with Backfill
+
+**1. Shard Rebalancing (N -> N+1)**
+
+When a new shard is added, the routing function changes from `hash(paste_key) % N` to `hash(paste_key) % (N+1)`. This remaps roughly every row, requiring a full migration.
+
+```
+Phase 1: Provisioning (0 downtime)
+  - Provision new shard with identical schema
+  - Register shard in routing table (new routing table: N+1)
+
+Phase 2: Dual-write (0 downtime)
+  - Application enters dual-write mode via feature flag
+  - New writes go to BOTH old routing (hash % N) AND new routing (hash % (N+1))
+  - Reads continue using old routing — no disruption
+
+Phase 3: Backfill (rolling, background)
+  - Background migrator iterates old shards:
+    for each row in old_shard:
+      new_shard_id = hash(row.paste_key) % (N+1)
+      if new_shard_id == new_shard:
+        INSERT INTO new_shard (row) ON CONFLICT (paste_key) DO UPDATE SET
+          title = EXCLUDED.title, language = EXCLUDED.language,
+          content_hash = EXCLUDED.content_hash, expires_at = EXCLUDED.expires_at,
+          access_mode = EXCLUDED.access_mode, status = EXCLUDED.status
+        DELETE FROM old_shard WHERE paste_key = row.paste_key
+  - Run at 1K rows/sec to minimize impact on live traffic
+  - Monitor lag: "rows_not_migrated" metric, alert if > 100K
+
+Phase 4: Read-switch (rolling)
+  - Once all rows are migrated:
+  - Enable new routing for reads (feature flag update)
+  - Reads use hash(paste_key) % (N+1) exclusively
+  - Double-write remains active for 1 hour as safety net
+
+Phase 5: Cleanup (rolling)
+  - Disable double-write
+  - Decommission old shards when N+1 is stable for 24h
+```
+
+**Backfill throughput estimate** (at 1B pastes, N=100 -> N+1=101):
+- With `hash % N` sharding, ~98% of rows change target shard when N changes (100 and 101 are coprime, so modular arithmetic redistributes almost all rows)
+- Total rows touched: ~980M (reads from old shards, writes to new target shards)
+- At 1K rows/sec: ~28.6 hours total
+- Per-shard load: each of 100 old shards handles ~9.8M rows (out + in), ~2.7 hours per shard
+- **This is why hash-modulo sharding is expensive to rebalance**. At this scale, consider switching to consistent hashing (ketama/murmur ring) instead, where only ~1/N of rows need to move (~10M for N=100) rather than ~98%.
+- Impact on live traffic: at 1K rows/sec vs ~10K live writes/sec, ~10% additional load — manageable with connection pool headroom
+
+**2. Schema Evolution — Add Column**
+
+```sql
+-- Phase 1: Add nullable column (instant, no lock)
+ALTER TABLE pastes ADD COLUMN language VARCHAR(64);
+
+-- Phase 2: Backfill existing rows (background, batched)
+-- This is optional — nullable columns don't need backfill
+-- Only needed if the column has a non-trivial default
+
+-- Phase 3: Deploy application code that uses the column
+-- The feature flag gates whether new writes set the column
+-- Existing rows that weren't backfilled will have NULL — that's fine
+-- because the column is nullable
+
+-- Phase 4: (Optional) Make column NOT NULL with a default
+-- ALTER TABLE pastes ALTER COLUMN language SET NOT NULL;
+-- This requires a full table scan and will lock — only do with pg_repack
+-- or during a maintenance window
+```
+
+**Key insight**: PostgreSQL's `ALTER TABLE ... ADD COLUMN` is instant for nullable columns with no default because it only updates the catalog — it does not touch existing rows. The migration burden shifts to application code, which handles NULL values gracefully.
+
+**3. Deferred Compression Migration**
+
+When blob compression is added (Section 1), the migration must handle existing uncompressed blobs and new compressed blobs simultaneously.
+
+```
+Phase 1: Deploy compressor (0 downtime)
+  - Feature flag: "enable_blob_compression" = false
+  - Writes: new pastes uploaded uncompressed (no change)
+  - Reads: existing path — fetch uncompressed blob
+
+Phase 2: Background compressor (rolling, background)
+  - Background job selects pastes in batches:
+    for batch in SELECT paste_key, content_hash FROM pastes LIMIT 1000:
+      blob = GET s3://objects/<hash>.txt
+      compressed = gzip(blob)
+      PUT s3://objects/compressed/<hash>.gz
+      UPDATE pastes SET blob_compression = 'gzip' WHERE paste_key = :key
+  - Rate-limited to 100 blobs/sec
+  - Existing uncompressed blobs remain readable — read path checks
+    blob_compression flag before deciding decompress or not
+
+Phase 3: Switch read path (0 downtime)
+  - Feature flag: "enable_blob_compression" = true
+  - Reads: check blob_compression flag
+    - If 'gzip': decompress on read
+    - If NULL or 'uncompressed': direct fetch (backward compatible)
+
+Phase 4: Cleanup (optional)
+  - Purge uncompressed blobs after 30 days (safety window)
+  - DELETE s3://objects/<hash>.txt where blob_compression = 'gzip'
+```
+
+**Rollback**: At any phase, disable the feature flag to revert. Uncompressed blobs are still accessible because the background job doesn't delete them until Phase 4.
+
+**4. PostgreSQL Version Upgrade**
+
+```
+Strategy: Logical replication (pg_logical) — no downtime
+
+Phase 1: Set up logical replication
+  - Old cluster: PG 15 (primary)
+  - New cluster: PG 16 (standby, logical replication from old)
+  - Initial sync: pg_dump + pg_restore of all shards
+  - Replication catches up: WAL streaming
+
+Phase 2: Cutover (near-zero downtime)
+  - Stop writes to old cluster (1-2 second write pause)
+  - Wait for replication lag to reach 0
+  - Promote new cluster to primary
+  - Update connection routing (DNS or config change)
+  - Resume writes on new cluster
+
+Downtime: < 5 seconds (only the stop-wait-promote-resume window)
+Rollback: Flip DNS back to old cluster if needed
+```
+
+**5. Application Deployment — Rolling Update**
+
+```
+Strategy: Zero-downtime rolling deployment
+
+- Minimum 3 instances (one per AZ)
+- maxSurge = 1, maxUnavailable = 0
+- Health check: /health (liveness), /ready (readiness)
+- Deploy instance A → wait for /ready → deploy instance B → ...
+- New code reads/writes old schema — backward compatible
+- If /ready fails 3 times in 30s: stop deployment, rollback this instance
+
+Feature flags control:
+  - New code paths (disabled by default)
+  - Migration phases (dual-write, read-switch, cleanup)
+  - Experiments and AB tests
+```
+
+**6. Migration Safety — Rollback Strategy**
+
+| Migration | Rollback Method | Data Loss? | Rollback Time |
+|-----------|----------------|------------|---------------|
+| Shard rebalancing | Disable dual-write, keep old routing | No | < 1 minute (config change) |
+| Schema addition | Code rollback | No | < 1 minute (config change) |
+| Compression | Disable feature flag, revert to uncompressed reads | No | < 1 minute (config change) |
+| PG upgrade | Flip DNS back to old cluster | 0-1 min (WAL) | < 5 minutes |
+| Application deploy | Stop rolling update, redeploy previous version | No | < 5 minutes |
+
+**7. Migration Orchestration**
+
+```
+Migration control plane:
+
+  Migration Manager (state machine)
+    ├── Feature Flag Service (Consul/etcd/Redis)
+    ├── Backfill Worker Pool (distributed, rate-limited)
+    ├── Monitoring (lag metrics, error rate)
+    └── Alerting (PagerDuty on migration failure)
+
+State transitions (each gated on completion criteria):
+  provisioning -> dual_write -> backfill -> read_switch -> cleanup -> complete
+
+Each state:
+  - Has an exit condition (e.g., "all rows migrated")
+  - Has a health check (e.g., "no errors in backfill")
+  - Has a timeout (e.g., "abort if backfill > 48 hours")
+  - Logs progress (migration_id, rows_migrated, rows_remaining, estimated_completion)
+```
+
+**8. Migration Testing**
+
+Every migration must be tested in a staging environment before production:
+
+| Test | Purpose | Method |
+|------|---------|--------|
+| Schema compatibility | Verify old code works with new schema | Deploy old code against new schema in staging |
+| Backfill correctness | Verify row counts match after migration | Compare row counts, sample random rows |
+| Performance impact | Verify migration doesn't degrade live traffic | Monitor P95 latency during backfill |
+| Rollback safety | Verify rollback is reversible | Perform full rollback test in staging |

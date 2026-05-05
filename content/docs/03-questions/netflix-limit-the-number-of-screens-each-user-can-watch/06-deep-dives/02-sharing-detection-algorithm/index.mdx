@@ -1,0 +1,191 @@
+---
+title: Sharing Detection Algorithm
+description: Deep dive into Netflix's credential sharing detection — geo analysis, IP network clustering, and the verification flow.
+---
+
+## Detection Criteria
+
+### The Problem Statement
+
+Netflix's business model penalizes account sharing, but users naturally share passwords within households. The challenge is distinguishing between:
+
+- **Legitimate household sharing** — family members using the account from the same location
+- **Credential sharing** — giving your password to someone in a different city/country
+- **Account piracy** — selling your password to strangers
+
+The system must flag the second category without creating false positives on the first.
+
+### Detection Signals
+
+```mermaid
+flowchart TB
+    subgraph Temporal["Temporal Signals"]
+        T1[Time between logins from different regions]
+        T2[Sessions overlapping across regions]
+        T3[Session duration pattern — long continuous vs intermittent]
+    end
+
+    subgraph Spatial["Spatial Signals"]
+        S1[IP geolocation distance]
+        S2[IP ASN — different ISPs = different networks]
+        S3[GPS data from mobile apps]
+        S4[WiFi SSID from mobile apps]
+    end
+
+    subgraph Behavioral["Behavioral Signals"]
+        B1[Watching patterns — overlapping content consumption]
+        B2[Device types — TV in one location, phone in another]
+        B3[Account age — new accounts sharing = suspicious]
+        B4[Payment method — credit card vs gift card]
+    end
+
+    T1 --> Detector
+    T2 --> Detector
+    T3 --> Detector
+    S1 --> Detector
+    S2 --> Detector
+    S3 --> Detector
+    S4 --> Detector
+    B1 --> Detector
+    B2 --> Detector
+    B3 --> Detector
+    B4 --> Detector
+    Detector[Detection Engine] --> Flag
+    Flag[Suspicious Flag] --> Verify
+    Verify[Verification Flow]
+```
+
+### Scoring System
+
+Each signal contributes a weighted score. When the total exceeds a threshold, the account is flagged:
+
+| Signal | Weight | Rationale |
+|--------|--------|-----------|
+| Sessions from different IP ASNs simultaneously | +40 | Strongest signal — same password, different ISPs |
+| Sessions from different countries overlapping | +35 | Impossible travel window |
+| Sessions from same household (same WiFi SSID) | -30 | Normalizes household sharing |
+| Sessions from same IP range (same /24) | -20 | Same building/network, likely household |
+| GPS from mobile apps same location | -25 | Strong negative signal |
+| Account age < 30 days | +10 | New accounts are more likely to be shared |
+| Gift card payment | +10 | Higher fraud correlation |
+| TV + phone simultaneously | +15 | Different device classes = likely different people |
+
+**Threshold**: Flag if score &gt;= 50. This means one strong signal (different ASNs simultaneously) triggers a flag, or two moderate signals combine.
+
+## Algorithm Design
+
+### Real-Time Detection Pipeline
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka (stream events)
+    participant C as Consumer
+    participant G as Geo Engine
+    participant I as IP Index
+    participant S as Scorer
+    participant F as Flag Store
+
+    K->>C: stream.session_started events
+    C->>I: GET ip_asn:\{ip\}
+    I-->>C: AS number + country
+    C->>G: GET geo:\{user_id\}:\{device_id\}
+    G-->>C: \{lat, lon, country\}
+    C->>S: Run scoring algorithm
+    S->>F: Set flag:\{user_id\}=\{score\} EXPIRE 3600
+    alt Score &gt;= 50
+        S->>F: HSET suspicious:\{user_id\} \{timestamp\}
+        F-->>S: Flagged
+    end
+```
+
+The geo engine maintains a sliding window of active sessions per user. For each new session_started event, it checks:
+
+1. Are there overlapping sessions from different IP ASNs?
+2. Are any sessions from different countries with overlapping timestamps?
+3. Is there GPS/SSID data that contradicts the IP-based geolocation?
+
+### IP Network Clustering
+
+```mermaid
+flowchart TB
+    A[IP Address] --> B[ASN Lookup]
+    B --> C\{Different ASN?\}
+    C -->|Yes| D[Different networks]
+    C -->|No| E\{Same /24 subnet?\}
+    E -->|Yes| F[Same ISP block]
+    E -->|No| G[Same ISP, different block]
+    D --> H[High sharing probability]
+    F --> I[Low sharing probability]
+    G --> J[Medium sharing probability]
+```
+
+IP ASN (Autonomous System Number) is the most reliable single signal because:
+
+- Two devices on different ISPs (e.g., Comcast vs Verizon) cannot physically be in the same household
+- Two devices on the same ISP but different /24 subnets are likely in different buildings
+- Two devices on the same /24 subnet might be in the same apartment building but not the same household
+
+### Time-Overlap Detection
+
+```mermaid
+flowchart LR
+    A[Session 1: started 20:00, device TV] --> B\{Overlaps with Session 2?\}
+    C[Session 2: started 20:05, device phone] --> B
+    B -->|Yes, >5min overlap| D[Overlapping sessions]
+    B -->|No overlap| E[No action]
+    D --> F\{Different locations?\}
+    F -->|Yes| G[Flag immediately]
+    F -->|No| H[Normal household use]
+```
+
+A 5-minute overlap threshold is used because:
+
+- 0 minutes: Too strict — a user might briefly watch on TV, then switch to phone
+- 5 minutes: Captures genuine simultaneous use (e.g., one person watching a show, another checking notifications)
+- 15 minutes: Too loose — would miss short-term sharing detection
+
+## Verification Flow
+
+### The User Experience
+
+When an account is flagged, the system doesn't block anyone. Instead, it triggers a verification flow:
+
+```mermaid
+flowchart TB
+    A[Account flagged] --> B[Next login from new device]
+    B --> C[Display: This account is shared]
+    C --> D[Require account password re-entry]
+    D --> E\{Password correct?\}
+    E -->|Yes| F[Trust this device for 90 days]
+    E -->|No| G[Account temporarily locked]
+    F --> H[Normal streaming continues]
+    G --> I[Contact support or wait 24h]
+```
+
+The verification flow only triggers on the **most recently added device**, not on existing active sessions. This minimizes disruption:
+
+- Existing users (household members) continue watching
+- The new user (sharing suspect) must re-authenticate
+- If they can't, they either: (a) don't get access, or (b) must contact the account owner
+
+### Device Trust Tokens
+
+After successful re-verification, a trust token is issued:
+
+```
+trust:\{user_id\}:\{device_id\} = "verified"
+EXPIRE trust:\{user_id\}:\{device_id\} 7776000  # 90 days in seconds
+```
+
+This prevents re-flagging the same device for 90 days. The token is stored in Redis and checked during the scoring phase.
+
+### False Positive Recovery
+
+If a user is incorrectly flagged (e.g., traveling, or legitimately sharing with a friend):
+
+1. The account owner receives an email with a link to "manage sharing"
+2. The owner can confirm or deny the flag
+3. If confirmed as legitimate, the flag is dismissed and the score decreases by 50 points
+4. The device is added to a "trusted devices" list
+
+This puts the decision in the hands of the account holder rather than an automated system.

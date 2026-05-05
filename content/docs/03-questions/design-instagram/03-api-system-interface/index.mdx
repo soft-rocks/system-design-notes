@@ -1,0 +1,80 @@
+---
+title: API / System Interface
+description: REST API endpoints and internal service interfaces for the Instagram system design.
+---
+
+## REST Endpoints
+
+### Auth & User
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| POST | `/auth/register` | Register account. Body: `\{username, email, password, display_name\}`. Rate-limited. |
+| POST | `/auth/login` | Authenticate. Body: `\{username_or_email, password\}`. Returns JWT + refresh token. |
+| POST | `/auth/refresh` | Refresh token. Body: `\{refresh_token\}`. |
+| GET | `/users/:id/profile` | Get profile by user ID. Returns user info + follow status + counts. |
+| GET | `/users/@:username/profile` | Get profile by username. Same response. |
+| PUT | `/users/me/profile` | Update own profile. Body: `\{display_name, bio, profile_picture_url, is_private\}`. |
+| POST | `/users/me/change-username` | Change username. Body: `\{new_username\}`. Unique check. |
+| GET | `/users/search` | Search users. Query: `\{q, limit, offset\}`. |
+
+### Media
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| POST | `/media/upload-init` | Start upload. Returns `\{upload_id, presigned_upload_urls\}`. |
+| POST | `/media/upload-complete` | Signal completion. Body: `\{upload_id, width, height, format, caption, hashtag_list, location_id\}`. Response: `\{photo_id\}`. |
+| GET | `/media/:photo_id` | Get photo metadata + engagement counts + derivative URLs. |
+| GET | `/media/:photo_id/derivative/:resolution` | Direct CDN URL for a derivative (thumb/small/large/original). Cacheable. |
+| PUT | `/media/:photo_id` | Update caption/location. |
+| DELETE | `/media/:photo_id` | Soft delete photo + async derivative cleanup. |
+
+### Feed & Social
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/feed/home` | Home feed. Query: `\{cursor, count=20\}`. Returns `FeedItem[]` + `next_cursor`. |
+| GET | `/feed/user/:userId` | User's own photo grid for profile page. Query: `\{cursor, count=12\}`. |
+| POST | `/users/:id/follow` | Follow. Idempotent. Response: `\{following: true\}`. |
+| DELETE | `/users/:id/follow` | Unfollow. Response: `\{following: false\}`. |
+| GET | `/users/:id/followers` | List followers. Query: `\{cursor, count\}`. |
+| GET | `/users/:id/following` | List following. Query: `\{cursor, count\}`. |
+| POST | `/media/:photo_id/like` | Like. Idempotent. Response: `\{liked: true, like_count\}`. |
+| DELETE | `/media/:photo_id/like` | Unlike. Response: `\{liked: false, like_count\}`. |
+| GET | `/media/:photo_id/likes` | List likers. Query: `\{cursor, count\}`. Returns avatars. |
+| POST | `/media/:photo_id/comments` | Add comment. Body: `\{body, parent_comment_id\}`. |
+| GET | `/media/:photo_id/comments` | List comments. Query: `\{cursor, count\}`. |
+| DELETE | `/comments/:commentId` | Delete comment. |
+
+### Discoverability
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/explore` | Explore feed. Response: `FeedItem[]`. Powered by ML recommendation service. |
+| GET | `/hashtags/:tagName` | Hashtag page. Response: `\{tag_name, photo_count, items\}`. |
+| GET | `/locations/:locationId` | Location page. Same structure. |
+| GET | `/search` | Unified search. Query: `\{q, type: user\|hashtag\|location, limit\}`. |
+
+---
+
+## Internal Services (gRPC)
+
+### Image Processing Service
+
+Receives `UploadComplete` signal, downloads the original from object store, generates derivatives (thumbnails, crops), uploads them back, and writes metadata to the database.
+
+### Feed Generation Service
+
+When a user posts, the service fans out the new photo ID into the follower feeds of active followers using the **write-ahead model**. For power users (>10K followers), uses pull-based feed generation instead.
+
+### Notification Service
+
+Consumes events (`Like`, `Comment`, `Follow`) from a message queue and sends push notifications via FCM (Android) and APNs (iOS).
+
+### Search Index Service
+
+Builds and maintains Elasticsearch indices for users, hashtags, and locations based on database change streams.
+
+### Recommendation Service
+
+Powers the Explore feed. Takes user features and candidate photos, returns a ranked list using a two-stage retrieval + ranking pipeline.

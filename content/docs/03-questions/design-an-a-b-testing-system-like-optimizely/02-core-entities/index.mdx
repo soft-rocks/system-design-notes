@@ -1,0 +1,140 @@
+---
+title: Core Entities
+description: Core domain entities for an A/B testing system.
+---
+
+## Entity Definitions
+
+### Experiment
+The top-level entity representing an A/B test.
+
+| Field | Type | Description |
+|---|---|---|
+| `experiment_id` | UUID (unique) | Global unique identifier |
+| `name` | string | Human-readable name |
+| `description` | string | Purpose and hypothesis |
+| `status` | enum | `draft` / `running` / `completed` / `stopped` |
+| `created_at` | timestamp | Creation time |
+| `updated_at` | timestamp | Last modification time |
+| `owner_id` | string | Experiment creator |
+| `start_time` | timestamp | When the experiment started |
+| `end_time` | timestamp | Scheduled end (nullable) |
+| `layers` | string[] | Layer IDs for mutual exclusion |
+| `targeting_conditions` | JSON | Audience filter rules |
+| `traffic_allocation` | JSON | Percentages per variant (e.g., `\{control: 50, variant_a: 25, variant_b: 25\}`) |
+| `reset_on_variant_change` | boolean | Whether to reassign users if variants are modified |
+
+### Variant
+A treatment option within an experiment.
+
+| Field | Type | Description |
+|---|---|---|
+| `variant_id` | UUID | Unique identifier |
+| `experiment_id` | FK → Experiment | Parent experiment |
+| `name` | string | Human-readable name |
+| `key` | string | String identifier used in client SDKs |
+| `description` | string | What this variant changes |
+| `traffic_percentage` | float | Portion of traffic this variant receives |
+
+> **Note:** Every experiment has exactly one control variant (key: `"control"`), which represents the baseline.
+
+### FeatureFlag
+A simple on/off toggle for feature rollouts (not an experiment).
+
+| Field | Type | Description |
+|---|---|---|
+| `flag_id` | UUID | Unique identifier |
+| `name` | string | Human-readable name |
+| `key` | string | Identifier for client SDK |
+| `enabled` | boolean | Current state |
+| `targeting_rules` | JSON | Conditional rollout rules |
+| `rollout_percentage` | float | % of users who see the feature enabled |
+| `created_by` | string | Creator |
+| `created_at` | timestamp | Creation time |
+| `updated_at` | timestamp | Last modification time |
+
+### EventDefinition
+Defines what events to track for an experiment.
+
+| Field | Type | Description |
+|---|---|---|
+| `event_id` | UUID | Unique identifier |
+| `name` | string | Event name (e.g., `purchase_completed`) |
+| `description` | string | What the event represents |
+| `category` | enum | `behavioral` / `business` |
+| `properties` | JSON[] | Schema: `\{property_name, type, required\}` |
+
+### ExperimentEvent
+An individual event occurrence tied to a user's variant assignment.
+
+| Field | Type | Description |
+|---|---|---|
+| `event_id` | UUID | Unique identifier |
+| `experiment_id` | FK → Experiment | Which experiment this belongs to |
+| `variant_id` | FK → Variant | Which variant the user was assigned |
+| `user_id` | string | Anonymized user identifier |
+| `event_name` | string | Event type (e.g., `button_click`) |
+| `event_timestamp` | timestamp | When the event occurred |
+| `properties` | JSON | Event-specific metadata |
+| `session_id` | string | Session identifier |
+| `platform` | string | `ios` / `android` / `web` / `server` |
+| `device_info` | JSON | Device metadata |
+
+### UserAssignment
+Maps a user to a variant for an experiment.
+
+| Field | Type | Description |
+|---|---|---|
+| `assignment_id` | UUID | Unique identifier |
+| `user_id` | string | User identifier |
+| `experiment_id` | FK → Experiment | Parent experiment |
+| `variant_id` | FK → Variant | Assigned variant |
+| `assigned_at` | timestamp | When assignment was made |
+| `expires_at` | timestamp | When the assignment expires (nullable for permanent) |
+
+### Layer
+A grouping of mutually exclusive experiments. Prevents interference between experiments running on the same page.
+
+| Field | Type | Description |
+|---|---|---|
+| `layer_id` | UUID | Unique identifier |
+| `name` | string | Layer name |
+| `experiment_ids` | UUID[] | Experiments in this layer |
+
+### Metric
+A KPI tracked across experiments.
+
+| Field | Type | Description |
+|---|---|---|
+| `metric_id` | UUID | Unique identifier |
+| `name` | string | Metric name (e.g., `conversion_rate`) |
+| `description` | string | What this metric measures |
+| `event_name` | FK → EventDefinition | Underlying event |
+| `aggregation_type` | enum | `count` / `sum` / `mean` / `rate` |
+| `guardrail` | boolean | Whether this is a guardrail metric (must not degrade) |
+
+## Relationships
+
+```
+Experiment 1:N Variant
+  Experiment 1:N UserAssignment
+  Experiment 1:N ExperimentEvent
+Layer 1:N Experiment
+Experiment N:M Metric
+FeatureFlag N:M Experiment
+UserAssignment 1:1 ExperimentEvent
+```
+
+### Key Relationships
+
+**Experiment → Variant (1:N):** An experiment has one control (key: `"control"`) and N treatment variants. Traffic is split among all variants.
+
+**Experiment → UserAssignment (1:N):** Each experiment accumulates assignments for all users entering the test. Assignments are immutable once created to ensure consistency.
+
+**Experiment → ExperimentEvent (1:N):** Events are collected per experiment for metric computation. Each event is tagged with the user's variant.
+
+**Layer → Experiment (1:N):** Multiple experiments belong to the same layer. Experiments within a layer are mutually exclusive for the same user — the assignment engine picks one experiment per layer per user.
+
+**Experiment ↔ Metric (N:M):** Experiments track zero or more metrics. Metrics can be shared across experiments (e.g., `conversion_rate` tracked in 100 experiments).
+
+**FeatureFlag ↔ Experiment (N:M):** Flags can be referenced by experiments (e.g., a flag gates whether a variant's feature is shown). An experiment can contain multiple flag references.

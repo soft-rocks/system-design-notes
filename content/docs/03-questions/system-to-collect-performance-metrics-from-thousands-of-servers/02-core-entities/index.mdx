@@ -1,0 +1,127 @@
+---
+title: "Core Entities"
+description: "Core data entities for the performance metrics collection system — Metric, MetricValue, Label, AlertRule, and Dashboard"
+---
+
+## Metric Definitions
+
+Every unique combination of metric name + label dimensions is a distinct metric series.
+
+### Metric
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | UUID | Primary key |
+| name | string | e.g., `cpu_usage`, `http_requests_total`, `disk_io_bytes` |
+| type | enum | `counter`, `gauge`, `histogram`, `summary` |
+| unit | string | `percent`, `bytes`, `seconds`, `count`, `bits_per_second` |
+| description | string (nullable) | Human-readable description |
+
+### Metric Series (Time-Series Key)
+
+A metric series is the intersection of a metric name and a label set. This is the primary partition key for storage.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| metric_id | UUID (FK→Metric) | The metric this series belongs to |
+| labels | JSON | Key-value labels: `\{"host": "web-01", "service": "api", "region": "us-east-1"\}` |
+| series_key | string (computed) | MD5(metric_name + sorted labels) — used for routing |
+
+With 2M unique metrics × ~10 unique label sets per metric on average, the system manages ~20M series.
+
+## Metric Values
+
+### MetricValue
+
+A single data point in the time series.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | UUID | Primary key (optional; often omitted in columnar stores) |
+| series_key | UUID (FK→MetricSeries) | Which series this value belongs to |
+| timestamp | timestamp | Wall-clock time (UTC, millisecond precision) |
+| value | double | The metric value (NaN for missing/histogram bucket markers) |
+| ingest_time | timestamp | When the system received the value (for dedup detection) |
+
+**Histogram values** are stored as bucket counts:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| series_key | UUID | Same series |
+| timestamp | timestamp | Same bucket |
+| bucket_upper | double | Bucket upper bound (e.g., 0.01, 0.05, 0.1) |
+| count | long | Number of observations &lt;= upper bound |
+| sum | double | Sum of all observations in bucket |
+
+## Alert Rule
+
+### AlertRule
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | UUID | Primary key |
+| name | string | Human-readable alert name |
+| query | string | PromQL-like query: `avg(rate(http_errors_total[5m])) > 0.01` |
+| for_duration | duration | Minimum time above threshold before firing (e.g., 5m) |
+| labels | JSON | Alert metadata: `\{"severity": "critical", "team": "platform"\}` |
+| annotations | JSON | Notification details: `\{"summary": "High error rate", "runbook_url": "..."\}` |
+| enabled | boolean | Soft delete toggle |
+| created_at | timestamp | |
+| updated_at | timestamp | |
+
+### AlertState
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| rule_id | UUID (FK→AlertRule) | |
+| series_key | UUID | Which series triggered this |
+| state | enum | `pending`, `firing`, `resolved` |
+| last_evaluation | timestamp | When the rule was last evaluated |
+| last_firing | timestamp | When this alert last entered firing state |
+| last_acked | timestamp (nullable) | When the alert was acknowledged |
+
+## Dashboard
+
+### Dashboard
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | UUID | Primary key |
+| name | string | Dashboard title |
+| owner_id | UUID (FK→User) | Dashboard creator |
+| is_public | boolean | Shared across team or private |
+| panels | JSON array | Array of panel configs, each with query, visualization type, x/y labels |
+| refresh_interval | duration | Auto-refresh: 5s, 15s, 30s |
+| time_range | string | Default: `now-1h` |
+| created_at | timestamp | |
+| updated_at | timestamp | |
+
+### Relationships
+
+```
+┌──────────┐     has            ┌──────────────┐
+│  Metric  │◄──────────────────│  MetricSeries │
+│          │   1:N              │              │
+│ id       │                    │ metric_id    │
+│ name     │                    │ labels       │
+│ type     │                    │ series_key   │
+└──────────┘                    └──────┬───────┘
+                                       │
+                                       │ produces
+                                       ▼
+                              ┌──────────────┐
+                              │  MetricValue  │
+                              │              │
+                              │ series_key   │
+                              │ timestamp    │
+                              │ value        │
+                              └──────────────┘
+
+┌──────────┐     references         ┌──────────┐
+│ AlertRule │─────────────────────▶│  Metric   │
+│          │                        │ (queried) │
+│ id       │                        └──────────┘
+│ query    │
+│ for_dur  │
+└──────────┘
+```

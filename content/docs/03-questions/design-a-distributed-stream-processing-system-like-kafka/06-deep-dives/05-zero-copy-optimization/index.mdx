@@ -1,0 +1,95 @@
+---
+title: Zero-Copy Optimization
+description: Memory-mapped files, sendfile, and network throughput
+---
+
+## Memory-Mapped Files (mmap)
+
+The producer write path starts with a memory-mapped file for the log segment. When a producer sends a message to a partition, the broker appends it to the log via `mmap`. This maps the log file directly into the process's virtual address space, so the OS handles paging data between disk and memory.
+
+**Why mmap for writes:**
+
+Without mmap, a write involves two copies: user space to kernel space (via `write()` system call), then kernel page cache to disk (via the OS writeback thread). With mmap, the producer writes directly to the page cache — only one copy occurs (in userspace where the producer builds the byte array), and the OS handles flushing to disk asynchronously at optimal intervals.
+
+```
+Write path without mmap:
+  Application buffer → syscall write() → kernel page cache → OS writeback thread → disk
+  Copies: userspace buffer copy + kernel syscall copy = 2 copies
+
+Write path with mmap:
+  Application buffer → page cache (via mmap) → OS writeback thread → disk
+  Copies: userspace buffer copy = 1 copy (syscalls only manage virtual memory, not data)
+```
+
+**The page cache as a write buffer:**
+
+The OS's page cache buffers writes and flushes them to disk in large sequential batches. This is far more efficient than writing small messages individually to disk. The flush interval is controlled by `os.pagecache.clean.dir.interval.ms` and `os.pagecache.dirty.ratio`. For high-throughput producers, the page cache can hold significant data before flushing, effectively batching writes automatically.
+
+**Tradeoff: mmap is not direct I/O.**
+
+Data written via mmap is not immediately on disk — it lives in the page cache until the OS flushes it. A power failure could lose unwritten page cache data. The `flush.messages` config controls how often the OS is told to flush: `flush.messages=1` forces a disk flush after every message (slow but durable); `flush.messages=never` relies on the OS (fast but riskier). The default `flush.messages=1` is a Kafka-specific override that forces a sync after every produce request, at the cost of disk IOPS.
+
+## sendfile System Call
+
+When a consumer requests data, the broker reads from the log and sends it over the network. The `sendfile()` system call transfers data from the page cache directly to a socket without copying it through userspace:
+
+```
+Traditional read-then-write:
+  disk → page cache → userspace buffer (read) → kernel socket buffer (write) → network
+  2 copies
+
+sendfile:
+  disk → page cache → socket buffer (kernel internal) → network
+  0 copies between kernel and userspace
+```
+
+**The sendfile path:**
+
+```
+1. Broker mmap reads the log segment, finding data already in the page cache.
+2. Broker calls sendfile(sockfd, fd, &offset, count).
+3. Kernel copies page descriptors (not page contents) from file cache to socket buffer.
+4. Network interface controller (NIC) DMA's data directly from page cache to network.
+```
+
+Step 3 is the key insight: `sendfile` copies metadata (page table entries, offsets) not data. The NIC may DMA directly from the page cache (with scatter-gather DMA), eliminating even the kernel-to-socket buffer copy.
+
+**Why sendfile matters at scale:**
+
+With 1B messages/day x 1KB = ~12GB/s of network throughput, copy operations are expensive. On a 32-core server, each copy operation consumes CPU cycles that could serve other requests. Zero-copy can reduce CPU utilization by 30-50% for high-throughput brokers.
+
+**Limitations:**
+
+`sendfile` only works when the data source is a file descriptor (log files). It cannot be used with in-memory transformations or encrypted data without copying. Compression (if enabled) requires decompressing into userspace, which negates the zero-copy benefit — this is why Kafka uses compression that is compatible with zero-copy (none, or uncompressed segments).
+
+## Page Cache and Direct I/O
+
+Kafka's performance depends critically on the OS page cache. Hot data stays in the page cache, serving reads from memory. The page cache size should be sized to hold the working set of frequently accessed partitions.
+
+**Read path through page cache:**
+
+```
+Consumer requests offset 5M in partition P1:
+1. Broker checks its index files (offset → position in log segment).
+2. Index lookup finds the log segment and byte offset within it.
+3. Broker reads from mmap — if data is in page cache, served from memory.
+4. If not in page cache, the OS pages in the relevant disk blocks (sequential read).
+```
+
+Sequential reads are exceptionally fast — modern disks sustain ~200MB/s sequential read. Even spinning disks can serve thousands of partition reads per second because each read is a sequential scan of a small segment.
+
+**Direct I/O bypass (Kafka's default):**
+
+Kafka uses the page cache by default, NOT direct I/O. This means all reads go through the OS page cache, which provides a second level of caching. Direct I/O would bypass the page cache, reading directly from disk. Kafka intentionally avoids direct I/O because:
+
+1. **Double caching is beneficial**: The application has its own client-side cache; the page cache provides a server-side cache. These serve different working sets.
+2. **Sequential reads are fast enough**: Without direct I/O, the OS optimizes sequential reads with read-ahead, prefetching data before it's requested.
+3. **Direct I/O requires larger buffers**: Must be aligned to disk sector boundaries, reducing flexibility.
+
+**Tuning the page cache:**
+
+The key parameter is `vm.dirty_ratio` and `vm.dirty_background_ratio` on Linux. These control when the OS flushes dirty pages to disk:
+- `vm.dirty_background_ratio=10`: OS starts background writeback when 10% of memory is dirty pages.
+- `vm.dirty_ratio=20`: Process blocking writeback starts at 20% dirty pages.
+
+For Kafka, these should be tuned to ensure smooth writeback without blocking producers. Setting them too low causes frequent small flushes; too high causes large flushes after pauses, creating latency spikes.

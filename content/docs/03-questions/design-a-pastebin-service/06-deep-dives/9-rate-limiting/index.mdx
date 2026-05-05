@@ -1,0 +1,197 @@
+---
+title: Rate Limiting
+description: Deep dive into distributed rate limiting using sliding window counters with Redis.
+---
+
+### Rate Limiting
+
+#### Challenge
+
+Enforcing tiered rate limits across anonymous (per-IP) and authenticated (per-API-key) users while keeping the rate limit check itself under 2ms P95. With ~3,500 reads/sec peak, every request triggers a rate limit check — at 2ms per check, that's 7,000 Redis ops/sec just for rate limiting. The algorithm must be accurate (no over- or under-counting), distributed (across multiple API Gateway instances), and resistant to manipulation.
+
+**Rate limit tiers**:
+- Anonymous reads: 20 requests/minute per IP
+- Anonymous writes: 20 requests/minute per IP (same bucket as reads — writes count against read limit)
+- Authenticated reads: 100 requests/minute per API key
+- Authenticated writes: 100 requests/minute per API key
+
+**Key design decision**: Reads and writes share the same rate limit bucket. This is intentional — the limit is about system load, not about distinguishing between read and write operations. A user making 20 read requests is consuming the same origin resources as 20 write requests (if they bypass cache).
+
+#### Solution: Sliding Window Log with Redis Sorted Set
+
+**1. Algorithm: Sliding Window Log**
+
+The sliding window log tracks individual request timestamps within a rolling 60-second window. It is more accurate than a fixed-window counter and more memory-efficient than a token bucket at high cardinality.
+
+```python
+import redis
+import time
+
+class RateLimiter:
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+
+    def allow_request(self, identifier: str, window: int = 60, limit: int = 20) -> tuple[bool, int]:
+        """
+        Check if request is allowed under the rate limit.
+        Uses a Lua script for atomicity (single Redis call).
+
+        Returns: (allowed: bool, remaining: int)
+        """
+        key = f"rate:\{identifier\}"
+        now_ms = int(time.time() * 1_000)  # millisecond precision
+        window_start = now_ms - (window * 1_000)
+
+        # Atomic Lua script — no race condition between check and increment
+        lua = """
+        local key = KEYS[1]
+        local window_start = tonumber(ARGV[1])
+        local limit = tonumber(ARGV[2])
+        local now_ms = tonumber(ARGV[3])
+        local member = ARGV[4]
+        local ttl_ms = tonumber(ARGV[5])
+
+        -- Remove expired entries
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+
+        -- Count current entries
+        local count = redis.call('ZCARD', key)
+
+        if count < limit then
+            -- Add this request (member = now_ms:component_id for uniqueness)
+            redis.call('ZADD', key, now_ms, member)
+            redis.call('PEXPIRE', key, ttl_ms)  -- TTL = window + 1s buffer
+            return \{1, limit - count - 1\}  -- allowed, remaining
+        else
+            return \{0, 0\}  -- denied, remaining
+        end
+        """
+
+        ttl_ms = (window * 1000) + 1000  # window in ms + 1s buffer
+        component_id = f"\{os.getpid()\}:\{uuid4().hex[:8]\}"  # Unique per process+request
+        member = f"\{now_ms\}:\{component_id\}"
+        result = self.redis.eval(lua, 1, key, window_start, limit, now_ms, member, ttl_ms)
+
+        return bool(result[0]), int(result[1])
+```
+
+**Why Lua script?** Without atomicity, two concurrent requests could both read `ZCARD` before either increments, causing both to think they're within the limit and both succeeding — a classic TOCTOU race. The Lua script runs atomically in Redis, eliminating this race.
+
+**Why millisecond precision?** Prevents two requests in the same millisecond from colliding on the same sorted set member. With `component_id` appended, even same-millisecond requests from different processes are unique.
+
+**2. Identifier Mapping**
+
+| User Type | Identifier | Key Format |
+|-----------|-----------|------------|
+| Anonymous | Client IP address | `rate:ip:<IP>` |
+| Authenticated | API key ID | `rate:api:<key_id>` |
+
+**IP extraction** (behind CDN/load balancer):
+```python
+def get_client_ip(request) -> str:
+    # Cloudflare CF-Connecting-IP takes precedence over X-Forwarded-For
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr
+```
+
+**3. Rate Limit Response Headers**
+
+Every API response includes rate limit status:
+
+```http
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 20
+X-RateLimit-Remaining: 17
+X-RateLimit-Reset: 1714000060
+```
+
+| Header | Meaning |
+|--------|---------|
+| `X-RateLimit-Limit` | Maximum requests per window |
+| `X-RateLimit-Remaining` | Requests remaining in current window |
+| `X-RateLimit-Reset` | Unix timestamp (seconds) when the window resets |
+
+On rate limit exceeded:
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 42
+X-RateLimit-Limit: 20
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1714000060
+```
+
+**4. Origin-Only Rate Limiting**
+
+Rate limiting applies only to requests that reach the origin, not to CDN cache hits. This is intentional:
+
+- CDN-level rate limiting would enforce the same limit for anonymous and authenticated users (no distinction possible at the edge without custom headers).
+- A CDN cache hit does not consume origin resources (DB connections, object storage fetches, compute), so counting it against the rate limit would be a false constraint.
+- The origin rate limiter has authoritative data: API key verification, access mode checks, and per-IP/per-key granularity.
+
+**Trade-off**: A user who has exhausted their rate limit may still receive cached content if the paste is in the CDN cache. This is acceptable because the rate limit protects backend resources, not client behavior — a cached response consumes zero backend resources. The CDN has its own DDoS protection (bot management, CAPTCHA challenges) that catches large-scale abuse at the edge.
+
+**5. Distributed Architecture**
+
+| Component | Count | Role |
+|-----------|-------|------|
+| Redis nodes | 5 (dedicated rate-limiting cluster) | Rate limit counters, ~2ms latency. Separate from the 6-node main Redis cluster (Sections 4/7/11) to isolate rate-limiting load from paste metadata caching. |
+| API Gateway instances | 50 | Rate limit check via Redis (per-request) |
+| Connections per instance | ~10 | 5 Redis nodes × 2 connections each = 10 per instance |
+
+**Redis key distribution**: With consistent hashing, rate limit keys are evenly distributed across Redis nodes. Each key holds at most `limit` entries (20 for anonymous, 100 for authenticated), so memory per key is negligible (~1KB).
+
+**6. Burst Handling**
+
+The sliding window log naturally handles bursts — it counts individual requests within the window, not average rates. If a user makes 20 requests in 1 second (burst), they are all counted and the 21st is rejected. The user must wait for their earliest request to fall outside the 60-second window before being allowed to make more.
+
+**Alternative: Token Bucket for Burst-Friendly Limiting**
+
+A token bucket algorithm allows controlled bursts (e.g., 20 tokens burst, refilled at 20/minute). This is less strict than a sliding window and could benefit users who sporadically hit the limit. However, a sliding window is simpler to implement correctly and provides more predictable origin load, so it is preferred.
+
+**7. Abuse Mitigation**
+
+| Attack | Detection | Response |
+|--------|-----------|----------|
+| IP rotation (proxies) | Multiple IPs from same ASN / geographic region | Cloudflare bot management (challenge suspicious IPs) |
+| API key scraping | High rate of failed auth → successful auth transitions | Alert on auth failure rate anomaly |
+| Key reuse abuse | Single key generating 100+ requests/min | Automatic 429 + manual review |
+| Cache bypass (vary by user-agent) | Same IP, different user-agents | Cloudflare fingerprinting; track by IP + user-agent hash |
+
+**8. Monitoring**
+
+| Metric | Alert |
+|--------|-------|
+| Rate limit hit rate > 5% of requests | Possible abuse or misconfigured limits |
+| Rate limiter Redis latency > 5ms | Redis overload; degrade to local counters |
+| Unique rate-limited IPs > 100 in 5 minutes | Possible DDoS or scanning attack |
+| Rate limit check failure rate | Redis unreachable → fallback to local counters (approximate) |
+
+**9. Fallback: Local Counters**
+
+If Redis is unavailable, rate limiting falls back to an in-memory counter per process:
+
+```python
+# Per-process in-memory rate limiter (fallback)
+local_counters: dict[str, list[int]] = defaultdict(list)
+
+def allow_request_fallback(identifier: str, limit: int, window: int) -> bool:
+    now = time.time()
+    window_start = now - window
+    local_counters[identifier] = [t for t in local_counters[identifier] if t > window_start]
+    if len(local_counters[identifier]) < limit:
+        local_counters[identifier].append(now)
+        return True
+    return False
+```
+
+- **Approximate**: Only sees requests handled by this process, not across all processes. May allow up to N×limit total (N = number of processes).
+- **Bounded**: List is truncated to `limit × 2` entries max to prevent unbounded memory growth during extended Redis outages.
+- **Warning logged**: `rate_limiter_redis_unavailable` metrics incremented for alerting.
+- **Grace period**: After Redis recovers, switch back with a 1-minute cooldown to prevent burst abuse from the Redis-unavailable period.
+
+**See Also**: [Security](../8-security) — transport security, API key auth, XSS prevention; [Content Moderation](../13-content-moderation) — abuse detection, hash blocklists, phishing URL scanning.

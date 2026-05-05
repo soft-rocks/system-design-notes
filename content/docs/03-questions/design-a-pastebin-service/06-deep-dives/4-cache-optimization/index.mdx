@@ -1,0 +1,156 @@
+---
+title: Cache Optimization and Coordination
+description: Deep dive into multi-tier caching strategy for the 100:1 read-heavy workload.
+---
+
+### Cache Optimization and Coordination
+
+#### Challenge
+
+Serving ~100M reads/day (~1,157 reads/sec sustained, ~3,500 reads/sec peak) with P95 < 100ms against only ~1M writes/day (~12/sec) — a 100:1 read/write ratio. The cache must handle a burst of traffic (e.g., a viral paste) without causing cache stampedes, maintain strong consistency between metadata and content, and minimize load on both PostgreSQL and object storage. At scale, the dominant cost is not compute but the number of downstream calls per request — every cache miss triggers a DB query and potentially an object store fetch.
+
+**Key tension**: Redis stores only metadata (`content_hash`, `expires_at`, `access_mode`), not full content. Content lives in object storage. This means even a "cache hit" on metadata requires a secondary fetch to retrieve the blob, unless the CDN has already served it. The cache hierarchy must be designed so that the most common case (public paste reads) never touches the origin at all.
+
+#### Solution: Four-Tier Cache with Read-Through and Cache-Aside Coordination
+
+**1. Cache Hierarchy**
+
+| Tier | Component | Covers | P95 Latency | Hit Rate Target |
+|------|-----------|--------|-------------|-----------------|
+| 1 | CDN edge (Cloudflare) | Public + unlisted paste reads | < 10ms | > 85% |
+| 2 | Local LRU (per-instance) | All reads (hot keys) | < 0.5ms | > 80% (per-instance, but collectively useful) |
+| 3 | Redis Cluster | All reads (warm + hot) | < 2ms | > 95% (of remaining) |
+| 4 | Object Storage + DB | Cold reads | ~25ms | ~100% |
+
+Combined cache hit rate target: > 99% — only 1 in 100 reads reaches object storage.
+
+**Tier 1: CDN Edge**
+
+- **Caches**: Full response body (paste content + headers) for `public` and `unlisted` access modes.
+- **Bypasses**: `private` access mode, `Content-Type: application/octet-stream`, requests with `Authorization` header, any request with cache-control bypass headers.
+- **TTL**: Dynamically set from `expires_at`: `Cache-Control: public, max-age=<remaining_seconds>`. If `expires_at` is within 60s, TTL = 0 (no CDN cache).
+- **Cache key**: `GET https://pastebin.com/p/\{paste_key\}` — URL-based, no query params.
+- **Private paste handling**: `private` pastes are never sent to the CDN. The Paste Service routes them directly to origin with `Cache-Control: private, no-store` headers.
+
+**Tier 2: Local LRU (Per-Instance)**
+
+```python
+from cachetools import TTLCache
+
+# Per Paste Service instance — TTLCache stores (value, expiry_time) tuples internally
+local_cache = TTLCache(
+    maxsize=100_000,
+    ttl=300  # 5 minutes
+)
+```
+
+- **Size**: 100K entries per instance, ~10MB RAM. With 50 instances, collectively 5GB of hot keys.
+- **TTL**: 5 minutes. Shorter than Redis TTL to avoid serving stale metadata after an update (though pastes are immutable, so staleness is primarily from expiration).
+- **Eviction**: LRU. Hot pastes (high-read) stay warm; cold pastes evict naturally.
+- **Not shared across instances**: Each instance maintains its own cache. This means cache fill rate is instance-dependent, but the locality of reference (same API Gateway routes to same instances) keeps effective hit rates high.
+
+**Tier 3: Redis Cluster (Distributed Metadata Cache)**
+
+- **Key format**: `paste:<paste_key>` → Redis hash with fields `content_hash`, `expires_at`, `access_mode`
+- **Value format**: Redis hash (not JSON string) for efficient field-level access:
+  ```
+  HSET paste:abc123 content_hash a7f3c8... expires_at "2026-12-31T23:59:59Z" access_mode "public"
+  ```
+- **TTL**: `EXPIRE paste:<key> <seconds_until_expires_at + 60_buffer>` — TTL is set on creation and refreshed on each cache-miss read.
+- **Eviction**: LRU policy. Capacity: ~20GB, supporting ~20M entries (each entry ≈ 1KB with metadata + Redis overhead).
+- **Secondary key**: `content_hash:<hash>` → `\{ paste_key \}` — used for deduplication pre-check on write.
+- **Cluster**: 6 nodes across AZs (3 masters + 3 replicas, 1 master per AZ); ~20GB master data (40GB total with replication). Connected via connection-pooled clients from each Paste Service instance.
+
+**Tier 4: Object Storage (Source of Truth for Content)**
+
+Content lives in S3/compatible object storage, addressed by `content_hash`. The Redis metadata maps `paste_key` → `content_hash`, and a DB fallback maps `paste_key` → (`content_hash`, `expires_at`, `access_mode`). Object storage is the final source of truth for the paste body.
+
+**2. Read Path — Cache Coordination**
+
+When a paste is read from DB and object storage, both caches are warmed in a single request:
+
+```python
+# Redis: pipelined for atomicity
+pipe = redis.pipeline()
+pipe.hset(f"paste:\{key\}", mapping={
+    "content_hash": content_hash,
+    "expires_at": expires_at.isoformat(),
+    "access_mode": access_mode
+})
+pipe.expire(f"paste:\{key\}", int((expires_at - now).total_seconds()) + 60)
+pipe.execute()  # Atomic pipeline
+
+# Local LRU: fire-and-forget, never blocks the response path
+local_cache[key] = PasteMetadata(content_hash, expires_at, access_mode)
+```
+
+Local LRU warm is fire-and-forget — if the LRU warm fails (e.g., memory pressure), the next read simply retries from Redis. Consistency is guaranteed by Redis; the LRU is a performance optimization only.
+
+**3. Cache Stampede Protection**
+
+A popular paste (e.g., shared on Hacker News) can receive 10K+ reads in seconds. Without protection, all of these would simultaneously miss the cache after a TTL expiry, flooding both the DB and object storage.
+
+**Solution: Lock-on-miss with single-flight**
+
+```python
+async def get_paste(key: str) -> Paste:
+    # 1. Check local LRU
+    if entry := local_cache.get(key):
+        return entry
+
+    # 2. Check Redis
+    if entry := await redis.get(f"paste:\{key\}"):
+        # Fire-and-forget LRU warm (non-blocking)
+        local_cache[key] = entry  # warm LRU in background
+        return entry
+
+    # 3. Acquire a distributed lock for this key (only one fetcher)
+    lock_key = f"lock:paste:\{key\}"
+    lock = await redis.set(lock_key, "1", nx=True, ex=5)
+    if not lock:
+        # Another thread is fetching — wait and retry cache
+        await asyncio.sleep(random.uniform(0.01, 0.05))
+        if entry := await redis.get(f"paste:\{key\}"):
+            return entry
+        if entry := local_cache.get(key):
+            return entry
+
+    try:
+        # 4. Actual fetch from DB + object storage
+        entry = await fetch_from_db_and_storage(key)
+        # 5. Warm caches
+        await warm_cache(key, entry)
+        return entry
+    finally:
+        await redis.delete(lock_key)
+```
+
+- **Lock TTL = 5 seconds**: Prevents stale locks if the fetcher crashes.
+- **Jittered wait (10–50ms)**: Prevents thundering herd on lock release.
+- **Double-check after wait**: The fetcher may have completed before the waiter acquired the lock.
+
+**4. Consistency Model**
+
+| Scenario | Consistency | Mechanism |
+|----------|-------------|-----------|
+| Paste creation | Strong | Redis warmed atomically with DB insert in same request |
+| Paste read | Eventual | Cache warm is fire-and-forget to LRU; Redis warm is pipelined |
+| Paste deletion | Strong | Redis DEL is synchronous; DB status update is synchronous |
+| Paste expiration | Eventual | TTL on Redis key; DB `expires_at` checked on fallback |
+
+Since pastes are immutable after creation, consistency concerns are limited to:
+1. New pastes being immediately readable (strong — guaranteed by atomic warm)
+2. Deleted pastes becoming inaccessible promptly (strong — guaranteed by sync DEL)
+3. Expired pastes returning 410 Gone (eventual — relies on TTL expiration + `expires_at` check on DB fallback)
+
+**5. Monitoring**
+
+| Metric | Target | Alert Threshold |
+|--------|--------|-----------------|
+| Redis hit rate | > 95% | < 90% for 5 minutes |
+| Local LRU hit rate | > 80% per instance | < 60% for 5 minutes |
+| Combined cache hit rate | > 99% | < 95% for 5 minutes |
+| P95 read latency (cache path) | < 10ms (CDN), < 3ms (Redis), < 30ms (cold) | > 50ms for any tier |
+| Cache stampede events | 0 | > 10/minute |
+
+**See Also**: [Paste Storage Engine](../1-paste-storage-engine) — read/write paths, blob lifecycle; [CDN Integration](../5-cdn-integration) — CDN edge caching rules.

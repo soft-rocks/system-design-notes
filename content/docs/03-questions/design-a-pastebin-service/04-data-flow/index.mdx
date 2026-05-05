@@ -1,0 +1,138 @@
+---
+title: Data Flow
+description: Critical request paths for the Pastebin service.
+---
+
+### Write Path
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant DB
+    participant Redis
+    participant ObjectStorage
+
+    Client->>API: POST /api/v1/pastes (content, title, language, expires_in, Idempotency-Key?)
+    API->>API: Validate size (64KB), encoding (UTF-8)
+    opt Idempotency-Key provided
+        API->>Redis: GET idempotency:<key>
+        alt Hit
+            Redis-->>API: \{ paste_key \}
+            API-->>Client: 200 (idempotent replay)
+        else Miss
+            API->>Redis: SET idempotency:<key> 1 EX 600
+        end
+    end
+    API->>API: Compute SHA-256 → dedup
+    alt Content exists
+        API->>Redis: GET content_hash:<hash>
+        alt Hit
+            Redis-->>API: \{ paste_key, expires_at, status \}
+            alt Active and not expired
+                API-->>Client: 201 \{ key, url, expires_at, created_at \}
+            else Deleted or Expired
+                Note over API: Treat as new content — proceed to store new blob
+            end
+        else Miss
+            API->>DB: SELECT paste_key, expires_at, status WHERE content_hash = :hash
+            alt Found, active, and not expired
+                DB-->>API: \{ paste_key, expires_at, created_at \}
+                API-->>Client: 201 \{ key, url, expires_at, created_at \}
+            else Not found, deleted, or expired
+                Note over API: Treat as new content — proceed to store new blob
+            end
+        end
+    else New content
+        API->>ObjectStorage: Store content blob (content_hash → object)
+        ObjectStorage-->>API: OK
+        API->>DB: INSERT paste_key (unique constraint, retry on collision)
+        DB-->>API: Success
+        API->>Redis: SET paste:<key> \{ content_hash, expires_at, access_mode \} EX <TTL>
+        API-->>Client: 201 \{ key, url, expires_at, created_at \}
+    end
+```
+
+### Read Path
+
+**Public/Unlisted (via CDN)**:
+```mermaid
+sequenceDiagram
+    participant Client
+    participant CDN
+    participant API
+    alt Cache hit
+        CDN-->>Client: 200 (cached)
+    else Cache miss
+        CDN->>API: GET /api/v1/pastes/\{key\}
+        API-->>CDN: content + headers
+        CDN-->>Client: 200 + cache store
+    end
+```
+
+**Private + Backend (Redis → ObjectStorage)**:
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Redis
+    participant DB
+    participant ObjectStorage
+
+    Client->>API: GET /api/v1/pastes/\{key\}
+    API->>Redis: GET paste:<key>
+    alt Redis hit
+        Redis-->>API: \{ content_hash, expires_at \}
+        alt Expired
+            API-->>Client: 410 Gone
+        else Active
+            API->>ObjectStorage: Get content by content_hash
+            ObjectStorage-->>API: content
+            API-->>Client: 200 (content + headers)
+        end
+    else Redis miss
+        API->>DB: SELECT paste by paste_key
+        DB-->>API: \{ content_hash, expires_at, access_mode \}
+        opt Not found
+            API-->>Client: 404 Not Found
+        end
+        API->>Redis: DEL paste:<key>
+        alt Expired
+            API-->>Client: 410 Gone
+        else Active
+            API->>Redis: SET paste:<key> \{ content_hash, expires_at \} EX <TTL>
+            Redis-->>API: OK
+            API->>ObjectStorage: Get content by content_hash
+            ObjectStorage-->>API: content
+            API-->>Client: 200 (content + headers)
+        end
+    end
+```
+
+### Deletion
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Redis
+    participant DB
+    participant ObjectStorage
+
+    Client->>API: DELETE /api/v1/pastes/\{key\}
+    API->>Redis: DEL paste:<key>
+    Redis-->>API: OK
+    API->>DB: UPDATE pastes SET status = 'deleted' WHERE paste_key = :key
+    DB-->>API: Success
+    API-->>Client: 204 No Content
+    Note over ObjectStorage: Blob persists 24h for recovery, then background purge
+```
+
+### Expiration
+
+- **Primary**: Lazy — expired status checked on every read (TTL on Redis entry + `expires_at < NOW()` check on DB fallback).
+- **Secondary**: Periodic cleanup removes expired entries from Redis and purges soft-deleted blobs after 24 hours.
+
+### Cache Hierarchy
+
+CDN edge (ms) → Redis (sub-ms) → ObjectStorage (content blob). Redis stores only metadata (content_hash, expires_at, access_mode); the full content lives in the object store.

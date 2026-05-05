@@ -1,0 +1,110 @@
+---
+title: API / System Interface
+description: REST APIs, client SDK interface, and system-to-system interfaces.
+---
+
+## REST/GraphQL Endpoints
+
+### Experiment CRUD
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/experiments` | Create a new experiment |
+| `GET` | `/v1/experiments` | List experiments (with filters: status, owner, layer) |
+| `GET` | `/v1/experiments/\{id\}` | Get experiment details |
+| `PATCH` | `/v1/experiments/\{id\}` | Update experiment metadata |
+| `POST` | `/v1/experiments/\{id\}/stop` | Stop an experiment |
+| `POST` | `/v1/experiments/\{id\}/start` | Start/resume an experiment |
+
+### Variant Management
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/experiments/\{id\}/variants` | Add a new variant |
+| `PATCH` | `/v1/experiments/\{id\}/variants/\{variantId\}` | Update variant |
+| `DELETE` | `/v1/experiments/\{id\}/variants/\{variantId\}` | Remove a variant |
+
+### Feature Flags
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/v1/flags` | List all flags |
+| `POST` | `/v1/flags` | Create a flag |
+| `PUT` | `/v1/flags/\{key\}` | Update a flag |
+| `DELETE` | `/v1/flags/\{key\}` | Delete a flag |
+| `GET` | `/v1/flags/\{key\}/evaluate` | Evaluate a flag for a user |
+
+### Event Definitions
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/v1/experiments/\{id\}/events` | Define an event to track |
+| `GET` | `/v1/events/\{id\}` | Get event definition |
+
+### Reporting
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/v1/experiments/\{id\}/results?metrics=conversion_rate&segment=region` | Get experiment results |
+| `GET` | `/v1/experiments/\{id\}/funnel?steps=view,click,convert` | Get funnel analysis |
+
+### Segments
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/v1/segments` | List targeting segments |
+| `POST` | `/v1/segments` | Create a segment |
+
+## Client SDK Interface
+
+The SDK is the bridge between the client app and the experiment platform. It must be lightweight and non-blocking.
+
+| API | Description |
+|---|---|
+| `SDK.init(apiKey, config)` | Establishes connection to decision engine, loads local config cache. Called once at app startup. |
+| `SDK.variation(experimentKey, userId, default=false)` | Returns the variant key or default. O(1) hash lookup + cache. Thread-safe. |
+| `SDK.isFeatureEnabled(flagKey, userId, default=false)` | Boolean flag check from local cache. |
+| `SDK.track(eventKey, properties?)` | Queues event locally, sends in batches to event ingestion API. |
+| `SDK.setContext(userId, attributes?)` | Sets user context for targeting evaluation (e.g., region, app_version). |
+| `SDK.onVariationChange(handler)` | Callback when assignment changes (e.g., on config reload). |
+| `SDK.onReady(callback)` | Fires when config is loaded and SDK is ready to serve decisions. |
+
+### Configuration Polling
+The SDK polls `/v1/config` every 30 seconds (or uses long-poll via Server-Sent Events) to receive the latest experiments and flags without requiring an app restart. Configuration is versioned — the SDK only downloads changes since the last known version, minimizing payload size.
+
+## System Interfaces
+
+```
+┌──────────┐    HTTP/gRPC     ┌─────────────────┐
+│  SDK     │ ───────────────→ │ Assignment Service│
+│ (Client) │                  │ (Decision Engine) │
+└──────────┘ ←─────────────── └─────────────────┘
+                   \{variantKey\}
+┌──────────┐    HTTP POST      ┌─────────────────┐     Kafka     ┌──────────────┐
+│  SDK     │ ───────────────→ │  Event Ingestion  │ ───────────→ │ Stream Proc. │
+│ (Client) │   /v1/ingest      │     API           │              │ (Flink)      │
+└──────────┘                   └─────────────────┘              └──────┬───────┘
+                                                                        │
+                                                                       ↓
+                                                              ┌─────────────────┐     ┌──────────────┐
+                                                              │  Aggregation   │────→│ ClickHouse   │
+                                                              │  Engine        │     │ (Results)    │
+                                                              └─────────────────┘     └──────┬───────┘
+                                                                                             │
+                                                                                     GET /results
+                                                                                             │
+                                                              ┌─────────────────┐     ┌──────┴───────┐
+                                                              │  Reporting API  │ ←─── │ Results    │
+                                                              └─────────────────┘     │ Store      │
+                                                                                      └────────────┘
+┌─────────────────┐    Redis Cluster    ┌─────────────────┐
+│  Config Store   │ ══════════════════→ │ Edge Cache      │
+│ (Experiment     │  (low-latency       │ (CloudFront)    │
+│  Definitions)   │   replication)      │                 │
+└─────────────────┘                     └─────────────────┘
+```
+
+| Interface | Protocol | Direction | Description |
+|---|---|---|---|
+| Assignment Service → Variant Cache | Redis Cluster | Internal | In-memory LRU cache keyed by `\{userId:experimentId\}` → `variantId`. TTL = experiment duration. |
+| Client SDK → Assignment Service | HTTP/gRPC | External | Call with `\{userId, experimentKeys[]\}` → `\{experimentId: variantKey\}` response. |
+| Client SDK → Event Ingestion API | HTTP POST | External | Batched events → 200 OK (fire-and-forget). |
+| Event Ingestion → Stream Processor | Kafka/Redpanda | Internal | Events written to topic `experiment-events`. |
+| Stream Processor → Aggregation Engine | Flink/Spark Streaming | Internal | Consumes events, updates per-variant counters in real-time. |
+| Aggregation Engine → Results Store | Batch write | Internal | Writes aggregated metrics to ClickHouse for fast queries. |
+| Results Store → Reporting API | SQL query | Internal | `GET /v1/experiments/\{id\}/results` reads pre-aggregated data (< 100ms response). |
+| Config Store → SDK Config Cache | Redis + CloudFront | Global | Experiment configs stored in Redis, replicated to edge caches for low-latency global access. |

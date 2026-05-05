@@ -1,0 +1,63 @@
+---
+title: Link Expiration
+description: TTL configuration, lazy deletion, Redis TTL fallback, and expiration check during redirect path
+---
+
+### Link Expiration
+
+#### Challenge
+
+Allowing users to set TTL on short URLs so links auto-expire after a configured period. Must handle race conditions, clock skew, and expired link traffic without impacting redirect performance.
+
+#### Solution: TTL with Lazy Deletion + Cache-Level TTL
+
+1. **Database layer**: `expires_at` column in `url_mappings` (nullable, timestamp with timezone).
+
+   ```sql
+   ALTER TABLE url_mappings ADD COLUMN expires_at TIMESTAMP WITH TIME ZONE;
+   CREATE INDEX idx_url_expires_at ON url_mappings (expires_at) WHERE expires_at IS NOT NULL;
+   ```
+
+   - **Index rationale:** The filtered index only scans rows with expiration set (typically under 10% of total). Without the filter, the DB would scan the entire table.
+
+2. **Redirect path**: Check `NOW() > expires_at` atomically with the URL lookup.
+
+   ```sql
+   SELECT original_url, expires_at FROM url_mappings
+   WHERE short_code = $1 AND (expires_at IS NULL OR expires_at > NOW());
+   ```
+
+   - **Key design choice:** Combine the existence check and expiration check in a single query. This eliminates the race condition where a URL is valid at lookup time but expires between the query and the redirect.
+   - If query returns no rows, the URL is either non-existent or expired — return **410 Gone** (not 404) so search engines and clients understand it was intentionally removed.
+
+3. **Redis TTL synchronization**: When writing to Redis, set the TTL to `expires_at - NOW()` (capped at max 24h for normal URLs). This means:
+   - Expired URLs are served directly from Redis eviction (zero DB hit)
+   - Cache and DB are always consistent (Redis TTL &lt;= DB TTL)
+
+4. **Lazy deletion (cleanup job)**:
+
+   ```sql
+   DELETE FROM url_mappings
+   WHERE id IN (
+       SELECT id FROM url_mappings
+       WHERE expires_at IS NOT NULL AND expires_at < NOW()
+       LIMIT 10000
+   );
+   ```
+
+   - Run every 5 minutes (not daily) to prevent stale rows from accumulating
+   - `LIMIT 10000` per batch avoids long transactions and table locking
+   - Estimated cleanup cost at 2B total URLs: if 10% expire daily, that's ~200K rows/day, ~140/sec — trivial for modern DBs
+
+5. **Constraints and validation**:
+   - **Min TTL**: 1 hour (prevents abuse via sub-second URLs)
+   - **Max TTL**: 10 years (or 90 days for free tier)
+   - **Creation validation**: Reject `expires_at < NOW()` at the API level (fail-fast, no DB round-trip)
+   - **Clock skew**: All timestamps use UTC; Redis and DB use `NOW()` (not client-provided time)
+   - **Null behavior**: `expires_at IS NULL` means "never expires" — the most common case for production links
+
+6. **410 Gone vs 404 Not Found**:
+   - Use **410 Gone** for expired URLs. Semantically correct — the resource existed but is intentionally gone.
+   - Search engines will deindex expired URLs faster than 404.
+   - For non-existent URLs, still return 404. This distinction helps analytics: 410 count = expired link traffic (good data point), 404 count = mistyped/invalid links.
+

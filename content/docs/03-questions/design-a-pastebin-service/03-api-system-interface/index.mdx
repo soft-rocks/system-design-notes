@@ -1,0 +1,81 @@
+---
+title: API / System Interface
+description: API endpoints and integration points for the Pastebin service.
+---
+
+### Paste Creation
+
+`POST /api/v1/pastes`
+
+- Body: `\{ content, title?, language?, key?, expires_in?, access_mode? \}`. `expires_in` values: 600, 3600, 86400, 604800, or never.
+- Accepts `Idempotency-Key` header (10-min window).
+- Rate limited: per-IP (~20/min anonymous) and per-API-key (~100/min authenticated).
+- Returns existing key if identical content already exists (dedup via SHA-256).
+- Response: 201 `\{ key, url, expires_at, created_at \}` or 4xx/5xx.
+
+### Paste Retrieval
+
+`GET /api/v1/pastes/\{key\}`
+
+- Returns content verbatim with `Content-Type`, `Content-Length`, `Cache-Control`.
+- Supports conditional GET (`If-None-Match` / ETags).
+- Auth: `Authorization: Bearer <key>` for higher read rate limits (~100/min vs ~20/min anonymous).
+- 200 OK (active), 404 Not Found (never existed), 410 Gone (expired/deleted).
+
+### Paste Deletion
+
+`DELETE /api/v1/pastes/\{key\}`
+
+- 204 No Content on success. Deleted pastes recoverable for 24 hours. After 24 hours, permanently purged.
+- 404 Not Found, 410 Gone (already expired/purged).
+
+### Health Check
+
+`GET /health`
+
+- Liveness probe.
+
+### Readiness Check
+
+`GET /ready`
+
+- Readiness probe — 200 if PostgreSQL + ObjectStorage reachable; 503 if not. Partial Redis failure degrades gracefully.
+
+### Error Response Format
+
+All error responses use a consistent JSON envelope:
+
+```json
+{
+  "error": {
+    "code": "paste_not_found",
+    "message": "The requested paste was not found.",
+    "status": 404
+  }
+}
+```
+
+| HTTP Status | Error Code | When |
+|-------------|-----------|------|
+| 400 | `invalid_request` | Empty content, size exceeded, invalid key format |
+| 404 | `paste_not_found` | Paste key does not exist |
+| 409 | `key_conflict` | Custom key already in use |
+| 410 | `gone` | Paste expired or permanently deleted |
+| 429 | `rate_limit_exceeded` | Request limit exceeded |
+| 401 | `unauthorized` | Expired API key |
+| 403 | `forbidden` | Revoked API key |
+| 500 | `internal_error` | Unexpected server error |
+| 503 | `service_unavailable` | Object storage or database outage |
+
+**Key decisions:**
+- Machine-readable `code` field for client handling; human-readable `message` for display.
+- No stack traces, internal state, or request IDs in error bodies (prevent information leakage).
+- `Retry-After` header included with 429 responses (seconds until window resets).
+
+### Alternative: GraphQL
+
+REST is the default API style (simple, cache-friendly, CDN-compatible). GraphQL could be offered as an alternative for consumers who need flexible field selection (e.g., fetching paste metadata without the content body). Trade-offs: GraphQL is less CDN-cacheable, more complex to rate-limit, and harder to audit — not recommended for the primary interface but viable as an optional `POST /graphql` endpoint.
+
+### Integration Points
+
+1. **CDN** — Edge caching for paste reads (TTL based on `expires_at`). `private` access bypasses CDN.

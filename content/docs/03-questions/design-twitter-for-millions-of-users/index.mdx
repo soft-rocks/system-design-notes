@@ -1,0 +1,15 @@
+---
+title: Design Twitter for Millions of Users
+description: System design for a microblogging platform serving millions of users, featuring hybrid push/pull timeline fan-out, real-time notifications, trending topics, and highly scalable tweet ingestion.
+---
+
+This design covers a Twitter-like microblogging platform serving millions of daily active users with billions of reads and hundreds of millions of tweets per day.
+
+## Sections
+
+- [Requirements & Scale](01-requirements/) — Functional requirements, non-functional requirements, scale assumptions
+- [Core Entities](02-core-entities/) — User, Tweet, Follow, Like, Notification entity definitions and relationships
+- [API & System Interface](03-api-system-interface/) — REST endpoints and internal microservices
+- [Data Flow](04-data-flow/) — Write path, read path, sync/replication
+- [High-Level Design](05-high-level-design/) — Architecture overview, component diagram, technology choices
+- [Deep Dives](06-deep-dives/) — Feed fan-out, tweet deduplication, real-time notifications, trending topics

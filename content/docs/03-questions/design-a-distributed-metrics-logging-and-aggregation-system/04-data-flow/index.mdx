@@ -1,0 +1,73 @@
+---
+title: Data Flow
+description: Ingestion, aggregation, query, and replication flows for distributed metrics system
+---
+
+## Ingestion Flow
+
+```
+App Server → Agent (StatsD/OTel) → Ingestion Node → Kafka → Aggregation Service → TSDB (Cassandra)
+```
+
+1. **Agent** on each app server collects metrics (CPU, memory, request latency, custom counters) and batches them every 10s.
+2. Agent UDP-pushes the batch to the **nearest ingestion node** (DNS round-robin or service mesh sidecar load-balances across ingestion nodes).
+3. Ingestion node validates the sample (metricID exists, labels format correct), assigns a monotonic sequence number, and appends to a **Kafka topic** (`metrics-ingest`).
+4. Kafka partition key = `metricID` so all samples for the same metric land in the same partition.
+5. **Aggregation Service** consumes from Kafka (one goroutine per partition), and for each sample:
+   a. Inserts into the **in-memory window buffer** (last 60s per metric+label set).
+   b. Writes raw sample to **Cassandra** (time-series table).
+6. Every 60s, the window buffer **flushes** — computes aggregate stats (min, max, avg, sum, count, p50/p95/p99) and writes a MetricRollup row to Cassandra.
+
+### Kafka as the Buffer
+
+Kafka absorbs ingestion spikes. With 10M metrics/sec, assuming 200 bytes per sample, that's 2GB/s throughput. Kafka can handle this with ~20 brokers (each ~100MB/s sustained write).
+
+## Aggregation Flow
+
+```
+Kafka → Aggregation Service (in-memory windows) → flush every 60s → Cassandra rollups
+```
+
+The aggregation service maintains **in-memory windows** per (metricID, label_set):
+- Current 60s window accumulates raw samples.
+- When the window closes (at the 60s mark), it computes aggregates.
+- Aggregates are written to Cassandra in a single CQL batch.
+- After a flush, the in-memory window is reset.
+
+The aggregation service is stateless — any node can consume any Kafka partition. Kubernetes autoscales based on Kafka lag.
+
+### Second-level rollups
+
+A separate rollup service consumes the MINUTE rollups from Cassandra and computes HOUR rollups, which feed into DAY rollups. This cascading aggregation avoids full-scan queries for long time ranges.
+
+## Query Flow
+
+```
+Dashboard → Query Engine → Cassandra (rollup table) → Aggregate → Return
+                        ↘ Cassandra (raw table) → Aggregate → Return
+```
+
+When a query arrives:
+1. Query Engine determines the **time range and granularity**.
+2. If granularity &gt;= 5min and time range greater than 24h, it reads from the **rollup table** (HOUR/DAY).
+3. If time range less than or equal to 24h and granularity equals 1min, it reads from the **raw table** (after applying in-memory window data from ingestion nodes).
+4. Results from Cassandra are streamed back and optionally post-aggregated (e.g., `rate()`, `avg_over_time()`).
+
+### Query Parallelism
+
+Cassandra queries are parallelized by:
+- **Time bucket**: partition the time range into 10s chunks, query each chunk independently.
+- **Label filter pushdown**: Cassandra's clustering keys (metricID, timestamp) allow filtering by label within a partition.
+
+## Replication Flow (Cross-Region)
+
+```
+Primary Region Cassandra → CDC (Debezium) → Kafka Connect → Replica Region Cassandra
+```
+
+1. **Debezium** CDC connector watches Cassandra commitlog (via SSTable export) or uses a streaming approach.
+2. Changes are published to a Kafka topic in the primary region.
+3. **Kafka Connect** cross-region connector replicates the topic to the replica region.
+4. In the replica region, a Cassandra sink connector applies changes to the replica cluster.
+
+Replication is ordered by watermark. The replica buffers events until the watermark catches up, ensuring no out-of-order writes.

@@ -1,0 +1,100 @@
+---
+title: Requirements
+description: Functional and non-functional requirements for the Instagram system design, including scale assumptions.
+---
+
+## Functional Requirements
+
+### Media Upload & Storage
+
+Users can capture or select photos/videos and upload them; the system stores the original and generates derivatives at multiple resolutions for various display contexts.
+
+### Feed (Timeline)
+
+Users see a chronological or ranked feed of photos from accounts they follow. Each feed item shows the photo, caption, author info, and engagement counts.
+
+### Followers / Following
+
+Users can follow/unfollow other accounts. A user's feed consists of photos from followed accounts.
+
+### Likes
+
+Users can like/unlike photos. The system tracks like counts and stores individual likes for querying.
+
+### Comments
+
+Users can add/remove text comments on photos. Comments have timestamps and author info.
+
+### User Profiles
+
+Each user has a profile page showing their uploaded photos in a grid, follower/following counts, bio, and profile picture.
+
+### Photo Filtering / Editing
+
+Basic built-in filters and cropping are applied client-side, but the server stores the final processed image.
+
+### Discoverability
+
+A hashtag-based discovery page and an Explore page showing popular/trending photos not from a user's feed.
+
+### Search
+
+Users can search for other users, hashtags, and locations.
+
+### Notifications
+
+Users receive push notifications for likes, comments, and new follows from people they follow.
+
+### Out of Scope for V1
+
+- **Direct Messaging** — One-to-one photo and text messaging (deferred).
+- **Stories** — 24-hour ephemeral photo posts (deferred).
+
+---
+
+## Non-Functional Requirements
+
+### Availability
+
+The system should be highly available. Feed reads must succeed 99.99% of the time.
+
+### Read Latency
+
+Feed items should load within **200ms (p95)** after the initial request. Photo rendering should start within 500ms.
+
+### Write Latency
+
+Photo upload should complete (processing + indexing) within **5 seconds** for a 10MB image on a good connection.
+
+### Consistency
+
+- **Feed** is eventually consistent — it's acceptable for a new post to take a few seconds to appear in followers' feeds.
+- **Likes and comments** are strongly consistent — a like should be visible immediately to the liker.
+
+### Scalability
+
+Support **hundreds of millions of MAU** with billions of daily feed reads and millions of daily uploads.
+
+### Bandwidth
+
+The system is image-heavy. Efficient image delivery and caching are critical to control CDN costs.
+
+### Storage
+
+Images must be stored durably with redundancy across data centers.
+
+---
+
+## Scale Assumptions
+
+| Metric | Value |
+| --- | --- |
+| MAU | 500M |
+| Registered accounts | 1B |
+| Photos uploaded/day | 50M (avg 2MB each) |
+| Daily feed reads | ~10B (~200 items per session) |
+| Avg followers per user | ~500 |
+| Likes/day | 5B |
+| Comments/day | 100M |
+| CDN bandwidth/day | ~10TB |
+| Storage (5 years, 3x replication) | ~100PB |

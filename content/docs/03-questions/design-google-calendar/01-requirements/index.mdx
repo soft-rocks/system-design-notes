@@ -1,0 +1,82 @@
+---
+title: "Requirements"
+description: "Functional and non-functional requirements for Google Calendar"
+---
+
+## Functional Requirements
+
+### Event Management
+
+- Users can create, read, update, and delete calendar events
+- Events support single occurrences and recurring patterns (daily, weekly, monthly, yearly, custom interval, by day-of-week, by date range)
+- Events have a start time, end time (or all-day flag), title, description, location, and attachments
+- Timezone is specified per event; displayed correctly regardless of user's local timezone
+- Recurring events can have exceptions (one-time modifications to a specific occurrence)
+
+### Calendar Management
+
+- Each user has multiple calendars (e.g., "Work," "Personal," "Holidays")
+- Calendars can be created, renamed, archived, and color-coded
+- Events are assigned to one calendar
+- Users can view multiple calendars simultaneously in a unified calendar view
+
+### Sharing and Collaboration
+
+- Calendar ownership: full control (owner), edit (collaborator), read-only (viewer)
+- Event-level invitations: organizer sends invites to attendees
+- Attendees can respond: accepted, tentative, declined
+- Organizer is notified of RSVP responses
+- Attendees can modify their own events (if permissions allow) without affecting the organizer's version
+- Free/busy status: users can expose time ranges as "free," "busy," or "tentative" to other users/calendars for scheduling
+
+### Conflict Detection
+
+- System detects overlapping events on the same calendar and warns the user
+- Overlapping events across shared calendars are visible (not blocked)
+
+### Search
+
+- Full-text search across event titles, descriptions, and locations
+- Filter by date range, calendar, attendee, and keyword
+- Search results ranked by relevance and recency
+
+### Notifications and Reminders
+
+- Configurable reminders per event (10 min, 30 min, 1 hour, custom)
+- Email, push, and in-browser notifications
+- Recurring reminders for recurring events
+
+### Availability Lookup
+
+- Given a set of attendees and a proposed time window, system identifies available slots
+- Considers attendees' free/busy status, working hours, and existing events
+- Supports recurring meeting scheduling (e.g., "every Tuesday 2pm")
+
+## Non-Functional Requirements
+
+| Requirement | Target |
+| --- | --- |
+| Event creation latency | p99 < 200ms |
+| Calendar view load time | p99 < 500ms (1-week view) |
+| Availability lookup | p99 < 2s for 50 attendees, 2-week window |
+| Real-time sync delay | < 5s across all connected devices |
+| Event storage durability | Zero data loss; 99.9999999% durability |
+| Availability | > 99.95% (excludes scheduled maintenance) |
+| Concurrent users | 50M active users, 200M DAU |
+| Storage per user | ~1,000 events, ~50MB attachments |
+| Multi-region | Active-active replication; RPO < 1s, RTO < 5min |
+
+## Scale Assumptions
+
+| Metric | Value |
+| --- | --- |
+| Total users | 200M (DAU), 1B (total) |
+| Active calendars per user | 3 avg (work + personal + shared) |
+| Events per user | ~50 events/month = ~1,500/year |
+| Total events | ~150B (cumulative, not all active) |
+| Active events (last 2 years) | ~30B |
+| Daily event creation | ~200M events/day |
+| Daily event updates | ~100M updates/day |
+| Daily reads per user | ~50 calendar views |
+| Calendar shares per user | 10 avg |
+| Attendee invitations | ~1B per day |

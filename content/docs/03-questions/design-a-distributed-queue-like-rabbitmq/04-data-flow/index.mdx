@@ -1,0 +1,150 @@
+---
+title: Data Flow
+description: Publish flow, consume flow, message persistence, flow control, mirror/quorum replication, and dead letter flow.
+---
+
+## Publish Flow
+
+```
+Publisher → Exchange → Routing (binding match) → Queue → Mirror/Raft → Confirm
+```
+
+1. Publisher opens TCP connection → opens channel → declares exchange + queue (idempotent)
+2. Publisher sends `basic.publish(exchange, routing_key, message)`
+3. Broker routes via ExchangeService:
+   - Lookup exchange by name (in-memory hash map)
+   - If exchange doesn't exist: drop message (or return if mandatory)
+   - Lookup bindings for exchange: filter by routing_key match
+     - direct: exact match
+     - topic: wildcard (`*` = one word, `#` = zero or more words)
+     - fanout: all bindings (ignore routing_key)
+     - headers: match on AMQP header key-value pairs
+4. For each matched binding:
+   - Resolve queue name → QueueService
+   - If queue doesn't exist: drop or return (mandatory)
+   - Check queue limits: max_length, max_length_bytes → drop oldest or reject
+   - If persistent: write to disk (fsync) before queue insertion
+   - Insert into in-memory B-tree index keyed by delivery_tag
+   - Mirror (classic): replicate to slaves via RPC
+   - Quorum: propose to Raft leader → replicate to quorum → commit
+5. Return `basic.ack` to publisher (confirm mode) or `tx.commit-ok` (transaction)
+
+### Publish Latency Budget (persistent, single node)
+
+| Step | Component | Budget | Actual |
+|------|-----------|--------|--------|
+| Frame decode + routing | Broker (in-memory) | 1ms | 0.1ms |
+| Disk write (fsync) | Persistent store | 5ms | 2ms |
+| Queue insertion | In-memory B-tree | 1ms | 0.1ms |
+| Mirror/Raft replicate | Network (within DC) | 5ms | 1ms |
+| Publisher confirm | Broker → Publisher | 0.5ms | 0.1ms |
+| **Total** | | **12.5ms** | **~3.3ms** |
+
+---
+
+## Consume Flow
+
+```
+Consumer → basic.consume(queue) → basic.deliver → process → basic.ack
+                                       ↓ nack
+                                  DLQ / Requeue
+```
+
+1. Consumer opens channel → `basic.consume(queue, consumer_tag)`
+2. Broker delivers next message: `basic.deliver(consumer_tag, delivery_tag, redelivered, exchange, routing_key)`
+3. Consumer processes → `basic.ack(delivery_tag)` → broker removes from unacked index
+4. Consumer crash: all unacked messages requeued (`redelivered=true`)
+5. `basic.nack(requeue=false)` → DLQ or drop
+6. `basic.nack(requeue=true)` → re-inserted at head (retry with back-off limit)
+
+**Ordering:** guaranteed per-queue, per-consumer (FIFO, respecting priority).
+
+**Prefetch:** broker won't deliver more than `prefetch_count` unacked messages per consumer.
+
+**Back-pressure:** if all consumers at prefetch limit, broker sends `basic.flow(blocked)` → TCP pause → resumes via `basic.flow(resume)`.
+
+---
+
+## Message Persistence
+
+| Mode | Storage | Crash Survival |
+|------|---------|----------------|
+| **Transient** | In-memory only | No |
+| **Persistent** | Disk (append + fsync) + memory-mapped B-tree index | Yes |
+
+- File-based store: one file per node, segmented by date
+- Append-only with periodic fsync
+- On restart: replay WAL → recover in-memory index → load persistent queue state
+- GC: acked messages marked deleted; background GC removes from disk
+
+---
+
+## Flow Control & Back-pressure
+
+### Memory Threshold
+
+`memory_high_watermark` (default 40% of RAM). When exceeded:
+
+1. GC drops unreferenced indexes
+2. If still exceeded: block all publishers → `basic.flow(blocked)`
+3. TCP send buffers fill → TCP back-pressure to publisher
+4. Memory drops below watermark → `basic.flow(resume)`
+
+### Disk Threshold
+
+`disk_free_limit` (default 50MB): same blocking behavior; persistent messages prefer disk.
+
+### Consumer Back-pressure
+
+`basic.qos(prefetch_count)` limits unacked messages per consumer.
+
+### Queue Back-pressure
+
+`x-max-length`: drops oldest messages or rejects new publishes (406 NOT_ALLOWED).
+
+---
+
+## Mirror / Quorum Replication Flow
+
+### Classic Mirror (RPC-based)
+
+```
+Publisher → Master → (RPC) → Slave 1
+                  → (RPC) → Slave 2
+```
+
+- Master handles all operations; slaves replicate via RPC
+- On failure: one slave promoted (may lose uncommitted messages)
+- Overhead: N-1 RPC round-trips per publish
+
+### Quorum Queue (Raft-based)
+
+```
+Publisher → Leader → (Raft Log) → Follower 1
+                       (Raft Log) → Follower 2
+```
+
+- Leader elected via Raft; handles all writes
+- Publish: append to Raft log → quorum commit → apply to local queue
+- On failure: new leader elected within seconds; uncommitted log messages lost
+- Overhead: 1-2 RTTs for Raft commit
+
+---
+
+## Dead Letter Flow
+
+```
+Message in Queue A
+  │
+  ├─ nack without requeue ──▶ DLQ Exchange ──▶ DLQ Queue B
+  │   (requeue=false)        (x-dead-letter-exchange)
+  │
+  ├─ TTL expires ──▶ DLQ Exchange ──▶ DLQ Queue B
+  │   (x-message-ttl)
+  │
+  └─ Queue full ──▶ DLQ Exchange ──▶ DLQ Queue B
+      (x-max-length, oldest dropped)
+```
+
+- DLQ configurable per-queue or global
+- DLQ messages require manual inspection/re-processing

@@ -1,0 +1,203 @@
+---
+title: "Core Entities"
+description: "Core data entities for Google Calendar — Event, Calendar, Recurrence, Invitation, Reminder, Availability"
+---
+
+## Event
+
+An event is a scheduled time block on a calendar.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | string (UUID) | Unique event identifier (e.g., `abc123def456@google.com`) |
+| organizer_id | string (user_id) | User who created the event |
+| calendar_id | string (FK → Calendar) | The calendar this event belongs to |
+| title | string | Max 500 characters |
+| description | text (nullable) | Supports markdown, rich text |
+| location | string (nullable) | Physical or virtual location (e.g., Zoom link) |
+| start | datetime | Inclusive start time (timezone-aware) |
+| end | datetime | Exclusive end time |
+| all_day | boolean | True for all-day events (birthday, holiday) |
+| status | enum | `confirmed`, `tentative`, `cancelled` |
+| visibility | enum | `default`, `public`, `private` |
+| created_at | timestamp | When the event was created |
+| updated_at | timestamp | Last modification time (for sync) |
+
+**Recurring event exception handling:**
+
+A recurring event consists of one master event record plus zero or more exception records:
+
+```
+MasterEvent (rrule present):
+  id: master_abc123
+  title: "Team Standup"
+  rrule: "FREQ=WEEKLY;BYDAY=TU;COUNT=52"
+  exceptions: [exc_001, exc_002]
+
+ExceptionEvent (master_id reference):
+  id: exc_001
+  master_id: master_abc123
+  original_start: "2024-06-04T10:00:00Z"
+  start: "2024-06-04T11:00:00Z"  // moved to 11am
+  end: "2024-06-04T11:30:00Z"
+```
+
+To get all occurrences for a time range, the system:
+1. Loads the master event
+2. Generates occurrences from rrule for the query range
+3. Applies exception overrides for any matching dates
+4. Deduplicates by occurrence time
+
+## Recurrence Rule
+
+Follows the iCalendar RFC 5545 RRULE specification.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| frequency | enum | `DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`, `HOURLY`, `MINUTELY`, `SECONDLY` |
+| interval | int | Every N intervals (e.g., every 2 weeks) |
+| by_day | string[] | Days of week (e.g., `["MO","WE","FR"]`) |
+| by_month_day | int[] | Days of month (e.g., `[1,15]`) |
+| by_month | int[] | Months (1–12) |
+| by_year_day | int[] | Day of year (1–366) |
+| count | int (nullable) | Number of occurrences; unlimited if null |
+| until | datetime (nullable) | End date; unlimited if null |
+| max_instances | int | Upper bound for occurrence expansion (default: 365) |
+
+**Canonical RRULE string format:**
+```
+FREQ=WEEKLY;BYDAY=TU,TH;INTERVAL=1;COUNT=52
+FREQ=DAILY;UNTIL=20241231T235959Z
+FREQ=MONTHLY;BYMONTHDAY=1;INTERVAL=1
+```
+
+## Calendar
+
+A named collection of events owned or shared with a user.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | string | Unique calendar identifier |
+| owner_id | string (FK → User) | Owner of the calendar |
+| name | string | Display name (e.g., "Work," "Personal") |
+| description | text (nullable) | Optional description |
+| color | hex color | Hex color for UI display |
+| timezone | string (IANA) | Default timezone (e.g., "America/New_York") |
+| is_primary | boolean | Whether this is the user's primary calendar |
+| is_deleted | boolean | Soft delete flag |
+| created_at | timestamp | |
+| updated_at | timestamp | |
+
+## Attendee / Invitation
+
+Represents a user's participation in an event and their response status.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | string | Unique invitation identifier |
+| event_id | string (FK → Event) | The event this invitation is for |
+| user_id | string (FK → User) | The attendee |
+| status | enum | `needs_action`, `accepted`, `tentative`, `declined`, `in_event_calendar` |
+| optional | boolean | True if optional attendee |
+| response_change_time | timestamp (nullable) | When the response changed (triggers notifications) |
+| organizer | boolean | True if this attendee is also the event organizer |
+| added_at | timestamp | When the attendee was added |
+
+**Free/Busy Status Mapping:**
+
+| Event Status | Attendee Status | Visible Free/Busy |
+| --- | --- | --- |
+| confirmed | accepted | `busy` |
+| tentative | tentative | `tentative` |
+| cancelled | — | not shown |
+| (no event) | — | `free` |
+
+## Reminder / Notification
+
+Reminders are attached per-event and trigger notifications at configurable times before the event start.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | string | Unique reminder identifier |
+| event_id | string (FK → Event) | The event this reminder is for |
+| minutes_before | int | Minutes before start (e.g., 10, 30, 60) |
+| method | enum | `popup`, `email`, `sms`, `mobile_push` |
+| triggered_at | timestamp (nullable) | When the reminder was last triggered |
+| triggered | boolean | Whether the reminder has been triggered |
+
+**Reminder defaults:**
+- Calendar-level defaults can be set per calendar (e.g., "all Work calendar events get 15-min reminder")
+- Per-event overrides take precedence over calendar defaults
+- Max 8 reminders per event
+
+## Availability Slot
+
+Computed entity — not stored persistently. Generated on demand when a user requests free/busy info.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| user_id | string | The user whose availability is being queried |
+| start | datetime | Slot start time |
+| end | datetime | Slot end time |
+| status | enum | `free`, `busy`, `tentative` |
+| event_ids | string[] (nullable) | If busy/tentative, the event IDs blocking this slot |
+
+**Availability computation:**
+
+```
+For user X, time range [T1, T2], slot_size = 30min:
+  1. Load all events for user X in [T1, T2] where status != cancelled
+  2. Expand recurring events into occurrences (bounded by max_instances)
+  3. Build a timeline by merging all occurrences
+  4. Each slot is marked:
+     - busy: any confirmed event overlaps
+     - tentative: any tentative event overlaps (no confirmed)
+     - free: no event overlaps
+```
+
+## Relationships
+
+```
+┌──────────┐   owns    ┌──────────┐   contains    ┌──────────┐
+│  User    │────────▶  │ Calendar │──────────────▶│  Event   │
+│          │           │          │               │          │
+│ id       │           │ id       │   ┌──────────▶│ id       │
+│ name     │           │ owner_id │   │           │ organizer│
+│ timezone │           │ name     │   │           │ calendar │
+└──────────┘           │ color    │   │           │ title    │
+                       │ timezone │   │           │ start    │
+                       │ primary  │   │           │ end      │
+                       └──────────┘   │           │ status   │
+                                        │           └──────────┘
+                                        │                  │
+                                        │             has │
+                                        │                  │
+                                        │            ┌─────▼─────┐
+                                        │            │ Attendee[] │
+                                        │            │ (invitation)│
+                                        │            └───────────┘
+                                        │
+                                        │     has
+                                        │     │
+                                        │     ▼
+                                        │ ┌──────────┐
+                                        │ │ Recurrence │
+                                        │ │ (rrule)    │
+                                        │ └──────────┘
+                                        │
+                                        │     has
+                                        │     │
+                                        │     ▼
+                                        │ ┌──────────┐
+                                        │ │ Reminder[] │
+                                        │ └────────────┘
+
+┌──────────┐  exposes    ┌──────────────┐
+│  User    │──────────▶  │ Availability │
+│          │             │ (computed)    │
+│ id       │             │ user_id       │
+└──────────┘             │ start         │
+                         │ end           │
+                         │ status        │
+                         └──────────────┘
+```

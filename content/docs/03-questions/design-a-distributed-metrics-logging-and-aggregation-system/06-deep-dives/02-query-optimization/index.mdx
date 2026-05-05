@@ -1,0 +1,101 @@
+---
+title: Query Optimization
+description: Deep dive into query optimization for the metrics system
+---
+
+## Rollup-based Query Routing
+
+The Query Engine uses a simple decision tree to determine which table to read:
+
+```
+Query arrives: \{metric_id, labels, start, end, granularity\}
+  │
+  ├─ granularity &gt;= 5min AND (end - start) > 24h?
+  │   └─ YES → Read metrics_rollup_day (if > 30d) or metrics_rollup_hour (if ≤ 30d)
+  │
+  ├─ granularity = 1min AND (end - start) ≤ 24h?
+  │   └─ YES → Read metrics_raw
+  │
+  └─ other combinations:
+      └─ Read metrics_rollup_minute + interpolate as needed
+```
+
+This ensures that queries for long time ranges never scan raw data. A query for `avg(cpu.usage)` over 30 days reads from `metrics_rollup_hour` — 720 data points instead of ~77 million raw samples.
+
+## Label Index Design
+
+### Problem: Filtering by Label
+
+Cassandra's partition key is `(metric_id, label_hash)`. If a user queries `avg(http.request.duration) WHERE host = 'web-1'`, Cassandra must know which `label_hash` value corresponds to `host = 'web-1'` without scanning all partitions.
+
+### Solution: Separate Label Index Table
+
+```sql
+CREATE TABLE metrics_label_index (
+    metric_id TEXT,
+    label_key TEXT,        -- e.g., "host", "region", "service"
+    label_value TEXT,      -- e.g., "web-1", "us-east", "api-server"
+    label_hash TEXT,       -- the hash used in the raw/rollup tables
+    PRIMARY KEY ((metric_id, label_key), label_value, label_hash)
+);
+```
+
+This allows efficient lookups:
+```sql
+-- Find all partition hashes where host = 'web-1'
+SELECT label_hash FROM metrics_label_index
+WHERE metric_id = 'cpu.usage' AND label_key = 'host' AND label_value = 'web-1';
+```
+
+The index table is updated as part of the aggregation flush — when a new label set is seen for the first time, a new index entry is written.
+
+### Cardinality Management
+
+Not all label values are indexable. Labels with cardinality > 10,000 (e.g., `request_id`, `user_session_id`) are excluded from the index and can only be queried by exact match. This prevents the index table from becoming a hotspot.
+
+## Parallel Query Execution
+
+### Query Partitioning
+
+A single query is broken into **time bucket chunks** of ~10 seconds each. Each chunk is executed as an independent Cassandra query, and results are merged in the Query Engine:
+
+```
+Query: avg(cpu.usage) WHERE host = 'web-1' from 10:00 to 10:30
+
+Step 1: Resolve label_hash for (host='web-1')
+Step 2: Split into 180 chunks of 10s each
+Step 3: Execute 180 Cassandra queries in parallel:
+         SELECT avg_value FROM metrics_rollup_hour
+         WHERE metric_id = 'cpu.usage' AND label_hash = 0xabcd
+         AND window_start BETWEEN 10:00:00 AND 10:00:10
+Step 4: Merge 180 results → compute overall average
+```
+
+The Query Engine maintains a pool of ~50 Cassandra connection sessions (configurable). Chunks are dispatched as sessions become available.
+
+### Result Caching
+
+The Query Engine maintains an **in-memory LRU cache** (2GB, configurable) keyed by:
+```
+cache_key = hash(metric_id, label_filter, start_ms, end_ms, granularity, aggregation)
+```
+
+Cache entries expire after 60s. This handles the common case of dashboard users refreshing the same view repeatedly:
+
+| Scenario | Cache Hit Rate |
+|---|---|
+| Dashboard auto-refresh (30s interval) | ~95% |
+| Ad-hoc user queries | ~20% |
+| Unique one-off queries | ~0% |
+
+## Caching Layer (Optional, for High Concurrency)
+
+For dashboards with very high read concurrency (> 100 queries/sec on the same data), a **read-through cache layer** sits between the Query Engine and Cassandra:
+
+```
+Query Engine → Redis (cache) → Cassandra (cache miss)
+```
+
+Redis stores pre-computed query results (JSON) with a 60s TTL. On a cache hit, the Query Engine returns immediately. On a cache miss, it queries Cassandra, stores the result in Redis, and returns.
+
+This reduces Cassandra load for high-concurrency dashboards by ~80-90%.

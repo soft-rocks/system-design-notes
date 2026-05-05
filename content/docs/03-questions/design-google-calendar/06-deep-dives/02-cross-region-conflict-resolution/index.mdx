@@ -1,0 +1,63 @@
+---
+title: Cross-Region Conflict Resolution
+description: Multi-primary replication, vector clocks, optimistic concurrency control, and split-brain handling.
+---
+
+## Multi-Primary Replication Model
+
+- CockroachDB multi-region deployment with 3 regions (e.g., us-east, us-west, eu-central)
+- Each region is a full writer (multi-primary): any client can read/write to any region
+- Replication via Raft consensus: writes at one region replicate to others via Raft log
+- Lease holding: region holding the lease for a range handles proposals; followers apply log entries
+
+## Conflict Detection
+
+Conflict occurs when two clients modify the same event concurrently in different regions.
+
+Detection mechanism: CockroachDB MVCC stores multiple value timestamps (.wall, .seq) for each row. Each write increments local logical clock (wall clock + node sequence). Raft serializes writes: one write wins, the other is deferred.
+
+## Conflict Resolution Strategy
+
+### Last-Write-Wins with Vector Clocks
+
+- Each event has a `version` field (monotonically increasing per-event, assigned at commit)
+- Concurrent writes: Raft ordering ensures total order; the write that commits first wins
+- Losing client receives 412 Precondition Failed with the current version
+
+### Vector Clock for Application-Level Tracking
+
+Each region maintains a per-event vector: `\{regionA: vA, regionB: vB, regionC: vC\}`. On write: increment own region's counter. On read: return vector clock with event; client includes it on next write. Detects causality: if `vcA > vcB` for some regions and `vcA < vcB` for others → concurrent modifications.
+
+## Optimistic Concurrency Control
+
+All writes require `If-Match: <etag>` header. ETag = SHA256(event_content + version).
+
+**Retry flow:**
+```
+try {
+  PATCH /events/E with If-Match: etag_v3
+} catch 412 {
+  GET /events/E         // fetch current state
+  merge locally         // apply user's changes on top
+  PATCH /events/E with If-Match: etag_v4
+}
+```
+
+## Split-Brain Scenario
+
+If one region loses network connectivity:
+
+- CockroachDB leases: if a majority can communicate, they form a quorum
+- Minority partition: writes queue locally; when connectivity restores, apply queued writes
+- Conflict window: writes in partitioned region that conflict with majority region writes
+- Resolution: majority writes committed first; partitioned region's conflicting writes get 412 on reconnect
+
+## Data Consistency Guarantees
+
+| Read Level | Latency | Consistency |
+|------------|---------|-------------|
+| `SERIALIZABLE` (default) | 15-30ms (cross-region) | Linearizable — strongest guarantee |
+| `STALE_READ` | 1-5ms (cross-region) | May read up to 1s stale data |
+
+- **Read-your-writes:** always consistent (local read path, no cross-region latency)
+- **Read-your-writes-with-others:** use `ReadConsistency=STRONG` for cross-region reads (adds Raft round-trip)

@@ -1,0 +1,164 @@
+---
+title: Performance Optimization
+description: Deep dive into end-to-end latency tuning and scaling sensitivity analysis.
+---
+
+### Performance Optimization
+
+#### Challenge
+
+Maintaining P95 < 100ms for reads and P95 < 200ms for writes under 1,157 reads/sec sustained (~3,500 peak) and 12 writes/sec sustained (~40 peak) with a 100:1 read/write ratio. The dominant challenge is not raw throughput — the system is small enough that a single well-tuned server could handle both — but rather minimizing the **number of network round-trips per request**. Each cache miss triggers a DB query and a blob fetch; each cache miss to 1,157 concurrent readers is 1,157 DB queries and 1,157 blob fetches.
+
+**Latency budget**: Read P95 = 100ms. Breakdown by layer:
+- Network round-trip (client → CDN → origin): 10–30ms
+- Application processing: 5–10ms
+- Redis lookup: < 2ms
+- DB lookup: < 5ms
+- Object storage fetch: < 20ms
+- **Worst-case cold read**: CDN miss + cache miss + DB + ObjectStorage = 40–70ms. Must stay under 100ms P95.
+
+#### TL;DR — Cost at Scale
+
+| Metric | Value |
+|--------|-------|
+| Total monthly infrastructure cost | ~$1,314 |
+| Cost per paste read | ~$0.000013 |
+| Cost per paste write | ~$0.0013 |
+| 10× scale cost | ~$6,500/month (linear scaling until operational complexity kicks in) |
+
+Detailed cost breakdown is in Section 7 below.
+
+#### Solution: Sensitivity Analysis — What Happens When Assumptions Break
+
+Rather than adding subsystems, this chapter analyzes the system's sensitivity to changes in scale and asks: **at what point do current optimizations break, and what do we need next?**
+
+**1. Read/Write Ratio Sensitivity**
+
+| R/W Ratio | Reads/sec | Writes/sec | Primary Bottleneck |
+|-----------|-----------|------------|-------------------|
+| 100:1 (current) | 1,157 | 12 | Redis + CDN |
+| 10:1 | 3,500 | 350 | DB replicas |
+| 1:1 | 12,000 | 12,000 | Object Storage |
+| 0.1:1 | 120 | 120,000 | Write throughput |
+
+**At 10:1 ratio** (~10K reads/sec, ~350 writes/sec):
+- Redis becomes the bottleneck — need more nodes or read replicas for cache queries.
+- DB read replicas: need 3 per shard (currently 2) since reads are no longer dominated by background queries.
+- CDN coverage: still strong (>90% hit rate), so origin load stays manageable.
+
+**At 1:1 ratio** (~12K reads/sec, ~12K writes/sec):
+- Object Storage becomes the bottleneck — 12K PUTs/sec saturates most cloud providers' per-shard throughput limits.
+- Sharding: need more shards (20–50) to distribute writes evenly.
+- Write path optimization: batch dedup checks, parallelize blob upload + cache warm.
+
+**At 0.1:1 ratio** (~120 reads/sec, ~120K writes/sec):
+- This is the "write-heavy" scenario (e.g., IoT telemetry, logging).
+- Write throughput dominates: need write-optimized storage (e.g., columnar storage, append-only log).
+- Read path becomes secondary — cache hit rate target drops to 90% since reads don't need to be at 99%.
+
+**2. Read Latency Sensitivity to Cache Layers**
+
+| Cache Layers | P95 Read | CDN Coverage | DB Load | S3 Load |
+|-------------|----------|-------------|---------|---------|
+| All 4 tiers | ~30ms | > 85% | 5% of reads | 5% of reads |
+| CDN + Redis | ~50ms | > 85% | 10% of reads | 10% of reads |
+| Redis only | ~200ms | > 0% | 100% of reads | 90% of reads |
+| DB only | ~500ms | > 0% | 100% of reads | 100% of reads |
+
+**Key insight**: The local LRU (Tier 2) saves ~2ms per hot request — seemingly trivial. But at 80% hit rate across 1,157 reads/sec, that's ~926 requests/sec × 2ms = 1.85 seconds of DB latency saved per second. The local LRU isn't about P95 — it's about **reducing Redis load during peak**, which indirectly improves P95 by preventing Redis tail latency spikes.
+
+**3. Write Path Parallelization**
+
+The write path touches 5 downstream services: validate, dedup check, blob upload, metadata insert, cache warm. Some can be parallelized:
+
+```python
+# Sequential (slow): 40–60ms
+validate → dedup_check → upload_blob → insert_metadata → warm_cache
+
+# Parallelized (fast): 25–35ms
+validate → [dedup_check, compute_hash]  # parallel
+  → insert_metadata  # correctness gate (reserved key)
+  → upload_blob  # blocking — response waits for this
+  → cache_warm  # fire-and-forget (can re-warm on cold read)
+```
+
+Key parallelization:
+- **SHA-256 + validation run in the same pass** — no separate hashing step.
+- **Blob upload blocks the response** (201 OK requires content to be available) but **cache warm is fire-and-forget**. Consistency is guaranteed by the DB: the metadata insert reserves the `paste_key` first, then blob upload is a performance best-effort — if it fails, the next read 404s until an orphan scan recovers the blob.
+- **Metadata insert comes before blob upload** — following the orphan-prevention pattern: if blob upload fails after metadata commit, the key is reserved but the blob is missing (safe degradation). The reverse order (blob first, then failed metadata) creates a permanent orphan.
+
+**4. Database Query Optimization**
+
+| Technique | Details | Savings |
+|-----------|---------|---------|
+| Covering index | `idx_expires_at` is partial (only active TTL pastes) | Index size ~10% of full table |
+| Read-only replicas | All reads go to replicas; primaries are write-only | Eliminates read-write lock contention |
+| PgBouncer transaction mode | Connections shared across requests | Eliminates TCP/TLS handshake overhead |
+| Single-row SELECT | `WHERE paste_key = :key` hits primary key index | O(log n), typically 2–3 levels deep |
+| NO LOCK on reads | Pastes are immutable — no locks needed | Zero lock wait time |
+
+**5. Object Storage Optimization**
+
+| Technique | Details | Savings |
+|-----------|---------|---------|
+| Single-part PUT | All pastes < 64KB, no multipart needed | Eliminates multipart overhead |
+| Regional endpoint | Object storage in same region as origin | ~5–10ms saved per fetch |
+| Connection-pooled SDK | Persistent HTTP connections to object storage | Eliminates TCP/TLS handshake |
+| Response streaming | Stream blob directly to client, no buffering | Eliminates double-copy in memory |
+
+**6. Application-Level Optimization**
+
+| Technique | Details | Savings |
+|-----------|---------|---------|
+| Async I/O | Non-blocking Redis, DB, and S3 calls | Higher throughput per instance |
+| Zero-copy serialization | Protocol Buffers or msgpack for Redis | 30–50% smaller payloads, faster serialization |
+| Thread pool for CPU-bound work | SHA-256 hashing in worker pool | Avoids GIL blocking in Python |
+| Response compression | gzip on API text/plain responses (not blob storage; see Paste Storage Engine §6) | 1–3KB saved per response (for 64KB paste) |
+
+**7. Cost Optimization**
+
+Infrastructure cost estimation at current scale (~1M writes/day, ~100M reads/day):
+
+| Component | Monthly Cost | Notes |
+|-----------|-------------|-------|
+| PostgreSQL (primary × 10) | ~$150 | 10 primaries, db.r6g.large, 100GB SSD, multi-AZ (~$15/shard) |
+| PostgreSQL (replicas × 20) | ~$300 | 10 shards × 2 replicas |
+| Redis (6-node cluster) | ~$200 | 6 nodes across 3 AZs (3 masters + 3 replicas), 40GB total |
+| S3 storage | ~$6 | Active set ~250 GB at any time (3.65 TB/year ingress, ~1 month avg TTL), at $0.023/GB |
+| S3 requests | ~$10 | ~100M GET/day + 1M PUT/day |
+| CDN (Cloudflare) | ~$50 | 100M reads/day, egress included |
+| Paste Service (50 instances) | ~$500 | t3.small × 50, 24/7 |
+| PgBouncer (10 instances) | ~$20 | t3.micro × 10 |
+| **Total** | **~$1,313** | ~$0.000013 per paste read, ~$0.0013 per paste write |
+
+Note: Cost estimate assumes 10 independently provisioned shards, each with 1 primary + 2 replicas, plus 50 Paste Service instances, 6-node Redis cluster, and 10 PgBouncer instances. In practice, shared PgBouncer pools and a smaller Redis cluster could reduce this by ~20%. The 10× scale cost (~$6,500/month) assumes linear scaling of DB shards, compute, and CDN bandwidth.
+
+Cost scaling: at 10× scale (~10M writes/day, ~1B reads/day):
+- S3 storage: $840/month (linear)
+- CDN: $500/month (linear with reads)
+- Compute: $2,000/month (10× instances)
+- DB: $3,000/month (shard scaling, not vertical)
+- **Total: ~$6,500/month** — the cost curve is approximately linear until operational complexity kicks in.
+
+**8. Latency Budget Summary**
+
+| Operation | P10 | P50 | P95 | P99 |
+|-----------|-----|-----|-----|-----|
+| CDN cache hit | < 10ms | < 15ms | < 20ms | < 50ms |
+| Redis cache hit | < 5ms | < 10ms | < 15ms | < 25ms |
+| Cold read (cache miss) | < 30ms | < 60ms | < 90ms | < 150ms |
+| Write | < 20ms | < 40ms | < 120ms | < 200ms |
+
+**P95 targets are met with comfortable headroom**. The 100ms read P95 budget allows for ~30ms network + ~5ms app + ~5ms Redis + ~5ms DB + ~20ms S3 = ~65ms in the worst case, leaving 35ms of margin for tail latency.
+
+**9. Optimization Trade-offs**
+
+| Technique | Benefit | Cost |
+|-----------|---------|------|
+| Local LRU | ~2ms saved per hot request | 10MB RAM per instance, stale data risk |
+| gzip response | 1–3KB saved over network | 1–2ms CPU per response |
+| msgpack serialization | 30–50% smaller Redis payloads | Slightly more complex deserialization |
+| Async I/O | Higher throughput per instance | More complex code, harder to debug |
+| Circuit breaker | Prevents cascade failures | Returns degraded responses (metadata without content) |
+
+**See Also**: [Cache Optimization](../4-cache-optimization) — cache mechanics, stampede protection; [CDN Integration](../5-cdn-integration) — CDN edge caching.

@@ -1,0 +1,54 @@
+---
+title: Anti-Gaming
+description: Fraud detection signals, penalty scoring, and false positive prevention.
+---
+
+## Fraud Detection Signals
+
+Gaming attacks fall into three categories:
+
+| Attack Type | Detection Signal | Threshold |
+|------------|-----------------|-----------|
+| **Review bombing** | Sudden influx of 1-star ratings from same IP range or device cluster | > 50 ratings from /24 in 1 hour |
+| **Download fraud** | Burst of downloads from bot-like patterns (no install, immediate uninstall) | > 1000 downloads from same ASN in 1 hour |
+| **Rating manipulation** | Sustained influx of 5-star ratings with similar text patterns | NLP similarity > 0.8 across reviews |
+| **Revenue manipulation** | Self-purchases or refund abuse | Refund rate > 30% of revenue |
+
+**Graph-based detection:** A separate graph database tracks relationships between:
+- IPs → devices → apps → ratings
+- Devices → payment methods → accounts
+- Downloads → app installs → usage patterns
+
+Anomalies are detected via:
+- **Community detection:** Identify clusters of coordinated behavior (e.g., 1000 reviews from the same IP subnet)
+- **Degree analysis:** Apps with abnormally high in-degree from a small set of sources are flagged
+
+## Penalty Scoring
+
+Flagged apps receive a penalty that is applied as a multiplier to their total score:
+
+```
+penalized_score = total_score × (1 - fraud_penalty)
+```
+
+| Fraud confidence | Penalty multiplier | Effect |
+|-----------------|-------------------|--------|
+| Low (0.3–0.5) | 0.05 | 5% score reduction |
+| Medium (0.5–0.8) | 0.20 | 20% score reduction |
+| High (0.8–1.0) | 0.50 | 50% score reduction |
+
+**Penalty is advisory:** The GamingDetector output is a **penalty score**, NOT an auto-removal. This prevents false positives from immediately demoting legitimate apps.
+
+**Penalty decay:** Fraud penalty halves every 7 days if no new fraudulent signals are detected (same exponential decay model).
+
+## False Positive Prevention
+
+| Mechanism | Description |
+|-----------|-------------|
+| **Advisory only** | Penalties reduce score but don't remove apps from rankings |
+| **Human review queue** | Medium/high-confidence flags are sent to a review queue for manual verification |
+| **Appeal process** | Developers can dispute flags via Console API with evidence (e.g., legitimate marketing campaign causing download spike) |
+| **Feedback loop** | False positive confirmations reduce the sensitivity of that detection rule |
+| **Whitelist** | Apps with verified developer status (e.g., top publishers) are excluded from automated penalties |
+
+**Latency:** Fraud detection runs asynchronously alongside ranking computation. A flag takes 15–30 minutes to affect rankings (one to two update cycles).

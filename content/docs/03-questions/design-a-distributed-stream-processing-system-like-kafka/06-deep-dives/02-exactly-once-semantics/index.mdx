@@ -1,0 +1,83 @@
+---
+title: Exactly-Once Semantics
+description: Idempotent producers, transactions, and commit log semantics
+---
+
+## Idempotent Producers
+
+At-least-once delivery means retries on transient failures cause duplicates. Idempotent producers eliminate this problem by assigning each producer a unique Producer ID (PID) and monotonically increasing sequence numbers per partition.
+
+**How it works:**
+
+1. Producer fetches a new PID from the metadata broker (PID is refreshed periodically).
+2. Each message sent to a partition carries `(PID, sequence_number)`.
+3. The broker tracks the last sequence number received for each `(PID, partition)` pair.
+4. If a message arrives with a sequence number already seen, it is silently deduplicated.
+5. If a message arrives with a gap (sequence N+2 after N), it is rejected — out-of-order messages from the same producer are not allowed.
+
+```
+Producer PID=42 sends to partition 3:
+  Msg 1: (PID=42, seq=0) → broker stores, HW updated
+  Msg 2: (PID=42, seq=1) → broker stores, HW updated
+  Timeout → retry Msg 1: (PID=42, seq=0) → broker sees seq=0 already stored → discard
+```
+
+**Why sequence numbers must be monotonic per partition:**
+
+This preserves message ordering within a partition. Without per-partition sequence tracking, a late message could be accepted out of order. The tradeoff is that producers must track state locally — if a producer crashes, it gets a new PID, losing its sequence state. The old PID's sequence numbers remain in the broker's table until it expires (after 24 hours by default), at which point a new producer with the same PID (unlikely) could replay old messages.
+
+## Transactional Writes
+
+Idempotence handles deduplication at the producer level. But what if a consumer reads from Topic A, transforms data, and writes to Topic B — and the producer crashes between reading and writing? The message is consumed but not re-produced, causing data loss. Transactions solve this with a commit log that spans multiple partitions and topics.
+
+**Transaction protocol:**
+
+1. Producer fetches a transactional ID from the bootstrap broker and gets an initial producer epoch.
+2. The broker initializes a transaction coordinator and creates a transactional entry in the `__transaction_state` topic.
+3. Producer begins a transaction, sends messages to multiple partitions with a special `transactional_id` marker.
+4. Messages are written to a transactional log, not visible to consumers (marked as "in-flight").
+5. Producer sends a commit or abort marker to the transaction coordinator.
+6. The transaction coordinator appends the marker to the transaction log and notifies all affected partition leaders.
+7. Partition leaders make the messages visible (on commit) or discard them (on abort).
+
+```
+Producer: beginTransaction()
+Producer: send(msg1 → topic-orders, partition=0)  [txn=42, phase=in-flight]
+Producer: send(msg2 → topic-inventory, partition=1) [txn=42, phase=in-flight]
+Producer: sendCommit(txn=42)
+  → Transaction coordinator writes COMMIT marker to __transaction_state
+  → Broker 0 (leader for topic-orders:0) makes txn=42 messages visible
+  → Broker 1 (leader for topic-inventory:1) makes txn=42 messages visible
+Consumer: reads only committed messages → sees both msg1 and msg2 atomically
+```
+
+**Why a transaction log instead of in-memory state?**
+
+If the transaction coordinator crashes, in-memory state is lost. The transaction log is a replicated topic, so the new coordinator can replay pending transactions and either commit or abort them (abort on recovery if the original producer didn't complete).
+
+## End-to-End Exactly-Once
+
+Idempotent producers and transactions provide exactly-once semantics within the stream processing system. But end-to-end exactly-once requires the entire pipeline to be idempotent:
+
+```
+Source (external system) → Consumer → Transform → Producer → Target (external system)
+```
+
+The consumer must read each message exactly once (committed offsets must be in the same transaction as the output writes). The target system must be idempotent — or the producer must track which messages were successfully delivered.
+
+**The tradeoff: performance vs correctness**
+
+Transactions add significant overhead:
+- **Latency**: Messages are buffered until the transaction commits, adding 10-100ms of batching delay.
+- **Throughput**: Transactional writes are 10-100x slower than non-transactional writes due to coordination overhead.
+- **Scope**: Transactions can only span partitions that share the same transaction coordinator (co-partitioned by partition count).
+
+**When to use exactly-once:**
+
+| Scenario | Recommendation |
+|---|---|
+| Payment processing | Required — double charges are unacceptable |
+| Event sourcing | Required — inconsistent snapshots corrupt state |
+| Metrics/aggregation | Not needed — at-least-once + dedup at query time is cheaper |
+| Log enrichment | Not needed — downstream dedup is simpler |
+| Cache invalidation | Not needed — stale cache entries resolve quickly |

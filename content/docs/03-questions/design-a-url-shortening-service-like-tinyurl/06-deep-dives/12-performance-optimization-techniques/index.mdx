@@ -1,0 +1,62 @@
+---
+title: "Performance Optimization Techniques"
+description: "Maintaining P95 less than 50ms for redirects under high load"
+---
+
+### Performance Optimization Techniques
+
+#### Challenge
+
+Maintaining P95 < 50ms for redirects under 23K RPS. Every millisecond adds up: DNS (~5ms) + TLS handshake (~15ms) + network RTT (~10ms) + cache lookup (~0.5ms) + redirect generation (~0.1ms). The biggest wins are at the network and caching layers.
+
+#### Solution: Layered Optimization
+
+1. **Network Level**:
+
+- **TLS session resumption:** Reuse TLS session tickets to skip full handshake. Reduces first-request latency from ~30ms to ~10ms for repeat visitors.
+- **HTTP/2 multiplexing:** Single TCP connection per origin, no head-of-line blocking. Reduces concurrent connection overhead.
+- **HTTP/3 (QUIC):** Eliminates TCP head-of-line blocking. Beneficial primarily for mobile clients on lossy networks. For datacenter-to-datacenter links, HTTP/2 is sufficient.
+- **Connection reuse:** API instances maintain persistent connections to Redis and PostgreSQL via connection pools (PgBouncer for Postgres). This avoids per-request connection setup cost (~0.5-2ms each).
+
+2. **Application Level**:
+
+- **Language choice:** Go (Gin/Fiber) or Rust (Axum). Go provides excellent concurrency primitives with goroutines (100K+ concurrent requests on a single 4-core instance). Rust provides lower per-request memory with similar throughput. At 23K RPS, language choice matters less than architecture — avoid Python (FastAPI) without multi-worker setup and async DB/Redis drivers; single-threaded asyncio would not sustain this load.
+- **Response compression:** Do NOT compress 302 redirect responses (the redirect itself is small: ~200 bytes). Compression adds ~0.3ms latency for minimal gain. Only compress larger responses (API JSON bodies, error pages).
+- **Zero allocation paths:** Pre-allocate response buffers. For the redirect path, the entire operation (cache lookup → header construction → 302) can be done without heap allocations using pre-allocated byte slices (Go) or stack buffers (Rust). This brings redirect path latency to ~0.3ms when cached.
+- **Batch enrichment:** GeoIP lookups and UA parsing happen in the API process, not in a separate service. Embedding the MaxMind GeoLite2 DB in the process avoids a network call. Parsing cost: ~0.2ms per request.
+
+3. **Caching Level**:
+
+- **Cache line alignment:** In-memory local cache keys are padded to 64-byte cache line boundaries. This avoids cache line contention on multi-core systems. At 23K lookups/sec across 16 cores, this prevents false sharing.
+- **TTL design:** Cache entries expire in 5 minutes (local) and min(24h, url's remaining lifetime) (Redis). The TTL should be long enough to serve the same entry repeatedly, but short enough to allow stale data recovery after a write. Never cache beyond the URL's actual expiry time.
+- **Cold start mitigation:** On API instance startup, pre-warm the local cache with the most-accessed URLs from the Redis cache. This prevents a "thundering herd" of DB hits when new instances join (e.g., during autoscaling). Warm-up time: ~2 seconds for 10K entries.
+
+4. **Database Level**:
+
+- **Index-only scans:** PostgreSQL's `short_code` primary key index is small enough (8 bytes per entry) to fit in memory. At 23K RPS across 16 shards (~1.4K/sec per shard), the entire index (~100MB) should fit in the OS page cache. This eliminates disk I/O for lookups.
+- **Prepared statements:** Always use parameterized queries with prepared statement names (pgbouncer supports this). Avoids query parsing overhead (~0.1ms per query).
+- **Connection pooling:** PgBouncer in transaction mode. Each API instance maintains a pool of 20 connections per shard. This means 16 shards × 20 connections = 320 connections per API instance, handled by ~20 instances = ~6400 total client connections vs. ~140K individual connections (without pooling).
+
+5. **Redirect Path Profiling** (typical breakdown):
+
+| Step | P50 | P95 | P99 |
+| --- | --- | --- | --- |
+| Network RTT (same region) | 2ms | 5ms | 10ms |
+| TLS termination (ALB) | 0.5ms | 1ms | 2ms |
+| API processing | 0.3ms | 1ms | 3ms |
+| Local cache lookup | 0.1ms | 0.3ms | 1ms |
+| Redis lookup (if cache miss) | 0.5ms | 1ms | 2ms |
+| Blacklist check | 0.1ms | 0.3ms | 1ms |
+| Analytics enqueue (async) | 0.1ms | 0.2ms | 0.5ms |
+| Redirect response | 0.05ms | 0.1ms | 0.2ms |
+| **Total (local cache hit)** | **~3.1ms** | **~7.7ms** | **~17.7ms** |
+| **Total (Redis + DB hit)** | **~15ms** | **~28ms** | **~55ms** |
+
+- **Key insight:** 95%+ of redirects hit the local cache (cache hit rate ~97%). The remaining 3% that miss local cache but hit Redis add ~0.5ms. Only 0.1% miss both caches and hit the DB, which is the P99 path.
+
+6. **Load Testing**:
+- Simulate 10K-50K RPS with Locust or k6
+- Test gradual ramp-up (1K → 5K → 10K → 50K RPS)
+- Verify cache hit rates stabilize at >95% after warm-up
+- Validate autoscaling triggers (CPU > 60% → scale +1 instance)
+- Test cold start: measure P95 degradation during first 30 seconds after deploy

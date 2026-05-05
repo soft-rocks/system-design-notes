@@ -1,0 +1,98 @@
+---
+title: Channel Manager Integration
+description: Multi-protocol translation, per-channel proxy isolation, rate parity enforcement, and conflict resolution across OTA partners.
+---
+
+## Multi-Protocol Translation
+
+Each OTA partner uses different APIs, auth methods, and data formats:
+
+| Partner | API | Auth | Format | Rate Limit |
+|---|---|---|---|---|
+| Expedia | Property Access Platform (PAP) | OAuth 2.0 | XML/JSON | 100 req/s |
+| Booking.com | AES / NDI | API key + HMAC | XML | 50 req/s |
+| GDS (Amadeus) | PMS Gateway | X.509 certs | EDIFACT/XML | 30 req/s |
+| Airbnb | PMS API | OAuth 2.0 | JSON | 20 req/s |
+
+The Channel Service wraps each protocol in a dedicated adapter. Each adapter handles:
+
+- **Authentication**: Token refresh, certificate rotation, HMAC signature computation.
+- **Serialization**: Converting between partner format and internal protobuf.
+- **Rate limiting**: Per-partner tokens bucket algorithm.
+- **Error handling**: Mapping partner-specific error codes to internal error types.
+
+The internal representation is always protobuf:
+
+```protobuf
+message InventorySyncMessage {
+  string sync_event_id = 1;       // idempotency key
+  string property_id = 2;
+  string room_type_id = 3;
+  string operation = 4;            // BOOK / RELEASE / PRICE_CHANGE
+  int32 num_rooms = 5;
+  int64 timestamp = 6;
+}
+```
+
+This means downstream services (Inventory Service, Notification Service) never need to know which channel produced an event.
+
+## Per-Channel Proxy Isolation
+
+Each channel has its own proxy service deployed as a separate Kubernetes pod. This isolation is critical:
+
+- **Bug containment**: A memory leak in the Expedia adapter doesn't affect the Booking.com adapter (different pods, different memory limits).
+- **Rate limit compliance**: Each proxy has its own rate limiter. If Expedia temporarily throttles, only the Expedia proxy backoffs — Booking.com continues normally.
+- **Auth token isolation**: If an Expedia auth token leaks or expires, it only affects the Expedia proxy. Token rotation is per-proxy.
+- **Deployment isolation**: Expedia's API changes can be deployed to just the Expedia proxy pod without affecting other channels.
+
+Each proxy pod has independent metrics (request count, error rate, latency) visible in Grafana. A proxy failure is a P2 incident (not P1) — one channel is affected, not all.
+
+## Rate Parity Enforcement
+
+Most channel contracts include rate parity clauses — the partner cannot display a lower price than the hotel's direct site.
+
+**Real-time enforcement**: When a rate sync request arrives from a channel with `rate_parity_enforced = true`, the Channel Service compares the incoming rate against the direct site rate for the same (room_type, date, rate_plan):
+
+```
+if channel_rate < direct_site_rate AND channel.rate_parity_enforced:
+    reject with: RATE_PARITY_VIOLATION
+    log to audit trail
+    alert revenue manager
+```
+
+**Exceptions**: Corporate rates and government rates are exempt from parity (they're gated-login rates, not publicly visible). The parity check only applies to publicly available rates.
+
+**Weekly audit**: A background job scans all channel rates against the direct site rate. Any violations not caught in real-time generate a report for the revenue team to negotiate with the offending partner.
+
+## Conflict Resolution
+
+When two channels book the same room simultaneously (the 30-second polling window gap), the last-write-wins strategy is used with a safety net:
+
+### The Race Condition
+
+```
+Time 0s:  Expedia booking arrives → Inventory Service → available 5 → 4
+Time 5s:  Booking.com booking arrives → Inventory Service → available 4 → 3
+Time 28s: Expedia polling shows available=4 (stale, should be 3)
+         Expedia sends another booking → Inventory Service → available 3 → 2
+         (This is a 3rd booking for what should be a 2nd)
+Time 30s: Booking.com polling catches up → system corrects
+```
+
+### Resolution
+
+1. Both channel booking requests arrive at the Inventory Service within the 30-second polling window.
+2. The first request atomically decrements availability (SELECT FOR UPDATE).
+3. The second request finds available_rooms = 0 (for the last room) → returns 409 CONFLICT.
+4. The Channel Service translates the 409 into a channel-specific error ("INVENTORY_UNAVAILABLE") and sends a "booking denied" response back to the channel.
+5. The channel's system automatically cancels the guest's booking and shows "sold out" on their site.
+
+### Mitigation
+
+The 30-second polling interval is the root cause. Mitigations:
+
+- **Webhook push**: Channels with webhook support receive real-time availability updates, eliminating the polling gap. ~60% of channels now support webhooks.
+- **Automatic interval reduction**: If a channel's conflict rate exceeds 5% of its bookings, the polling interval is automatically reduced from 30s to 10s.
+- **Historical tracking**: Every conflict is logged with timestamps, channels involved, and room type. Monthly reports track conflict rates per channel.
+
+**Worst case**: The 409 response is slow to propagate back to the channel. The guest may have already received a confirmation from Expedia that is subsequently cancelled. The walk policy applies: relocate the guest to another property with compensation (see overbooking strategy deep dive).

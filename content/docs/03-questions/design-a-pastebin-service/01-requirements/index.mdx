@@ -1,0 +1,44 @@
+---
+title: Requirements
+description: Functional, non-functional requirements, scale estimates, and assumptions for the Pastebin service.
+---
+
+## Functional Requirements
+
+1. **Paste Creation** — Submit raw text with optional `title` and `language`. Configurable TTL (10m, 1h, 1d, 7d, never). Reject empty content. Enforce a max size per paste (64KB). Supports idempotency via `Idempotency-Key` header (10-min window). Identical content (SHA-256) returns existing key (deduplication).
+2. **Paste Retrieval** — Read back content via a short key. Expired or deleted pastes return appropriate status codes (`404` for never existed, `410` for expired/deleted).
+3. **Short Key** — Server-generated random keys provide access. Users may optionally request a custom key.
+4. **Expiration** — Configurable TTL per paste. Expired pastes become unreadable.
+5. **Deletion** — Delete via short key. Support soft-delete with a 24-hour recovery window. During this window, the paste is marked `deleted=true` but content remains accessible via a `?recover=1` parameter or admin API. After 24 hours, the paste is permanently purged.
+6. **API** — RESTful endpoints for create, read, delete. Include a health check endpoint.
+7. **Rate Limiting** — Apply sliding window limits on create and read endpoints: per-IP (anonymous ~20/min), per-API-key (authenticated ~100/min).
+8. **Auth** — Optional API key support for authenticated access with rotation and revocation.
+9. **Access Modes** — `public` (listable on /pastebin/ page), `unlisted` (direct link only, not searchable), `private` (key-based access only; the key is the only access control — no server-side auth, equivalent to "secret URL" pattern).
+
+**Private mode limitation:** Private pastes use HMAC-SHA256 key derivation for access (not password hashing). Anyone with the access key (URL fragment + HMAC secret) can read the paste. This is "security through obscurity" — suitable for quick sharing but NOT suitable for sensitive data (passwords, credit cards). The UI must display a warning: "Private pastes are accessible to anyone with the link."
+
+## Non-Functional Requirements
+
+1. **Scale**: ~1M new pastes/day, ~100M reads/day.
+2. **Latency**: Write P95 < 200ms; Read P95 < 100ms.
+3. **Availability**: 99.9% uptime. Multi-AZ deployment.
+4. **Durability**: 99.99% — pastes must not be lost.
+5. **Key Collisions**: Negligible probability; enforce via unique constraint with retry.
+6. **Input Validation**: UTF-8 only, max size enforced.
+7. **Security**: TLS 1.3+, XSS prevention for rendered content.
+8. **Observability**: Structured logging, metrics (latency, error rate, throughput), alerts on SLI breaches.
+
+## Scale Estimates
+
+- **Daily active users**: ~5M
+- **New pastes per day**: ~1M (~12 writes/sec sustained, ~40/sec peak)
+- **Paste reads per day**: ~100M (~1,157 reads/sec sustained, ~3,500/sec peak)
+- **Storage**: ~3.65 TB/year raw (~10KB avg/paste); plan 2–3x headroom
+- **Read/write ratio**: ~100:1 — heavily read-heavy workload
+
+## Assumptions
+
+- Primary use case: code sharing, config dumps, quick text storage for developers.
+- Anonymous access — no account required.
+- Pastes are immutable in content after creation — content cannot be modified, only deleted (soft-delete with 24h recovery, then hard-delete).
+- Key is the only access control — anyone with the short key can read/delete.

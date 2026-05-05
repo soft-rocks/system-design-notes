@@ -1,0 +1,109 @@
+---
+title: API / System Interface
+description: REST API, internal gRPC services, and event topics
+---
+
+## REST API
+
+### Auth
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /auth/login | Email + password → JWT + refresh token |
+| POST | /auth/logout | Invalidate token |
+| POST | /auth/refresh | Refresh access token |
+| POST | /auth/register | Create account |
+| POST | /auth/2fa/enable | Enable 2FA |
+| POST | /auth/2fa/verify | Verify 2FA challenge |
+
+### Files
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /v1/files/upload | Multipart upload (64MB chunks, max 10K chunks/file); initiates session, returns fileId + upload session id |
+| POST | /v1/files/upload/resume | Resume interrupted upload (sessionId + chunk + offset) |
+| GET | /v1/files/\{fileId\} | Download file content (supports HTTP Range for partial/resumable download) |
+| GET | /v1/files/\{fileId\}/metadata | Get file metadata (name, parent, etc.) |
+| PUT | /v1/files/\{fileId\} | Replace file content; creates a new Version only if SHA256 differs from the current version (dedup check), otherwise returns 200 with the existing version |
+| DELETE | /v1/files/\{fileId\} | Soft-delete file |
+| POST | /v1/files/\{fileId\}/versions/\{versionId\}/restore | Restore prior version |
+| GET | /v1/files/\{fileId\}/versions | List versions |
+
+### Folders
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /v1/folders | Create folder |
+| GET | /v1/folders/\{folderId\}/children | List direct children (paginated) |
+| PUT | /v1/folders/\{folderId\}/metadata | Rename / reorder |
+| POST | /v1/move | Move files/folders: \{fileIds, newParentId\} |
+
+### Sharing
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /v1/files/\{fileId\}/share | Grant access: \{userId, role\} |
+| GET | /v1/files/\{fileId\}/shares | List all shares |
+| PUT | /v1/shares/\{shareId\} | Update role |
+| DELETE | /v1/shares/\{shareId\} | Revoke access |
+| GET | /v1/shares/\{publicToken\} | Public link — requires role check |
+| GET | /v1/shares/public/\{publicToken\}/download | Public download |
+
+### Sync
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /v1/sync/check | Poll: \{sinceSyncToken\} → diff of changes; if token too old, returns 409 Conflict forcing full resync |
+| POST | /v1/sync/submit | Client pushes batch of operations |
+| GET | /v1/sync/state | Get current full state hash |
+
+### Search
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | /v1/search?q=\{q\}&parentId={}&type={}&limit={}&offset={} | Full-text search with filters; results paginated |
+
+### User
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | /v1/user/root | Get user's root folder (fileId) to bootstrap tree traversal |
+
+**Rate limits (example):** 100 req/min per user for write operations, 1000 req/min for reads. Sync polling capped at 1 req/sec per device to prevent abuse. Responses include `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` headers when throttled.
+
+## Internal gRPC / Event Interfaces
+
+### SyncEngine service
+
+```
+rpc ProcessSyncBatch(SyncBatch) returns (SyncDiff)
+rpc StreamSyncChanges(SyncCheckpoint) returns (stream SyncEvent)
+```
+
+### Storage service
+
+```
+rpc StoreObject(StoredObject) returns (ObjectRef)
+rpc GetObject(ObjectRef) returns (stream ObjectChunk)
+rpc DeleteObject(ObjectRef) returns (Empty)
+rpc DedupCheck(Sha256) returns (ObjectRef|nil)
+```
+
+### Metadata service
+
+```
+rpc ResolvePath(Path) returns (File)
+rpc BatchGetFiles(RepeatedFileId) returns (RepeatedFile)
+rpc ApplyJournalEntry(JournalEntry) returns (Empty)
+rpc ReplayJournal(fromVersion, toVersion) returns (stream JournalEntry)
+```
+
+### Pub/Sub Events
+
+| Topic | Publisher | Consumers |
+|---|---|---|
+| file.created | Metadata service | Sync engine, Search index, Audit log |
+| file.updated | Metadata service | Sync engine, Search index |
+| file.deleted | Metadata service | Storage garbage collector |
+| file.shared | Share service | Notification service |
+| storage.written | Storage service | Audit log, Analytics, Notifications |

@@ -1,0 +1,10 @@
+---
+title: "Deep Dives"
+description: "Deep dive topics for ETA service and location sharing system design"
+---
+
+This system design has three key areas that benefit from deeper technical analysis:
+
+1. [GeoHash Driver Discovery](01-geohash-driver-discovery/) — How to efficiently find nearby available drivers at scale when a rider requests a ride.
+2. [ETA Computation at Scale](02-eta-computation/) — The algorithms, caching strategies, and traffic layer integration that make real-time ETA possible under strict latency SLAs.
+3. [GPS Quality Handling](03-gps-quality-handling/) — Techniques for filtering drift, detecting anomalies, and optimizing battery life while maintaining location accuracy.

@@ -1,0 +1,86 @@
+---
+title: Data Flow
+description: Sequence diagrams and logical data flow for a cloud file storage and sync service
+---
+
+## Sequence: File Upload
+
+1. **Client requests upload slot** (`POST /v1/files/upload`) with file metadata (name, size, SHA256).
+2. **Metadata service** checks storage service's `DedupCheck` with SHA256 — if hit, returns existing ObjectRef and skips steps 3–4.
+3. **If new content:** Metadata service returns a **pre-signed URL** to object storage (e.g., S3 multipart).
+4. **Client uploads content directly** to object storage via pre-signed URL.
+5. **Client confirms** upload completion (`PUT /v1/files/\{fileId\}`) with storage confirmation.
+6. **Metadata service** creates Version record, appends to SyncOperation journal.
+7. **Publish** `file.created` event to event bus; **Sync engine** pushes diff to connected devices.
+
+## Sequence: Sync Check (Pull + Real-time)
+
+- **Primary (real-time):** Sync engine maintains a WebSocket connection to each connected device. On journal append, it pushes `SyncEvent` directly to clients. This is the preferred path.
+- **Fallback (polling):** If WebSocket is unavailable or token is stale, client falls back to `POST /sync/check` with last-known sync token. Server returns diff from that token. Use this as a periodic backup (e.g., every 30s when on mobile networks).
+- **Upload push:** Client submits its own operations via `POST /sync/submit`. Server persists journal entry and broadcasts via SyncEngine gRPC stream.
+
+## Sequence: Sync Conflict Detection & Resolution
+
+1. **Server detects** conflicting state: client's base version ≠ server's current version.
+2. **Server returns** diff response with `conflict=true` flag and both versions' states (not an HTTP 409 — this is a protocol-level condition).
+3. **Client applies** conflict resolution strategy (see Deep Dives: Sync Algorithm).
+4. **Client retries** with resolved state and a new base version.
+
+## Sequence: File Deletion
+
+1. **Client requests** deletion (`DELETE /files/\{id\}`).
+2. **Metadata service** marks file as `deleted` status (grace period starts, 30 days).
+3. **Scheduled job** runs daily, finds files past grace period and deletes their object storage.
+4. **Storage GC** permanently removes unreferenced objects and version records.
+
+## Data Flow Diagram (Logical)
+
+```mermaid
+flowchart TB
+    subgraph Clients
+        A[Desktop App]
+        B[Mobile App]
+        C[Web Client]
+    end
+
+    subgraph Edge
+        D[(LB / CDN<br/>static assets)]
+        E[(API Gateway<br/>REST)]
+        F[(WebSocket<br/>sync)]
+    end
+
+    subgraph Services
+        G[Auth Service]
+        H[Metadata Service]
+        I[Share Service]
+        J[Search Service]
+        K[Sync Engine]
+        L[Storage Service]
+    end
+
+    subgraph Storage
+        M[(RDS<br/>User, Metadata)]
+        N[(Object Storage<br/>Files/Versions)]
+        O[(Cache<br/>Redis)]
+    end
+
+    subgraph EventBus
+        P[Event Bus<br/>Kafka-like]
+    end
+
+    A & B & C -->|HTTPS / WSS| D & E & F
+    E --> G
+    G -->|JWT| E
+    E --> H
+    E --> I
+    E --> J
+    H --> M
+    H --> O
+    K --> P
+    H --> P
+    I --> P
+    J --> P
+    P --> K
+    H --> L
+    L --> N
+    L --> M

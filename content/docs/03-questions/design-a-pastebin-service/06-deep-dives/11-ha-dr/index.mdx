@@ -1,0 +1,173 @@
+---
+title: HA/DR
+description: Deep dive into high availability and disaster recovery strategy.
+---
+
+### HA/DR
+
+#### Challenge
+
+Achieving 99.9% availability (~8.76 hours downtime/year) with multi-AZ deployment while ensuring data durability of 99.99%. Pastes must not be lost (content stored in object storage with 11-nines durability), and metadata must have an RPO of 1 minute. The system must tolerate single-AZ failures without data loss or extended outage.
+
+**Scale context**: At 1M writes/day and 100M reads/day, the system is small enough that a single region with multi-AZ redundancy is sufficient. Multi-region active-active is not required at this scale — it adds operational complexity (cross-region replication lag, split-brain risk, increased cost) disproportionate to the benefit. Multi-AZ within a single region meets the 99.9% target.
+
+#### Solution: Single-Region Multi-AZ with Automated Failover
+
+**1. Architecture**
+
+```
+                  ┌─────────────────────────────────┐
+                  │       Single Region (e.g., us-east-1)   │
+                  │                                       │
+  ┌───────────────┤── Multi-AZ Deployment                │
+  │               │                                       │
+  │    AZ-1       │          AZ-2        AZ-3             │
+  │  (Primary)    │        (Standby)     (Standby)        │
+  │               │                                       │
+  │  ┌─────────┐  │    ┌─────────┐    ┌─────────┐        │
+  │  │  API    │  │    │  API    │    │  API    │        │
+  │  │Service  │  │    │Service  │    │Service  │        │
+  │  └─────────┘  │    └─────────┘    └─────────┘        │
+  │       │       │         │              │              │
+  │  ┌─────────┐  │    ┌─────────┐    ┌─────────┐        │
+  │  │  Pg     │  │    │  Pg     │    │  Pg     │        │
+  │  │Primary  │──┼───▶│ Replica │◀───│ Replica │        │
+  │  └─────────┘  │    └─────────┘    └─────────┘        │
+  │       │       │         │              │              │
+  │  ┌─────────┐  │    ┌─────────┐    ┌─────────┐        │
+  │  │ Redis   │  │    │ Redis   │    │ Redis   │        │
+  │  │Primary  │──┼───▶│ Replica │◀───│ Replica │        │
+  │  └─────────┘  │    └─────────┘    └─────────┘        │
+  │               │                                       │
+  └───────────────┤── Object Storage (Cross-AZ, 11-nines) │
+                  │  (S3 replicates across AZs automatically) │
+                  └─────────────────────────────────────────┘
+```
+
+**2. Component HA Configuration**
+
+| Component | HA Strategy | RPO | RTO |
+|-----------|-------------|-----|-----|
+| Paste Service | Multi-AZ, 3+ instances (1 per AZ minimum) | 0 (stateless) | < 30s (auto-restart) |
+| PostgreSQL | 1 primary + 2 replicas across AZs; async streaming replication (sync optional for critical writes) | 1min (async) or 0 (sync) | 1–2s (automated failover) |
+| Redis | Cluster mode, 6 nodes across AZs (3 masters + 3 replicas, 1 master per AZ); replication factor 2 | < 5s (async) | < 10s (automated) |
+| Object Storage | Cross-AZ replication (S3 standard) | 0 | Provider-dependent |
+| CDN | Multi-PoP (global, managed by Cloudflare) | 0 | Automatic |
+
+**3. PostgreSQL Failover**
+
+```
+Primary (AZ-1) ──streaming replication──▶ Replica (AZ-2)
+                ──streaming replication──▶ Replica (AZ-3)
+
+Failure scenario:
+  1. Primary crashes in AZ-1
+  2. Patroni/etcd detects primary unavailable (health check failure)
+  3. Most recent replica is promoted: REPLICATE TO PRIMARY
+  4. PgBouncer connection pooler updates routing table
+  5. Applications reconnect via PgBouncer — transparent to Paste Service
+  6. Downtime: ~1–2 seconds (health check interval + promotion + reconnect)
+```
+
+- **Streaming replication**: Async by default (RPO up to 1 min, bounded by WAL flush lag). Synchronous replication (`synchronous_commit = on`, `synchronous_standby_names = 'replica1'`) reduces RPO to ~0 but adds replica ACK latency (~1–2ms per write). Use async for default; toggle sync for critical operations via session-level `synchronous_commit`.
+- **Patroni**: Distributed leader election using etcd/Consul. Handles automatic failover without manual intervention.
+- **PgBouncer**: Connection pooler with `pool_mode = transaction`. On primary failure, PgBouncer automatically routes to the promoted replica. Application-level reconnect uses exponential backoff (100ms → 1s max).
+
+**4. Redis Cluster HA**
+
+```
+Redis Cluster: 6 nodes, 3 masters + 3 replicas
+  Master-0 (AZ-1) ──replication──▶ Replica-0 (AZ-2)
+  Master-1 (AZ-2) ──replication──▶ Replica-1 (AZ-3)
+  Master-2 (AZ-3) ──replication──▶ Replica-2 (AZ-1)
+
+Failure scenario:
+  1. Master-0 crashes
+  2. Redis Cluster automatically promotes Replica-0
+  3. Keys that were on Master-0 before last sync are lost (RPO < 5s)
+  4. Applications reconnect transparently (Redis client with cluster mode)
+  5. Downtime: < 10 seconds
+```
+
+**Graceful degradation**: If Redis is partially unavailable (e.g., 2 masters down), the system falls back to direct DB reads. The Paste Service handles this gracefully — reads serve from DB + object storage, writes continue normally. Redis loss reduces cache hit rate, not availability.
+
+**5. Paste Service HA**
+
+- **Minimum 3 instances** (one per AZ) — horizontal scaling handles load, redundancy handles failure.
+- **Health checks**: `/health` (liveness) and `/ready` (readiness) probed by load balancer every 10 seconds.
+- **Auto-scaling**: Scale out when CPU > 70% or request queue > 100 per instance. Scale in when CPU < 20% for 5 minutes.
+- **Deployment**: Rolling updates with `maxSurge = 1`, `maxUnavailable = 0` — zero downtime during deployments.
+- **Stateless**: No local state that prevents migration between AZs. Redis/DB connections are external.
+
+**6. Object Storage Durability**
+
+S3 (or equivalent) provides 99.999999999% (11 nines) durability by default. This is achieved through:
+- **Cross-AZ replication**: Objects are replicated across at least 3 AZs automatically.
+- **Versioning**: Enabled to protect against accidental deletion or corruption.
+- **MFA Delete**: Optional — requires MFA to delete objects (adds friction to destructive operations).
+
+**7. Disaster Recovery Scenarios**
+
+| Scenario | Impact | Recovery | RTO |
+|----------|--------|----------|-----|
+| Single AZ failure | Paste Service loses instances in that AZ; DB/Redis lose 1 replica | Automatic failover to remaining replicas; new instances provisioned | < 2s (DB/Redis), < 30s (Service) |
+| Region-wide outage | Entire region unavailable | DNS failover to secondary region (if provisioned); otherwise accept downtime | 15–60 minutes (manual) |
+| Database corruption | Data inconsistency or loss | Point-in-time recovery (PITR) from WAL archive; restore to point before corruption | 30–60 minutes |
+| Object Storage corruption | Blob data loss | S3 versioning rollback; restore from backup | 1–4 hours |
+| CDN outage | All CDN-cached responses unavailable; all reads hit origin | Origin handles full load; scale Paste Service horizontally | Automatic (CDN reroutes) |
+| DDoS attack | Service degraded or unavailable | Cloudflare absorbs traffic; enable "Under Attack" mode; scale origin | < 5 minutes |
+
+**8. Multi-Region DR (Optional, Future)**
+
+At current scale, a single region with multi-AZ is sufficient. Multi-region DR is a future consideration:
+
+```
+Primary: us-east-1 (Active)
+DR: eu-west-1 (Passive — warm standby)
+
+Replication:
+  PostgreSQL: Logical replication (pg_logical) → async, RPO < 1 min
+  Redis: Redis cross-cluster replication → async, RPO < 5 min
+  Object Storage: S3 cross-region replication → async, RPO < 15 min
+  DNS: Route 53 health check → failover to DR region if primary unhealthy
+
+Failover process:
+  1. Monitor detects primary region down
+  2. Promote DR replicas to primary
+  3. Update DNS TTL → 30s for fast propagation
+  4. RTO: 5–15 minutes (automated)
+  5. RPO: < 5 minutes (replication lag)
+```
+
+This is **not implemented** at current scale. It adds ~2× infrastructure cost and operational complexity. It becomes justified when:
+- Revenue exceeds a threshold where downtime cost exceeds DR cost
+- SLA requirements exceed 99.9% (e.g., 99.95% or 99.99%)
+- Compliance requirements mandate cross-region data replication
+
+**9. Backup Strategy**
+
+| What | Frequency | Retention | Method |
+|------|-----------|-----------|--------|
+| PostgreSQL base backup | Daily | 7 days | `pg_basebackup` to S3 |
+| PostgreSQL WAL | Continuous | 7 days | WAL archiving to S3 |
+| Redis RDB snapshot | Every 5 minutes | 24 hours | S3 (via Redis Cluster snapshots) |
+| Paste blobs | Not backed up | N/A | S3 11-nines durability is sufficient |
+| Configuration | On change | Indefinite | Git version control |
+
+**Recovery procedures**:
+- **Single-row recovery**: Use `pg_dump` with filter to restore individual rows.
+- **Full table recovery**: PITR using WAL archive to restore to a point in time.
+- **Full DB recovery**: Restore base backup, replay WALs to target time.
+- **Redis recovery**: Restore latest RDB snapshot from S3.
+
+**10. HA Metrics**
+
+| Metric | Target | Measurement |
+|--------|--------|-------------|
+| Overall availability | 99.9% | Uptime monitor (external, multi-region) |
+| Read availability | 99.95% | HTTP 200 / total requests |
+| Write availability | 99.9% | HTTP 201 / total write requests |
+| RPO (content) | 0 | Object storage is immutable; no writes lost |
+| RPO (metadata) | 1 minute | WAL replication lag |
+| RTO (read) | < 5 minutes | Time from failure detection to read restoration |
+| RTO (write) | < 15 minutes | Time from failure detection to write restoration |

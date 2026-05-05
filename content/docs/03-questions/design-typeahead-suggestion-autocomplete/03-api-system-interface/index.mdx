@@ -1,0 +1,89 @@
+---
+title: API / System Interface
+description: API and system interfaces for typeahead/autocomplete system design
+---
+
+## REST/gRPC Endpoint
+
+### Suggest API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET/POST | `/api/suggest` | Get autocomplete suggestions (request/response) |
+| GET | `/api/suggest/stream` | Stream suggestions via SSE (mobile-optimized) |
+| gRPC | `SuggestService.Suggest` | Internal gRPC for inter-service calls |
+
+**Request parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `q` | String | Yes | User-typed prefix (1-50 chars) |
+| `limit` | Integer | No | Number of results (default 10, max 20) |
+| `session_id` | String | No | Session identifier |
+| `user_id` | String | No | Authenticated user ID |
+| `client_ip` | String | No | Client IP for rate limiting (populated by API Gateway) |
+| `location` | JSON | No | `\{lat, lng, country, region\}` |
+| `language` | String | No | BCP 47 tag |
+| `category_filter` | String[] | No | Limit to specific categories |
+| `context` | JSON | No | `\{history: [queries], device_type\}` |
+| `stream` | Boolean | No | If true, return SSE stream for progressive suggestions |
+
+**Response format (REST):**
+```json
+{
+  "suggestions": [
+    {
+      "term": "google maps",
+      "score": 98.5,
+      "category": "SEARCH",
+      "metadata": \{ "icon_url": "...", "entity_type": "product" \}
+    },
+    \{ "term": "google drive", "score": 95.2, "category": "PRODUCT", "metadata": {\} }
+  ],
+  "corrected_query": "google maps",
+  "latency_ms": 12
+}
+```
+
+**SSE Stream format (mobile-optimized, streaming as user types):**
+```
+event: suggestion
+data: \{"suggestions": [{"term": "google", "score": 99.1\}], "corrected_query": null, "stage": "prefix"}
+
+event: suggestion
+data: \{"suggestions": [{"term": "google maps", "score": 97.5\}], "corrected_query": null, "stage": "fuzzy"}
+
+event: done
+data: \{"suggestions": [], "corrected_query": null\}
+```
+
+## Rate Limiting
+
+| Tier | Limit | Mechanism |
+|------|-------|-----------|
+| Per-IP (anonymous) | 5 req/s sliding window | Token bucket in API Gateway (Redis-backed) |
+| Per-user (authenticated) | 20 req/s sliding window | Token bucket with user-level quota |
+| Burst allowance | 2x limit for 1s | Leaky bucket with 10-request burst buffer |
+
+- Rate limit is checked **before** any dictionary lookup to avoid wasted compute
+- Over-limit requests return `429 Too Many Requests` with `Retry-After` header
+- Rate limit state stored in Redis: `ratelimit:ip:\{hash\}` and `ratelimit:user:\{userId\}`
+
+## Internal Services
+
+| Service | Interface | Description |
+|---------|-----------|-------------|
+| Suggest API → Dictionary | gRPC `Suggest(prefix, limit) → [Result]` | Lookup matching terms by prefix |
+| Suggest API → Personalization | gRPC `Rank(query, context) → RankedResults` | Re-rank results using user context |
+| Suggest API → Trending | gRPC `GetTrending(time_window) → [Term]` | Fetch hot terms for current time window |
+| Dictionary → Fuzzy Matcher | gRPC `FuzzyMatch(input) → [CorrectedTerm]` | Spell-check/phonetic correction |
+| Admin Dashboard | REST | Manage term categories, boost/suppress terms |
+
+## Async Interfaces
+
+| Interface | Protocol | Description |
+|-----------|----------|-------------|
+| Client → Analytics | HTTP batch (fire-and-forget) | Log every autocomplete interaction |
+| Analytics → Kafka | Producer | Stream event log for aggregation |
+| Kafka → Trending Service | Consumer | Compute trending terms (velocity-based) |
+| Kafka → Dictionary Builder | Consumer | Aggregate query counts into new/updated PrefixEntries |
+| Dictionary Builder → Cache | gRPC batch update | Push updated prefix dictionary to cache layer |

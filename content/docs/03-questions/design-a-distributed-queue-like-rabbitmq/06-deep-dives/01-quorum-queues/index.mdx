@@ -1,0 +1,66 @@
+---
+title: Quorum Queues
+description: Raft state machine design, leader election, replication protocol, log compaction, and failure handling.
+---
+
+## Raft State Machine Design
+
+Each quorum queue is a Raft state machine.
+
+**State:** ordered log of message inserts, acks, nacks, dequeues.
+
+**Commands:** `Append(queue, message)` or `Remove(queue, delivery_tag)`
+
+**Log entry:** `\{index, term, command, timestamp\}`
+- command: `\{type: "publish", queue_id, message\}` or `\{type: "ack", queue_id, delivery_tag\}`
+
+**Leader:** handles all publish/consume operations; followers apply committed entries locally.
+
+## Leader Election
+
+- Initial election: first node declared as leader; subsequent use Raft timer
+- Election timeout: 3000ms ± random(0-500ms) jitter
+- On timeout: node increments term, votes for itself, sends RequestVote to all peers
+- Majority votes → becomes leader → sends no-op AppendEntries to establish authority
+- Leadership transfer: draining queues before shutdown; new leader within 3s
+- Split-brain: protected by Raft majority rule
+
+## Replication Protocol
+
+```
+Publisher → Leader → AppendEntries(log_entry) → Follower 1
+                                           → Follower 2
+Leader → basic.ack (after quorum commit)
+```
+
+1. Leader appends to local log
+2. Sends AppendEntries to all followers
+3. Follower replies OK/Abort
+4. ≥ 2 replicas (quorum for 3-node) → committed → applied to local queue → leader acks publisher
+5. In-flight messages lost on leader failover (publisher retries)
+6. Max in-flight bounded by append buffer size
+
+## Log Compaction (Snapshotting)
+
+- Snapshot every N entries (default: 10,000)
+- Snapshot: current queue state (all pending messages) + last log index
+- Follower catch-up: snapshot sent instead of replaying entire log
+- Size: proportional to pending messages (typically < 100MB for 10K messages × 1KB)
+
+## Failure Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Leader failure | Followers timeout → new election → uncommitted messages lost (publisher retries) |
+| Follower failure | Leader stops sending; messages queue in append buffer; recovers on reconnect |
+| Network partition | Minority cannot elect leader; writes blocked until heal |
+
+## Performance vs Classic Mirror
+
+| Metric | Classic Mirror | Quorum Queue |
+|--------|----------------|-------------|
+| Publish p50 | 0.5ms | 2ms |
+| Publish p99 | 5ms | 15ms |
+| Survive N-1 failures | N-1 (manual) | N-1 (auto heal) |
+| In-flight loss | Possible | Zero (commit before ack) |
+| Management | Manual policies | Automatic |

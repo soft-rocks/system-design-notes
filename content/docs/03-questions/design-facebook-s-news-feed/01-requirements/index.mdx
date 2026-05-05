@@ -1,0 +1,82 @@
+---
+title: "Requirements"
+description: "Functional and non-functional requirements for Facebook's News Feed system"
+---
+
+## Functional Requirements
+
+### Core Feed Rendering
+
+When a user opens Facebook, they see a ranked list of posts from their network — friends, followed pages, groups, and suggested content. The feed is **generated on-demand** when the user opens the app or refreshes the page, not pre-computed.
+
+The feed shows posts of various types:
+- **Text posts** with reactions (like, love, haha, wow, sad, angry)
+- **Photo posts** with comments and shares
+- **Video posts** (including short-form / Reels)
+- **Link posts** with preview thumbnails
+- **Stories** (ephemeral 24-hour content)
+- **Reactions** (when a friend reacts to your post)
+- **Comments** (when a friend comments on your post)
+
+### Ranking
+
+Posts are ranked by **relevance**, not by recency. A highly relevant post from 3 days ago appears before an irrelevant post from 1 minute ago.
+
+The ranking system uses **hundreds of features** across these categories:
+- **User-post affinity**: How likely is this user to engage with this type of content from this author?
+- **Author relationship**: How close is the social relationship? (friends > followers > strangers)
+- **Post type preference**: Does the user prefer videos over photos? Links over text?
+- **Engagement signals**: This post's likes, comments, shares velocity in the first hour.
+- **Time decay**: Newer posts get a freshness boost, but it's weighted against relevance.
+- **Diversity**: Limit the number of posts from the same author, same content type, same page.
+
+### Pagination
+
+The feed supports **infinite scroll** with cursor-based pagination. Each page request includes a cursor to the last seen post. The feed is always 20–30 items per request.
+
+### Real-time Updates
+
+- New posts from close friends should appear in the feed within **seconds**.
+- Reactions, comments, and share counts on feed posts update **without a page refresh**.
+- The system uses a combination of **server-sent events** and **polling** for live updates.
+
+### Diversity & User Controls
+
+- **"Most Recent" toggle**: Users can switch to chronological ordering.
+- **"Unfollow" / "Snooze"**: Users can hide posts from specific friends or pages for 30 days or permanently.
+- **Diversity constraints**: No more than 2–3 posts from the same author in a row; mix of content types.
+- **Sensitive content filtering**: Users can adjust privacy settings to limit NSFW or controversial content.
+
+## Non-Functional Requirements
+
+| Requirement | Target |
+| --- | --- |
+| Read-heavy workload | ~10B feed renders/day vs ~200M posts/day (50:1 read-write ratio) |
+| Feed render latency | < 1 second p99 end-to-end |
+| Feed freshness | 95% of users see posts from the last 24 hours |
+| Availability | > 99.9% during peak usage |
+| Real-time delivery | New posts appear within 10 seconds |
+
+## Scale Assumptions
+
+| Metric | Value |
+| --- | --- |
+| MAU | 1B+ |
+| Concurrent users (peak) | ~500M |
+| Posts/day | ~200M (text, photo, video, link, reaction, story) |
+| Feed renders/day | ~10B (each user opens ~10 times) |
+| Feed items per render | 20–30 (infinite scroll) |
+| Average friends per user | ~500 |
+| Average page follows per user | ~200 |
+| Peak feed renders/sec | ~10K |
+
+## Why This Is Hard
+
+The core challenge is the **50:1 read-write ratio**. For every post created, ~50 people generate a feed page that includes it. This means:
+
+1. **Fan-out is the bottleneck**: If every post needs to be written to ~500 friends' feeds at publish time, that's 100B fan-out writes/day — impossible to do fully eagerly.
+2. **Ranking is expensive**: Each feed render requires evaluating hundreds of posts against hundreds of features per user.
+3. **Scale of the candidate pool**: Each user's friend graph yields ~700 candidate posts/day. Ranking ~700 candidates per feed render, for 10B renders/day, is ~7 trillion ranking evaluations.
+4. **Personalization at scale**: Every user has a different ranking model. You can't pre-compute feeds because there are too many users, each with different preferences.
+
+The solution must balance: **speed** (sub-second renders), **relevance** (personalized ranking), and **scale** (billions of events/day).

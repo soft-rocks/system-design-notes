@@ -1,0 +1,71 @@
+---
+title: Recommendation System
+description: Deep dive into recommendation system architecture
+---
+
+## Two-Stage Retrieval Architecture
+
+**The core challenge**: Search through 100M+ videos and return the top 10 personalized recommendations in &lt;100ms. No single model can do this efficiently.
+
+**Two-stage funnel:**
+```
+Stage 1 — Retrieval (Recall):  100M videos → 1,000 candidates → 100 shortlist
+Stage 2 — Ranking (Precision): 100 shortlist → scored → top 10
+```
+
+**Stage 1: Retrieval (batch, runs nightly)**
+- Trained on 90-day historical user behavior (implicit: watch time, likes, shares; explicit: likes/dislikes)
+- Uses a two-tower neural network: user tower + item tower, trained with negative sampling
+- Produces per-user candidate embeddings → ANN search (Faiss/Annoy) over video embeddings to get top 1,000
+- Output: stored in Redis as `user:\{id\}:candidates` (sorted set, TTL = 24h)
+
+**Stage 2: Ranking (online, per-request)**
+- Takes the 100 shortlist from Redis
+- Features: user features, item features, cross features
+- Gradient boosted tree model (LightGBM) for interpretability and fast inference
+- Output: top 10 scored recommendations returned to client
+
+**Why two-stage?**
+- End-to-end scoring of 100M videos with a deep model → seconds of latency (unacceptable)
+- ANN retrieval → 10ms; ranking 100 items → ~50ms; total &lt;100ms
+- Trade-off: recall rate vs precision. 1,000 candidate pool achieves ~85% recall of optimal ranking.
+
+## Feature Engineering
+
+**Feature categories:**
+
+| Category | Examples | Source |
+|----------|----------|--------|
+| User profile | Age range, country, device type, language | User DB |
+| User behavior | Watch time distribution, session length, bounce rate | Analytics events |
+| Item content | Video title embedding (BERT), category, duration bucket, upload recency | Video metadata |
+| Context | Time of day, day of week, network type (WiFi/cellular) | Client request |
+| Cross features | User-channel affinity, user-tag affinity | Computed offline |
+
+**Real-time features (computed at serving time):**
+- `last_n_watched`: last 5 video IDs watched in this session
+- `current_session_watched_categories`: category distribution in current session
+- `recent_bounce_rate`: fraction of videos watched &lt;10s in last 50 videos
+
+**Feature storage:**
+- Offline features: BigQuery (batch computed, daily refresh)
+- Online features: Redis (sub-millisecond reads, updated via streaming pipeline)
+- Feature consistency: both training and serving read from the same feature store (Feast) to prevent training/serving skew
+
+## Real-time Personalization
+
+**Session-based personalization (sub-30s freshness):**
+- Client sends last 5 watched video IDs with each recommendation request
+- Serving layer computes session embedding on-the-fly from those IDs
+- Session embedding shifts the ANN retrieval toward recent interests
+
+**Streaming feature updates:**
+- Every LIKE/VIEW event → Kafka → Flink → Redis (update user feature vector)
+- Update latency: &lt;30 seconds from event to feature availability
+- Cold start handling: new users get trending/popular content; new videos get boost in recommendations for similar past viewers
+
+**A/B testing framework:**
+- 7 default buckets: control + 6 experimental variants
+- User-to-bucket mapping stored in Redis (sticky sessions)
+- Metrics tracked per bucket: CTR, avg watch time, session length, subscription conversion
+- Statistical significance: Bayesian posterior with weekly check (better than p-value for continuous deployment)

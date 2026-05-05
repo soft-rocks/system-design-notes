@@ -1,0 +1,324 @@
+---
+title: "Deep Dive: Alert Evaluation"
+description: "Poll-based rule evaluation, deduplication, and alert dispatching"
+---
+
+## Poll-Based Evaluation Model
+
+We chose a poll-based evaluation model over a complex streaming rule engine because it is simpler, more debuggable, and sufficiently performant for the scale of alert rules.
+
+### Evaluation Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 Alert Evaluator (Go)                         │
+│                                                              │
+│  Scheduler: ticker every 30 seconds                          │
+│                                                              │
+│  Round 1: For each enabled rule (N rules)                   │
+│    1. Parse query string → identify metric + labels          │
+│    2. Execute query against Query Service                    │
+│    3. Get current metric values for all matching series      │
+│    4. Check threshold condition                              │
+│    5. Update AlertState based on `for_duration`              │
+│                                                              │
+│  Round 2: For each state change                             │
+│    1. Apply deduplication / suppression logic                │
+│    2. Fire dispatch if transitioning to `firing`             │
+│    3. Clear dispatch if transitioning to `resolved`          │
+│                                                              │
+│  Concurrency:                                                │
+│  • Goroutines per rule: 1 per unique metric name             │
+│  • Goroutines per metric: 1 per shard (fan-out)              │
+│  • Max concurrent goroutines: ~500 (rule count × shard fan-out) │
+│  • Overall timeout: 25 seconds (leaving 5s margin before 30s) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### State Machine
+
+```
+                    ┌──────────┐
+                    │  idle    │  Rule exists, never fired
+                    └────┬─────┘
+                         │ threshold exceeded
+                         ▼
+                  ┌──────────┐
+              ┌───│ pending  │───┐
+              │   └────┬─────┘   │ for_duration elapsed
+              │        │         │
+              │        │ threshold drops below      │ threshold drops below
+              │        ▼         │                  ▼
+              │   ┌──────────┐   │           ┌──────────┐
+              └───│  firing  │───┘           │  pending  │
+              │   └────┬─────┘               └──────────┘
+              │        │ threshold drops below
+              │        ▼
+              │   ┌──────────┐
+              └───│ resolved │───┐
+                  └──────────┘   │
+                   (after ack or silence period)
+                         │
+                         ▼
+                    ┌──────────┐
+                    │  idle    │
+                    └──────────┘
+```
+
+**Design decision: `idle` instead of `no_data`.** If a series stops sending metrics, the rule simply evaluates to "no data matching the query." We don't enter a `no_data` state because silent servers are rare compared to threshold violations, and the alert noise would be excessive.
+
+### Query Execution for Alert Evaluation
+
+```go
+func evaluateRule(rule AlertRule) ([]AlertStateChange, error) {
+    // 1. Execute query (reuse cached Query Service)
+    result, err := queryService.query(rule.Query, time.Now(), time.Now(), 10*time.Second)
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. Evaluate threshold for each series
+    var changes []AlertStateChange
+    for _, series := range result.Series {
+        current := isFiring(series, rule.Threshold)
+
+        // 3. Load persisted state
+        state := alertStateStore.get(rule.ID, series.Key)
+
+        // 4. Transition logic
+        if current && !state.IsFiring() {
+            // Threshold just exceeded
+            if state.EvalSince == nil || time.Since(*state.EvalSince) > rule.ForDuration {
+                state.EvalSince = &now
+                changes = append(changes, AlertStateChange{
+                    RuleID: rule.ID,
+                    SeriesKey: series.Key,
+                    NewState: "firing",
+                    Timestamp: now,
+                })
+            }
+        } else if !current && state.IsFiring() {
+            // Threshold recovered
+            changes = append(changes, AlertStateChange{
+                RuleID: rule.ID,
+                SeriesKey: series.Key,
+                NewState: "resolved",
+                Timestamp: now,
+            })
+        }
+    }
+    return changes, nil
+}
+```
+
+**Performance characteristics:**
+- 1,000 rules × 1 query per rule = 1,000 Query Service calls per evaluation round
+- Each query takes ~100ms (cached) → 100 seconds sequentially
+- Parallelized across goroutines → ~5–10 seconds total (limited by concurrent Query Service capacity)
+- With 5s margin before the 30s tick, we need to keep parallelism within Query Service rate limits
+
+## Alert Deduplication and Suppression
+
+Without deduplication, a firing alert would generate a notification every 30 seconds (the evaluation interval). Deduplication prevents this.
+
+### Deduplication Rules
+
+| Scenario | Behavior |
+| --- | --- |
+| Same alert re-evaluates as firing | No new notification (already firing) |
+| Alert fires, resolves, fires again | New notification (full cycle completed) |
+| Multiple series match same rule | One notification per series |
+| Alert is acknowledged by operator | Enters `ack` state; suppresses further notifications for 4 hours |
+
+### Suppression Mechanisms
+
+**Maintenance windows:**
+
+```
+POST /api/v1/alert/suppressions
+{
+  "scope": {
+    "metric": "cpu_usage",
+    "labels": \{"service": "api", "region": "us-west-2"\}
+  },
+  "reason": "Planned deployment window",
+  "start": "2024-05-03T02:00:00Z",
+  "end": "2024-05-03T04:00:00Z"
+}
+```
+
+During a suppression window, alerts matching the scope are silently dropped — they transition to `firing` internally but no notification is dispatched.
+
+**Flapping detection:**
+
+```
+Flap condition:
+  If an alert fires and resolves more than 5 times in 1 hour
+  → Mark as "flapping"
+  → Reduce notification frequency: one notification per hour instead of per firing
+  → After 2 hours without fire, reset flap count
+```
+
+**Global silence:**
+
+```
+POST /api/v1/alert/global-silence
+{
+  "reason": "Incident investigation in progress",
+  "duration": "30m"
+}
+```
+
+Global silence suppresses all non-critical alerts. Critical alerts (severity=critical) are excluded from global silence.
+
+### Notification Deduplication via Redis
+
+```
+Key: alert:dedup:\{rule_id\}:\{series_key\}:\{hash(state+threshold_value)\}
+TTL: 300 seconds (5 minutes)
+Operation: SETNX
+
+On evaluation:
+  if redis.setnx(dedup_key, 1, expire=300) == true:
+    // First time seeing this exact state in 5 minutes → dispatch
+    dispatch_alert(state_change)
+  else:
+    // Duplicate state within 5-minute window → suppress
+    log("alert dedup suppressed", dedup_key)
+```
+
+The hash includes both the alert state and the current threshold value. If the threshold changes between evaluations, the hash changes and a new notification is sent.
+
+## Alert Dispatching
+
+Once an alert passes dedup and suppression checks, it is dispatched to configured notification channels.
+
+### Dispatcher Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                Alert Dispatcher                              │
+│                                                              │
+│  Queue: in-memory ring buffer (10,000 entries)               │
+│  Workers: 10 goroutines pulling from queue                   │
+│  Retry: exponential backoff (1m, 5m, 15m)                    │
+│  Dead letter: entries failing all retries → alert_dlq topic  │
+│                                                              │
+│  Channels:                                                   │
+│  ├─ Webhook: POST with JSON payload                          │
+│  ├─ PagerDuty: REST API v2                                   │
+│  ├─ Slack: Incoming webhook                                  │
+│  └─ Email: SMTP with HTML template                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Notification Payload
+
+```json
+{
+  "alert_name": "High CPU Usage",
+  "state": "firing",
+  "rule_id": "abc-123",
+  "series": {
+    "host": "web-01",
+    "service": "api",
+    "region": "us-east-1"
+  },
+  "current_value": 94.7,
+  "threshold": 90,
+  "duration": "5m32s",
+  "severity": "critical",
+  "summary": "CPU at 94.7% on web-01 for 5m32s (threshold: 90%)",
+  "runbook_url": "https://wiki.internal/runbooks/high-cpu",
+  "evaluated_at": "2024-05-03T12:00:30Z"
+}
+```
+
+### Channel-Specific Behavior
+
+| Channel | Latency | Reliability | Use Case |
+| --- | --- | --- | --- |
+| Webhook | ~100ms | Best-effort, 3 retries | CI/CD pipelines, custom integrations |
+| PagerDuty | ~200ms | Guaranteed (with incident lifecycle) | On-call engineer escalation |
+| Slack | ~100ms | Best-effort, 3 retries | Team notification, non-critical alerts |
+| Email | ~1s | Best-effort, 3 retries | Audit trail, summary digests |
+
+### Webhook Signature (Security)
+
+```
+POST /webhook
+Headers:
+  X-Alert-Signature: sha256=abc123...
+
+Signature = HMAC-SHA256(secret_key, payload_body)
+```
+
+Every webhook recipient provides a secret key. The dispatcher signs each payload with HMAC-SHA256. Recipients verify the signature before processing.
+
+### PagerDuty Integration
+
+```
+POST https://events.pagerduty.com/v2/enqueue
+{
+  "routing_key": "pagerduty-service-key",
+  "event_action": "trigger",
+  "payload": {
+    "summary": "\&#123;&#123; alert.summary \\&#125;&#125; ",
+    "source": "\&#123;&#123; alert.series.host \\&#125;&#125; ",
+    "severity": "\&#123;&#123; alert.severity \\&#125;&#125; ",
+    "custom_details": {
+      "rule_id": "\&#123;&#123; alert.rule_id \\&#125;&#125; ",
+      "current_value": "\&#123;&#123; alert.current_value \\&#125;&#125; ",
+      "threshold": "\&#123;&#123; alert.threshold \\&#125;&#125; ",
+      "runbook_url": "\&#123;&#123; alert.runbook_url \\&#125;&#125; "
+    }
+  }
+}
+```
+
+When the alert resolves:
+
+```
+event_action: "resolve"
+```
+
+PagerDuty automatically links resolve events to trigger events via the same `routing_key` and `source` fields.
+
+### Escalation Policy
+
+```
+Severity → Escalation:
+
+critical:
+  Level 1: PagerDuty + Slack (immediate)
+  Level 2 (15min): If unacknowledged, escalate to team lead
+  Level 3 (30min): If still unacknowledged, escalate to director
+
+warning:
+  Level 1: Slack (immediate)
+  Level 2 (1h): If unacknowledged, escalate to Slack @channel
+
+info:
+  Level 1: Slack digest (hourly summary)
+  No escalation
+```
+
+### Evaluation Cycle Summary
+
+```
+Every 30 seconds:
+  1. Load all enabled rules from storage
+  2. For each rule, execute query in parallel (goroutines)
+  3. For each query result, evaluate threshold
+  4. Update AlertState in persistent storage (batched writes)
+  5. Apply dedup and suppression filters
+  6. Queue state changes to dispatcher
+  7. Dispatchers fire notifications to configured channels
+  8. Record evaluation metrics:
+     - alert_eval_duration_seconds (p50, p95, p99)
+     - alert_rules_evaluated_total
+     - alert_firings_total (by severity)
+     - alert_dispatch_failures_total (by channel)
+```
+
+This model is simple enough to deploy and debug, yet handles the expected scale. For 1,000 rules with ~100ms average query time, the full evaluation cycle completes in ~5–10 seconds, well within the 30-second tick budget.

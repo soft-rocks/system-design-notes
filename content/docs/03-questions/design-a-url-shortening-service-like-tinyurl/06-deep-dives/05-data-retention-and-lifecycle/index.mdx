@@ -1,0 +1,73 @@
+---
+title: Data Retention & Lifecycle
+description: Tiered retention policy for active, expired, and deleted URLs; partitioned cleanup; storage cost optimization
+---
+
+### Data Retention & Lifecycle
+
+#### Challenge
+
+Managing storage cost for billions of rows, including expired, deleted, and inactive links. The core tradeoff: retention duration vs storage cost vs queryability.
+
+#### Solution: Tiered Retention Policy
+
+1. **Active URLs**: Retained indefinitely in hot storage (PostgreSQL/MySQL on SSD). This is the primary table that serves redirects.
+2. **Expired URLs**: Stay in hot storage for 30 days after expiration — allows analytics queries on recently expired links. Then moved to cold storage.
+3. **Deleted URLs**: Mark as `status = 'deleted'`, retain for 30 days (extended from 7 for enterprise SLA compliance), then purge. Deleted URLs are still counted in analytics for the retention window.
+4. **Analytics data**: Raw click events in ClickHouse for 90 days, then aggregated into hourly rollups (retained 1 year), then daily rollups (retained 3 years).
+
+**Storage estimation** (at 50M inserts/day, 18.25B/year):
+- URL mapping row: ~200 bytes average (TOAST-compressed original_url ~100B + short_code 8B + metadata 50B + index overhead; URL column stored compressed in-page)
+- 18.25B rows/year × 200B = ~3.65 TB/year raw
+- With 3× replication: ~11 TB/year
+- After 3 years active retention: ~33 TB in hot storage (sharded across 10 nodes = ~3.3 TB/shard)
+- Cold storage (S3 Standard-IA): ~30% of hot cost; older partitions moved progressively
+
+**Why the math matters:** At scale, storage is not the bottleneck — it's the *index size* and *checkpoint frequency*. Larger tables = larger WAL, slower VACUUM (PostgreSQL), more expensive backups. The retention policy directly impacts DB performance, not just disk bills.
+
+#### Partitioning Strategy
+
+```sql
+-- Partition by created_at (monthly range partitions)
+CREATE TABLE url_mappings (
+    id BIGSERIAL,
+    short_code CHAR(8) NOT NULL,
+    original_url TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    PRIMARY KEY (short_code, created_at)  -- composite PK matches partition key
+) PARTITION BY RANGE (created_at);
+
+-- Create monthly partitions
+CREATE TABLE url_mappings_2024_01 PARTITION OF url_mappings
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+```
+
+- **Why monthly (not daily):** Monthly balances partition count (12/month × 3 years = 360 partitions) with granularity. Daily partitions would create 1095 partitions in 3 years — manageable but adds planner overhead.
+- **Why RANGE (not LIST/HASH):** Lifecycle management is time-based (drop old data). RANGE allows efficient `DROP PARTITION` which is an O(1) metadata operation vs. row-by-row DELETE.
+- **Primary key on partitioned table:** `short_code` alone cannot be the PK when partitioning by `created_at` (partition key must be part of PK). Use `(short_code, created_at)` — but note that this means a point lookup by `short_code` alone must fan out to all partitions (partition pruning cannot apply). For true single-partition point lookups, short_code must be first in the partition key, which requires `PARTITION BY RANGE (short_code)` — but that breaks time-based lifecycle management. **Tradeoff:** accept the fan-out for `short_code` lookups (acceptable since Redis caches most hot paths) or use a non-partitioned primary index on `short_code` alongside the time-partitioned table for analytics.
+
+#### Lifecycle Operations
+
+```sql
+-- 1. Migrate expired URLs to cold storage (run weekly per partition)
+INSERT INTO url_mappings_cold_storage
+SELECT * FROM url_mappings_2024_01
+WHERE expires_at < NOW() - INTERVAL '30 days'
+  AND expires_at IS NOT NULL;
+
+-- 2. Remove from hot storage via partition drop (O(1) metadata operation — preferred over DELETE)
+ALTER TABLE url_mappings DROP PARTITION url_mappings_2024_01;
+-- Or per-partition DELETE if using range subqueries (avoids full-table scan):
+DELETE FROM url_mappings_2024_01
+WHERE expires_at < NOW() - INTERVAL '30 days'
+  AND expires_at IS NOT NULL;
+
+-- 3. Delete old partitions (O(1) operation)
+ALTER TABLE url_mappings DROP PARTITION url_mappings_2024_01;
+```
+
+- **Cold storage schema**: Same structure but without indexes (only used for batch analytics, not lookups)
+- **Important:** After migration, short codes become **unavailable for reuse** until the cold storage retention period ends. This is usually fine — most URL shorteners never reuse short codes to maintain link stability.
+

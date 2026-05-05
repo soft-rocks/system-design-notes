@@ -1,0 +1,113 @@
+---
+title: Radix Tree / Trie Data Structure
+description: Deep dive into the Radix Tree (Patricia Trie) data structure with top-k precomputation for typeahead
+---
+
+## Why Radix Tree Over Alternatives?
+
+| Structure | Lookup | Memory | Fuzzy Support | Post-processing |
+|-----------|--------|--------|---------------|-----------------|
+| Standard Trie (256-way) | O(k) | ~2TB for 1B nodes | No | None (clean) |
+| Radix Tree (Patricia Trie) | O(k) | ~63GB after compression | Limited | Minimal |
+| Inverted Index | O(m log n) | ~50GB | Yes (built-in) | List intersection + scoring |
+| Elasticsearch | O(m + n) | ~200GB (disk-backed) | Yes | Serialization + network |
+
+**Why Radix Tree wins for typeahead:**
+- O(k) lookup with no post-processing — single tree descent gives both matching terms and pre-computed top-k
+- In-memory, cache-friendly sequential access — sub-millisecond for queries up to 5 characters
+- No network hop to a search engine — eliminates the 5-10ms latency of Elasticsearch
+
+**Trade-off**: Standard trie with 256-way branching is too memory-heavy (2KB per node × 1B nodes = 2TB). Radix tree collapses single-child chains into labeled edges, reducing node count by ~70%.
+
+## Radix Tree Structure
+
+```
+Node {
+    edgeLabel:   bytes       // multi-character edge (e.g., "oogle")
+    children:    map[bytes]*Node  // edgeLabel → child (sparse, not array)
+    topK:        [Entry]     // pre-computed top-k terms in this subtree
+    hasWord:     bool        // is a complete term ending here?
+    score:       float       // score of the term at this node (if hasWord)
+}
+```
+
+**Key difference from standard trie:** edges carry multi-character labels. "google maps" and "google docs" share the edge "gle" → then diverge. This avoids creating a chain of single-character nodes.
+
+### Node Layout (packed for cache efficiency)
+
+```
++---------------+---------------+------------------+---------------+
+| edgeLabel     | children ptr  | topK (up to 50)  | hasWord + score |
+| (avg 10 bytes) | (4 bytes)    | (50 × 12 bytes)   | (1 byte + 4B)  |
++---------------+---------------+------------------+---------------+
+= ~650 bytes per node
+```
+
+## Top-K Precomputation
+
+**Principle**: Pre-compute top-k at every node during dictionary build. Query = single trie descent, no scoring, no post-processing.
+
+- Each node stores a sorted array of its top-k (k=50) terms from the subtree
+- Updated during dictionary build: bottom-up merge of children's top-k + local terms
+- Use a min-heap of size k during merge to maintain sorted order in O(n) time
+- Query latency: O(k) tree descent = ~5µs for 5-character queries
+
+### Merge Algorithm (during dictionary build)
+
+```
+function mergeTopK(node):
+    // Collect candidates from children's pre-computed top-k
+    candidates = []
+    for child in node.children:
+        candidates += child.topK
+
+    // Add local term if this node is a word boundary
+    if node.hasWord:
+        candidates.append((node.term, node.score))
+
+    // Keep top-k by score
+    node.topK = min_heap_pop(candidates, k=50)
+```
+
+## Memory Analysis
+
+| Component | Calculation | Size per Shard |
+|-----------|-------------|----------------|
+| Node overhead (metadata, pointers) | 300M nodes × 50B | 15 GB |
+| Edge labels (avg 10 bytes) | 300M × 10B | 3 GB |
+| Top-k results (k=50) | 300M × 50 × 12B | 180 GB |
+| Term data (stored at word boundaries) | ~1B terms × 30B | 30 GB |
+| **Total raw** | | **~228 GB** |
+| **With RocksDB overhead (20%)** | | **~275 GB** |
+
+This means ~32 shards × 4 replicas = 128 nodes total. At ~78K QPS per node (10M QPS / 128), each node has comfortable headroom (~100K ops/sec).
+
+## Persistence: Save/Restore on Restart
+
+The radix tree lives in memory for speed, but must be persisted for crash recovery.
+
+**Approach: Snapshot + Delta**
+
+1. **Periodic snapshot** (every 30 minutes): serialize the entire tree to an S3-compatible blob store via RocksDB RDB snapshot. The snapshot is a flat key-value store: `node_id → packed_bytes`.
+
+2. **Delta log** (continuous): after each dictionary build cycle (5 minutes), only write the changed nodes to a write-ahead log (WAL). This is an LSM-tree append operation — O(log N) per write.
+
+3. **Restore procedure**:
+   - Load latest snapshot (parallel: 8 workers, ~60 seconds for 275GB)
+   - Replay delta log (WAL replay: ~10 seconds for 5 minutes of changes)
+   - Total restore time: ~70 seconds
+
+**Why not persist the tree directly?** A radix tree's pointer-based structure doesn't serialize well to disk. RocksDB's LSM-tree is better suited for bulk key-value writes. The in-memory tree is rebuilt from the KV store on startup.
+
+## Query Walkthrough
+
+```
+Query: "goo"
+
+Descent:
+1. Root → edge "g" → node "g" (top-k: google, github, gmail, ...)
+2. "g" → edge "oo" → node "goo" (top-k: google, google maps, google drive, ...)
+3. Result: return node.goo.topK[0:10]
+
+Time: O(3) = 3 edge comparisons + array access ≈ 5µs
+```

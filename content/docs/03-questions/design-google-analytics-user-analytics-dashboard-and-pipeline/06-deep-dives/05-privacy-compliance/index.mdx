@@ -1,0 +1,61 @@
+---
+title: Privacy & Compliance
+description: Data anonymization, retention, consent, audit logging, and data residency.
+---
+
+## Data Anonymization
+
+**IP masking:** SHA-256 hash before storage — irreversible, consistent per IP per property.
+
+```
+masked_ip = SHA-256(property_salt + ip_address)
+```
+
+- Salt rotated annually; old salt kept for 1 year during transition
+- Hash is consistent within a rotation cycle for reporting continuity
+
+**PII filtering:** User-configured filters exclude sensitive parameters.
+
+- **Regex-based:** `exclude_parameter: "email.*"`
+- **Blocklist:** Known PII parameter names (email, phone, name, address) are filtered by default in consent mode
+
+**User-level data deletion:** `user_id` and `user_properties` purged within 90 days of deletion request via progressive cleanup.
+
+## Data Retention
+
+**Configurable retention:** 2 months, 14 months (GA4), or indefinite (GA4 360).
+
+**Enforcement flow:**
+
+```
+Daily cron → Scan user_properties table → Mark entries > retention as tombstone → Compact on next flush
+```
+
+**Raw event expiration:** Bigtable entries deleted after retention period. BigQuery managed via partition expiration:
+
+```sql
+ALTER TABLE dataset.events_20260501 SET OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 14 MONTH))
+```
+
+## Consent & Compliance
+
+| Regulation | Mechanism |
+|-----------|-----------|
+| **GDPR** | Consent mode — events blocked until consent given; `consent` parameter in payload |
+| **CCPA** | "Do not sell" signal propagated via cookie; anonymous-only mode |
+| **DPAA** | US government data stored only in US regions |
+| **Right to be forgotten** | `DELETE /v1/properties/\{property\}/users/\{user_id\}:delete` — 90-day SLA |
+
+## Audit & Logging
+
+- **Admin API calls:** All logged to Cloud Audit Logs
+- **Data access:** Export queries logged with user identity, date range, estimated byte count
+- **Retention changes:** Logged as admin events with before/after values
+
+## Data Residency
+
+**Region assignment:** Property owner selects data processing region during creation (US, EU, or APAC).
+
+- Events collected in region X are processed **only** in region X
+- DNS resolves to nearest edge node; traffic redirected to correct region for processing
+- GCS export buckets are location-locked to processing region

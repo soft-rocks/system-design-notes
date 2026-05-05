@@ -1,0 +1,173 @@
+---
+title: "Viral Spike Handling"
+description: "Strategies for handling sudden 10x–100x increases in share rate due to viral articles"
+---
+
+## The Viral Spike Problem
+
+When an article goes viral (Breaking News, celebrity tweet, major event), share rate can jump from 100/sec to 10,000+/sec for that article alone. This creates three problems:
+
+1. **Consumer lag**: Kafka consumers can't keep up with the burst, aggregation falls behind real-time.
+2. **Redis hotspot**: All events for the same article go to the same Redis shard (if partitioned by article_id), causing a single-shard bottleneck.
+3. **Query amplification**: Users flock to the same trending topics, creating a query hotspot that compounds the ingestion load.
+
+## Detecting Viral Events
+
+```python
+# Running statistical monitor per article_id (updated per bucket)
+class ViralDetector:
+    def __init__(self, threshold=10x, window=10s):
+        self.threshold = threshold
+        self.baseline_window = 60 * 6  # 10 minutes of buckets
+
+    def check(self, article_id, current_count, historical_counts):
+        """
+        current_count: shares in the last 10-second bucket
+        historical_counts: list of previous 60 bucket counts
+        """
+        baseline = median(historical_counts[-self.baseline_window:])
+        if baseline == 0:
+            baseline = 1  # avoid division by zero
+
+        spike_ratio = current_count / baseline
+        if spike_ratio &gt;= self.threshold:
+            return ViralEvent(article_id, spike_ratio, current_count)
+        return None
+```
+
+**Key design**: Use **median** not mean for baseline. Mean is skewed by the current spike itself. Median is robust.
+
+**Configuration**:
+| Scenario | Spike Threshold | Detection Window | Action |
+| --- | --- | --- | --- |
+| Early warning | 5x | 10 seconds | Log, prepare auto-scaling |
+| Confirmed viral | 10x | 20 seconds | Activate backpressure, pre-warm cache |
+| Extreme viral | 50x | 10 seconds | Emergency query rate limiting |
+
+## Backpressure at Ingestion
+
+When consumers fall behind, the ingestion queue depth increases. We need to apply backpressure upstream:
+
+```
+┌───────────────────────────────────────────────────┐
+│              Ingestion Gateway                     │
+│                                                    │
+│  Queue depth > 100K:                               │
+│    1. Reject new non-critical events with 429      │
+│    2. Prioritize events from high-trust sources    │
+│    3. Batch more aggressively (larger flush size)  │
+│                                                    │
+│  Queue depth > 500K:                               │
+│    1. Reject all events with 503                   │
+│    2. Trigger emergency scaling (add consumers)    │
+│    3. Drop low-priority metadata fields            │
+└───────────────────────────────────────────────────┘
+```
+
+**Event priority scheme**:
+
+| Priority | Source | Behavior |
+| --- | --- | --- |
+| P0 | Direct SDK (our platform) | Always accepted, no batching delay |
+| P1 | Verified webhook partners | Accepted with 5s batching window |
+| P2 | General SDK events | Accepted with 10s batching window |
+| P3 | Bulk webhook (social APIs) | May be throttled during backpressure |
+
+## Graceful Degradation
+
+When the system is under stress, we degrade in this order:
+
+```
+Level 1 (Queue > 100K):    Reduce query cache TTL from 5s → 2s
+Level 2 (Queue > 500K):    Reduce query precision: only 5m and 24h windows, skip 1hr
+Level 3 (Queue > 1M):      Serve cached results only (no real-time computation)
+Level 4 (Queue > 5M):      Return empty trending list with "temporarily unavailable" message
+```
+
+**Tradeoff**: Users see stale or empty trending results rather than a complete outage. For a trending system, this is acceptable — trending is "best effort."
+
+## Auto-Scaling Strategy
+
+### Kafka Consumers
+
+```yaml
+# Kubernetes HPA based on consumer lag
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stream-processor-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stream-processor
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: kafka_consumer_lag
+      target:
+        type: AverageValue
+        averageValue: "100"  # target 100 messages lag per consumer
+```
+
+**Scale triggers**:
+| Consumer Lag | Scale Factor | Time to Full Capacity |
+| --- | --- | --- |
+| 1K | 1.5x | 30 seconds |
+| 10K | 2x | 60 seconds |
+| 50K | 3x | 90 seconds |
+| 100K+ | 5x | 120 seconds |
+
+### Redis Shard Rebalancing
+
+Under normal circumstances, Redis shards are balanced by consistent hashing. During a viral spike:
+
+1. The hot article's events all hash to the same shard.
+2. That shard's memory and CPU spike while others remain idle.
+3. **Solution**: Use **virtual sharding** — split the hot article's counters into sub-shards dynamically.
+
+```python
+# Before: article_id → single Redis shard (via consistent hash)
+hash(article_id) → shard_3  ← ALL traffic to shard_3
+
+# After: hot article → multiple sub-shards
+hash(article_id) → [shard_3_a, shard_3_b, shard_3_c]
+# Events for article_id are distributed across sub-shards
+# Queries sum across all sub-shards
+```
+
+This is complex and requires a routing layer. In practice, we prevent this by **not partitioning by article_id** — instead, we partition by a hash of (article_id + bucket_key), which naturally distributes load even for hot articles. The tradeoff is that we lose the per-article ordering guarantee, but since we use atomic INCR operations, ordering doesn't matter for counters.
+
+## Prioritization During Viral Events
+
+When resources are constrained, prioritize:
+
+```
+Priority 1: Query latency for viral articles
+  → These are the articles users are actively looking up
+  → Dedicate query resources to the top 100 viral articles
+
+Priority 2: Ingestion of share events
+  → Don't lose share counts — they're the core data
+  → Drop optional metadata (user_agent, geo) but keep article_id + timestamp
+
+Priority 3: Background maintenance
+  → Pause compaction, TTL cleanup, classification workers
+  → These can resume after the spike
+
+Priority 4: Non-critical query features
+  → Remove optional filters (source, category) from queries
+  → Serve bare top-K only
+```
+
+## Post-Spike Recovery
+
+After the viral event subsides:
+
+1. **Gradual scale-down**: Don't immediately remove scaled-up consumers (thrashing). Reduce capacity by 10% every 5 minutes.
+2. **Cache warm-up**: Pre-populate Redis cache with the trending article metadata.
+3. **Lag reconciliation**: Replay any Kafka messages that were consumed but not yet aggregated (if consumers fell behind too far).
+4. **Alert review**: Post-mortem analysis — did auto-scaling trigger fast enough? Were the thresholds appropriate?

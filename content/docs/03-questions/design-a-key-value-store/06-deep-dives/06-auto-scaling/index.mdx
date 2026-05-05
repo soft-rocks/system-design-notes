@@ -1,0 +1,101 @@
+---
+title: Auto-Scaling & Data Migration
+description: Adding and removing nodes, data rebalancing, and zero-downtime scaling
+---
+
+## Node Addition Flow
+
+Adding a node to a running cluster is a multi-phase process that must not interrupt existing client traffic:
+
+```
+Phase 1: Bootstrap
+    New node starts, connects to existing nodes
+    Registers with the cluster metadata service
+    Receives its assigned virtual partitions
+
+Phase 2: Data Transfer (background)
+    For each assigned virtual partition:
+        Old leader streams SSTable files to new node
+        New node builds memtable from streamed data
+        New node forms Raft group with 2 other nodes
+
+Phase 3: Metadata Update (atomic)
+    Cluster metadata is updated to reflect new partition assignment
+    Old and new leader switch atomically
+    Clients' metadata caches refresh within their polling interval
+
+Phase 4: Drain Old Leader (optional)
+    If the partition was moved from another node, that node stops serving it
+    Streams any remaining writes that occurred during transfer
+    Releases its Raft group membership
+```
+
+**Why stream SSTable files instead of replaying the Raft log?**
+
+SSTable files are already sorted and compressed — streaming them is more efficient than sending individual Raft log entries. A 64MB SSTable file can be streamed in ~1 second over a 1Gbps link. Replaying the equivalent log entries would require the new node to process each entry individually, which is much slower.
+
+## Node Removal Flow
+
+Graceful decommissioning is the reverse of addition:
+
+```
+Phase 1: Drain
+    Stop routing new writes to the decommissioning node's partitions
+    Streams each partition's data to replacement nodes
+
+Phase 2: Metadata Update
+    Partition assignments updated in cluster metadata
+    New leaders established
+
+Phase 3: Shutdown
+    Node stops accepting client connections
+    Flushes any remaining memtable to SSTable (safety)
+    Shuts down
+```
+
+**What if a node crashes without graceful decommission?**
+
+The Raft group detects the leader failure (missing heartbeats) and elects a new leader from the remaining replicas. The cluster redistributes the crashed node's virtual partitions across the remaining nodes. Data loss is zero because all committed data was replicated to at least 2 other nodes (quorum).
+
+## Data Migration Throttling
+
+Data migration competes with client traffic for network bandwidth and disk I/O. Without throttling, migrations would degrade client latency:
+
+```
+Migration rate limit:
+    Network: Max 50MB/s per node for data migration
+    Disk I/O: I/O priority set to "idle" (only uses unused disk bandwidth)
+    CPU: Compaction threads limited to 25% of available CPU
+```
+
+**Why not migrate at full speed?**
+
+A full-speed migration of a 10TB node would take ~5 hours and saturate the network, increasing client latency. A throttled migration at 50MB/s takes ~55 hours but keeps client latency unaffected. Most systems accept the longer migration time to avoid impacting production traffic.
+
+## Hotspot Detection and Mitigation
+
+Consistent hashing prevents global hotspots but not local ones:
+
+```
+Problem: Keys "user:1", "user:2", "user:3" are close in hash space
+         If user IDs are sequential, these map to nearby partitions
+         If only "user:1" and "user:2" are frequently accessed,
+         their partition leader becomes a hotspot.
+```
+
+**Mitigation strategies:**
+
+1. **Client-side load balancing**: Spread reads across multiple replicas, not just the leader. Even followers can serve reads (with eventual consistency).
+2. **Hot key detection**: Monitor per-partition request rate. If a partition exceeds the threshold, split its key range across multiple partitions.
+3. **Key salting**: Append a random suffix to frequently written keys to spread writes across multiple partitions:
+   ```
+   Original: Set("order:123", "...")
+   Salted:   Set("order:123:" + random(0-9), "...")
+   Read:     BatchGet("order:123:0" .. "order:123:9"), merge results
+   ```
+
+verification
+[] ## Node Addition Flow
+[] ## Node Removal Flow
+[] ## Data Migration Throttling
+[] ## Hotspot Detection and Mitigation

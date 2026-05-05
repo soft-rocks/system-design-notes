@@ -1,0 +1,229 @@
+---
+title: Access Control
+description: Deep dive into access mode enforcement, API key authentication, and visibility tiers.
+---
+
+### Access Control
+
+#### Challenge
+
+Enforcing three access modes (`public`, `unlisted`, `private`) that determine both visibility and CDN caching behavior, while providing API key authentication for higher rate limits. Access mode is set at paste creation and cannot change (pastes are immutable), but it directly affects the request path: `public` pastes go through CDN, `unlisted` pastes also go through CDN but are not listed, and `private` pastes bypass the CDN entirely.
+
+**Key constraint**: The access mode must be checked **before** any caching or content fetch. A `private` paste that reaches the CDN is a data leak. The access mode is stored in both the DB and Redis metadata, but the source of truth is the DB — Redis is the cache.
+
+#### Solution: Access Mode as Request-Path Enforcer
+
+**1. Access Mode Definitions**
+
+| Mode | Visibility | CDN Cacheable | Authentication Required | Use Case |
+|------|-----------|---------------|------------------------|----------|
+| `public` | Listable (in search/browse UI) | Yes | No | Code snippets, configs to share openly |
+| `unlisted` | Direct link only (not listable) | Yes | No | Shared via URL but not indexed |
+| `private` | Direct link only, no CDN | No | No (key obscurity only) | Sensitive configs, credentials (with caveat) |
+
+URL patterns:
+| Access Mode | URL Pattern |
+|-------------|-------------|
+| `public` | `GET https://pastebin.com/p/\{key\}` |
+| `unlisted` | `GET https://pastebin.com/p/\{key\}` |
+| `private` | `GET https://pastebin.com/private/\{key\}` |
+
+**Critical distinction**: All three modes use the **same access mechanism** — the short key. There is no password, no OAuth, no separate authentication gate. "Private" means "not cached by the CDN," not "authenticated." Anyone with the URL has full access. This is by design for simplicity, but users must be warned that private pastes are not truly private.
+
+**URL split trade-off**: Using `/private/` instead of a query parameter or header (e.g., `?mode=private`) for private paste routing avoids per-request header inspection at the CDN level, making the cache-bypass rule simpler and faster. However, it requires two distinct URL patterns to be configured in both CDN and client code, and users may be confused by the different URL format. An alternative would be a unified `/p/\{key\}` with access-mode validation at origin only, but that risks accidental CDN caching of private content on the first request before the origin sets cache headers.
+
+**2. Access Mode Check — Per-Request Flow**
+
+Because `private` pastes use a distinct URL path (`/private/`), the CDN never caches them. The Paste Service checks access mode from Redis/DB and serves the response with the appropriate headers:
+
+```
+Private paste flow:
+  Client → GET /private/\{key\}
+    → CDN rule: path contains '/private/' → bypass → forward to origin
+    → Origin: Paste Service checks Redis/DB for metadata
+    → If valid: fetch blob from object storage, return with Cache-Control: private, no-store
+    → If expired/deleted: return 410 Gone
+    → If not found: return 404 Not Found
+
+Public/Unlisted paste flow:
+  Client → GET /p/\{key\}
+    → CDN edge: cache hit → serve immediately (P95 < 20ms)
+    → CDN cache miss → forward to origin
+    → Origin: Paste Service checks Redis/DB, serves blob, returns Cache-Control with dynamic TTL
+```
+
+```python
+async def handle_get_paste(key: str, is_private: bool) -> Response:
+    # 1. Lookup metadata from Redis (source of truth for speed)
+    metadata = redis.hgetall(f"paste:\{key\}")
+    if not metadata:
+        # 2. Cache miss — check DB (authoritative)
+        row = db.query(
+            "SELECT access_mode, content_hash, expires_at, status "
+            "FROM pastes WHERE paste_key = %s", key
+        )
+        if not row:
+            return Response(404, "Not Found")
+        if row.status == "deleted" or (row.expires_at and row.expires_at < now()):
+            return Response(410, "Gone")
+        metadata = {
+            "access_mode": row.access_mode,
+            "content_hash": row.content_hash,
+            "expires_at": row.expires_at.isoformat()
+        }
+        # 3. Warm Redis
+        redis.hset(f"paste:\{key\}", mapping=metadata)
+        redis.expire(f"paste:\{key\}", int((row.expires_at - now()).total_seconds()) + 60)
+
+    # 4. Fetch and serve content
+    content = await fetch_from_object_storage(metadata["content_hash"])
+    # Security headers (CSP, X-Frame-Options, X-Content-Type-Options, Content-Disposition) are applied by middleware below
+    if is_private:
+        return Response(200, content, headers={
+            "Cache-Control": "private, no-store, no-cache",
+            "Content-Type": "text/plain; charset=utf-8"
+        })
+    else:
+        remaining = max(0, int((metadata["expires_at"] - now()).total_seconds()))
+        return Response(200, content, headers={
+            "Cache-Control": f"public, max-age=\{remaining\}, s-maxage=\{remaining\}, immutable",
+            "Content-Type": "text/plain; charset=utf-8"
+        })
+```
+
+**3. CDN Bypass for Private Pastes — URL Pattern Routing**
+
+Private pastes use a separate URL path (`/private/`) that is explicitly excluded from CDN caching at the request level. No response header inspection is needed:
+
+```yaml
+# Cloudflare Cache Rules
+- Name: "Paste content — honor origin Cache-Control"
+  Filter: "http.request.uri contains '/p/'"
+  Settings:
+    cache_level: "cache_everything"
+    ttl: 0  # defer to origin Cache-Control
+
+- Name: "Private paste — never cache"
+  Filter: "http.request.uri contains '/private/'"
+  Settings:
+    cache_level: "bypass"
+    edge_cache_ttl: 0
+```
+
+This approach guarantees no private content reaches the CDN edge because the URL pattern itself is the routing signal. This is the same mechanism described in the CDN Integration section (Section 5).
+
+**4. API Key Authentication**
+
+```
+Request: GET /api/v1/pastes/abc123
+Header: Authorization: Bearer sk_live_<base62>
+
+API Gateway flow:
+  1. Extract Bearer token from Authorization header
+  2. Compute HMAC-SHA256 with master_secret → constant-time compare with DB-stored mac
+  3. If match → look up key_id → apply 100 req/min rate limit (vs 20 req/min anonymous)
+  4. If no match → treat as anonymous (20 req/min)
+  5. If API key expired → 401 Unauthorized
+  6. If API key revoked → 403 Forbidden
+```
+
+```python
+async def authenticate_api_key(token: str) -> AuthResult:
+    # 1. Strip known prefix to get the random portion
+    if not token.startswith(("sk_live_", "sk_test_")):
+        return AuthResult.anonymous()
+    random_part = token[8:]
+
+    # 2. Lookup candidate by hash-prefix of the random portion
+    # Store hash(random_part)[:4] in DB as searchable prefix
+    prefix = hashlib.sha256(random_part.encode()).hexdigest()[:4]
+
+    rows = db.query(
+        "SELECT key_id, revoked_at, expires_at, key_mac "
+        "FROM api_keys WHERE key_prefix = %s", prefix
+    )
+
+    # 3. Constant-time HMAC comparison for each candidate
+    # key_mac was stored as HMAC(master_secret, random_part) — not the full token
+    for row in rows:
+        expected_mac = hmac.new(master_secret.encode(), random_part.encode(), hashlib.sha256).digest()
+        if hmac.compare_digest(expected_mac, row.key_mac):
+            if row.revoked_at:
+                return AuthResult.forbidden("API key has been revoked")
+            if row.expires_at and row.expires_at < now():
+                return AuthResult.unauthorized("API key has expired")
+            return AuthResult.authenticated(key_id=row.key_id, rate_limit=100)
+
+    return AuthResult.anonymous()
+```
+
+**HMAC-SHA256**: `hmac.compare_digest()` provides constant-time comparison (~0.1ms per verification) vs ~300ms for bcrypt. Key rotation is handled by storing multiple active MACs keyed by version ID. A `key_prefix` (SHA-256 hash of the random portion, first 4 hex chars) enables an indexed lookup in the DB. Since `sk_live_` is a constant 8-char prefix for all live keys, hashing the random portion produces a uniformly distributed prefix for efficient index lookup.
+
+**Why not bcrypt**: bcrypt is designed for passwords (intentionally slow), not API keys. The ~300ms per `checkpw` at 100 auth'd requests/sec would require ~30 CPU cores. HMAC-SHA256 is the correct primitive here.
+
+**Important**: If the API key is not recognized, we treat the request as **anonymous** (20 req/min), not as unauthorized. This is intentional — the API key affects rate limits, not access to the paste itself. Anyone with the paste's short key can read it regardless of API key status.
+
+**5. Rate Limit Escalation**
+
+| Auth Level | Rate Limit | Identifier | Redis Key |
+|------------|-----------|------------|-----------|
+| Anonymous | 20 req/min | Client IP | `rate:ip:<IP>` |
+| Authenticated | 100 req/min | API key_id | `rate:api:<key_id>` |
+
+The rate limit identifier is determined per-request:
+1. Check for `Authorization` header
+2. If valid API key → use `rate:api:<key_id>` bucket (100 req/min)
+3. If no valid API key → use `rate:ip:<IP>` bucket (20 req/min)
+
+A single IP can have multiple authenticated users (each with their own API key), and a single API key can be used from multiple IPs. The rate limit is per-identifier, not per-IP or per-key exclusively.
+
+**6. Access Mode Enforcement at API Gateway**
+
+The API Gateway performs access mode checks for routing:
+
+| Check | Decision |
+|-------|----------|
+| Valid short key + `public` | Serve (CDN may cache) |
+| Valid short key + `unlisted` | Serve (CDN may cache) |
+| Valid short key + `private` | Serve (origin only, no CDN) |
+| Invalid short key | 404 Not Found |
+| Expired paste | 410 Gone |
+| Deleted paste | 410 Gone |
+
+**7. Security Warning for Private Pastes**
+
+Private paste responses include a clear `Cache-Control: private, no-store, no-cache` header and a prominent UI warning on the paste page:
+
+```
+⚠️ This paste is not encrypted. Anyone with the URL can read it.
+   For truly secret content, encrypt before sharing.
+```
+
+This is a UX/communication concern: users must understand that "private" does not mean "secure" or "encrypted."
+
+**8. Deletion Access Control**
+
+```
+DELETE /api/v1/pastes/\{key\}
+
+Access model: Anyone with the short key can delete the paste.
+  - No separate "owner" concept
+  - No password requirement
+  - Key obscurity is the sole access control
+
+This is consistent with the access model: the key IS the access credential.
+```
+
+Rationale: Adding authentication or ownership would significantly complicate the architecture (require user accounts, password storage, auth flows) while providing limited additional security for a service where paste content is public text. The 24-hour soft-delete recovery window mitigates accidental deletion.
+
+**9. Summary: Access Control Matrix**
+
+| Operation | public | unlisted | private |
+|-----------|--------|----------|---------|
+| Read via CDN | Yes | Yes | No (origin only) |
+| Read via origin | Yes | Yes | Yes |
+| Delete via short key | Yes | Yes | Yes |
+| Listed in search/browse | Yes | No | No |
+| Rate limit (anonymous) | 20/min | 20/min | 20/min |
+| Rate limit (authenticated) | 100/min | 100/min | 100/min |
+| CDN cacheable | Yes (TTL = expires_at) | Yes (TTL = expires_at) | No |

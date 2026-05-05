@@ -1,0 +1,50 @@
+---
+title: Requirements
+description: Functional, non-functional requirements, scale estimates, and assumptions for the Pastebin service.
+---
+
+## Functional Requirements
+
+1. **Paste Creation** — 提交 raw text，支援 optional `title` 和 `language`。Configurable TTL（如 10m、1h、1d、7d、never）。拒絕 empty content。限制單個 paste 的最大 size（預設 64KB）。
+
+2. **Paste Retrieval** — 透過 short key 讀取 content。Overexpired 或 deleted 的 pastes 會回傳對應的 status codes（`404` for never existed、`410` for expired/deleted）。
+
+3. **Short Key** — Server-generated random keys 提供 access。使用者可選擇性提出 custom key 請求。
+
+4. **Expiration** — 每個 paste 可設定 TTL。Expired 的 pastes 變為不可讀取。
+
+5. **Deletion** — 透過 short key 刪除。支援 soft-delete 與短暫的 recovery window。
+
+6. **API** — RESTful endpoints 用於 create、read、delete。包含一個 health check endpoint。
+
+7. **Rate Limiting** — 對 create 和 read endpoints 套用 sliding window limits（anonymous 以 IP 為單位、authenticated 以 API key 為單位）。
+
+8. **Auth** — 支援 optional API key 以進行 authenticated access，並提供 rotation 與 revocation 機制。
+
+9. **Access Modes** — `public`（可出現在 listing）、`unlisted`（僅 direct link 可存取）、`private`（僅依賴 key obscurity）。
+
+## Non-Functional Requirements
+
+1. **Scale**：每天約 1M 筆新 pastes、100M 次 reads。
+2. **Latency**：Write P95 < 200ms；Read P95 < 100ms。
+3. **Availability**：99.9% uptime。Multi-AZ 部署。
+4. **Durability**：99.99% — pastes 不得遺失。
+5. **Key Collisions**：發生機率可忽略；以 unique constraint 搭配 retry 機制 enforcement。
+6. **Input Validation**：僅接受 UTF-8，size 上限嚴格限制。
+7. **Security**：TLS 1.3+，rendered content 需防範 XSS。
+8. **Observability**：Structured logging、metrics（latency、error rate、throughput），於 SLI breaches 時觸發 alerts。
+
+## Scale Estimates
+
+- **Daily active users**：約 5M
+- **New pastes per day**：約 1M（~12 writes/sec sustained、~40/sec peak）
+- **Paste reads per day**：約 100M（~1,157 reads/sec sustained、~3,500/sec peak）
+- **Storage**：約 3.65 TB/year raw（paste 平均約 10KB）；需預留 2–3x headroom
+- **Read/write ratio**：約 100:1 — 高度 read-heavy workload
+
+## Assumptions
+
+- Primary use case：code sharing、config dumps、開發者快速文字儲存。
+- Anonymous access — 不需要 account。
+- Pastes 建立後 immutable。
+- Key 是唯一的 access control — 任何持有 short key 的人都能讀取/刪除。

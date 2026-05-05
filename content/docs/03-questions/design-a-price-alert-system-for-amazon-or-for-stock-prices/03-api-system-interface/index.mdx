@@ -1,0 +1,149 @@
+---
+title: API / System Interface
+description: APIs and interfaces for the price alert system.
+---
+
+## REST API Endpoints
+
+### Alert Management
+
+```
+POST   /api/v1/alerts                      Create alert
+GET    /api/v1/alerts?status=ACTIVE          List alerts
+GET    /api/v1/alerts/:id                    Get alert
+PATCH  /api/v1/alerts/:id                    Update alert
+PUT    /api/v1/alerts/:id/status             Pause/Resume
+DELETE /api/v1/alerts/:id                    Delete alert
+```
+
+**Create Alert**
+```json
+POST /api/v1/alerts
+{
+  "target_type": "STOCK",
+  "target_id": "AAPL",
+  "condition": "BELOW",
+  "threshold_value": 185.00,
+  "notification_channels": ["EMAIL", "PUSH"],
+  "cooldown_minutes": 60
+}
+→ 201 { alert: Alert }
+```
+
+**List Alerts**
+```
+GET /api/v1/alerts?status=ACTIVE&target_type=STOCK&page=1&per_page=25
+→ 200 { alerts: [Alert], total: int, page: int }
+```
+
+### Price Search & Resolution
+
+```
+GET  /api/v1/search/products?q=sony+wh-1000xm5&limit=10    Search products
+GET  /api/v1/search/stocks?q=aapl                          Search stocks
+GET  /api/v1/prices/{type}/{id}?days=90                    Price history
+GET  /api/v1/prices/{type}/{id}/current                    Current price
+```
+
+### Notifications & History
+
+```
+GET  /api/v1/alerts/:id/triggers?limit=50   Trigger history
+GET  /api/v1/notifications?limit=50&read=false  Notification inbox
+PATCH /api/v1/notifications/:id             Mark as read
+```
+
+### User Settings
+
+```
+GET  /api/v1/settings/notifications         Notification preferences
+PUT  /api/v1/settings/notifications         Update preferences
+GET  /api/v1/settings/subscription          Subscription status
+```
+
+All APIs are versioned (`/api/v1`), use standard REST conventions, and require authentication via JWT bearer token. Rate-limited to 100 req/min for free users, 1000 req/min for premium.
+
+## Client SDK / Widget Interface
+
+### Browser Widget (Amazon Product Page)
+
+```javascript
+import { PriceAlertWidget } from '@pricealert/widget';
+
+const widget = new PriceAlertWidget({
+  asin: 'B08F3HTG7J',
+  productName: 'Sony WH-1000XM5',
+  currentPrice: 349.99,
+  currency: 'USD',
+  onAlertCreated: (alertId) => showSuccess('Price alert set!'),
+  onPriceDrop: (dropPercent) => showBanner(`Price dropped ${dropPercent}%!`)
+});
+
+widget.render('#price-alert-container');
+```
+
+Features: auto-detects current price, shows 30-day mini-chart, one-click creation for logged-in users, animated drop banner, local storage offline support.
+
+### Mobile SDK (iOS/Android)
+
+```kotlin
+class PriceAlertSDK {
+    fun init(context: Context, apiKey: String)
+    fun registerPushToken(token: String)
+    fun createAlert(targetType: TargetType, targetId: String, threshold: Double)
+    fun subscribeToPriceUpdates(asin: String)
+    suspend fun getAlerts(): List<Alert>
+    fun setOnPriceAlertListener { listener: (AlertTrigger) -> Unit }
+}
+```
+
+## System Interfaces (Internal Services)
+
+### PollService → PriceIngestionService
+
+Single shared poll per target, published to Kafka:
+
+```
+Topic: price-updates-ingestion
+Key: {target_type}:{target_id}       // e.g. "STOCK:AAPL"
+Value: { price, currency, timestamp, source, metadata }
+```
+
+### PriceIngestionService → EvaluationService
+
+```
+Topic: price-updates-ingestion
+Consumer group: evaluation-service
+Per-partition (target_id): fan-out to alert evaluation
+```
+
+### EvaluationService → NotificationService
+
+```
+Topic: alert-triggers
+Key: {alert_id}
+Value: { alert_id, user_id, price_at_trigger, threshold_value,
+         percentage_change, condition, notification_channels }
+```
+
+### NotificationService → External Providers
+
+| Channel | Provider | Payload Key |
+|---------|----------|-------------|
+| Email | AWS SES | Source, Destination, Content (HTML + text) |
+| Push | Firebase FCM | token, notification, data, apns |
+| SMS | Twilio | from, to, body |
+
+### EvaluationService ↔ AlertStore (Cache)
+
+Hot cache for sub-50ms evaluation:
+- **Redis key:** `alert:eval:{target_type}:{target_id}`
+- **Value:** Sorted set of active alerts scored by `threshold_value`
+- **Evaluation:** Binary search to find crossing alerts in O(log N)
+
+### ReconciliationService
+
+Runs every 4 hours:
+1. Detects alerts that should have triggered but didn't (last eval time vs last price event)
+2. Compares AlertTrigger count vs NotificationEvent count
+3. Identifies stale alerts with no recent price events (source outage)

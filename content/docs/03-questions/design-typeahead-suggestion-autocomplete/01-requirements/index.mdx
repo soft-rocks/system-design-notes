@@ -1,0 +1,34 @@
+---
+title: Requirements
+description: Requirements for typeahead/autocomplete system design
+---
+
+## Functional Requirements
+
+- **Real-time autocomplete** — Return suggestions as user types (1-3 characters), matching a prefix against a massive corpus
+- **Auto-correction** — Handle typos, misspellings, and similar phonetic variations (e.g., "Gogle" → "Google")
+- **Contextual suggestions** — Return results from multiple domains: search history, popular terms, trending topics, entity suggestions with images/icons
+- **Debounce support** — Client sends multiple rapid requests; service handles rate limiting per user
+- **Personalization** — Weight results by user's past behavior, language, location
+- **Multi-language support** — Different tokenization strategies for Latin, CJK (Chinese/Japanese/Korean), and Arabic scripts
+
+## Non-Functional Requirements
+
+- **Latency** — p99 < 50ms end-to-end (critical path: client → API → suggestion engine → client)
+- **Throughput** — 1M+ QPS at mid-size scale, scaling to 10M+ QPS for global platforms
+- **Freshness** — Trending terms surface within minutes; long-tail terms indexed within hours
+- **Availability** — 99.99% uptime; partial failures degrade gracefully (fewer results > error)
+- **Consistency** — Eventually consistent; stale suggestions acceptable, incorrect ones are not
+
+## Scale Assumptions
+
+| Metric | Value |
+|--------|-------|
+| Monthly active users | 1 billion |
+| Peak QPS | 10 million |
+| Distinct terms in dictionary | ~10 billion |
+| Prefix entries (each term → multiple prefixes) | ~50 billion |
+| Corpus size | 100 billion terms |
+| New terms added | ~1 million/day |
+| Average query length | 2-3 characters |
+| Suggestions per query | 5-10 results |

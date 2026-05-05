@@ -1,0 +1,112 @@
+---
+title: Data Flow
+description: Write path, read path, and sync/replication flow for the A/B testing system.
+---
+
+## Write Path
+
+### Event Ingestion Pipeline
+
+```
+┌──────────────┐  SDK buffer   ┌──────────────┐  Batch POST   ┌────────────────┐   Kafka    ┌────────────────┐
+│  Client SDK  │ ────────────→ │  In-Memory   │ ────────────→ │  Event Ingest  │ ────────→ │  Kafka Topic   │
+│              │   500 events  │  Buffer      │   /v1/ingest   │     API        │           │  experiment-   │
+│              │ or 5 seconds  │              │   (fire&forget)│                │           │   events       │
+└──────────────┘               └──────────────┘                └────────────────┘            └────────┬───────┘
+                                                                                                          │
+                                                                                                     Stream Processor
+                                                                                                     (Flink/Spark)
+```
+
+1. Client SDK collects an event (e.g., `purchase_completed`) with `userId`, `experimentId`, `variantId`, `eventKey`, `properties`.
+2. SDK queues the event locally in an in-memory buffer (max ~500 events).
+3. When buffer is full or 5 seconds elapse, SDK batches events and POSTs to `/v1/ingest` in parallel (10–20 concurrent requests).
+4. Event Ingestion API validates the payload (schema, required fields), assigns a server-side timestamp, and writes to Kafka `experiment-events` topic. Returns 200 immediately.
+5. Kafka partitions events by `experimentId` to guarantee ordering within an experiment. Each partition is consumed by the Stream Processor.
+
+**Design rationale:** Fire-and-forget from the client side ensures the SDK never blocks the UI. Batching reduces network overhead. Server-side timestamps correct for clock skew across devices/timezones.
+
+## Read Path
+
+### Assignment Lookup (Hot Path)
+
+```
+┌──────────────┐  variation()   ┌────────────────────┐   Cache hit   ┌──────────────┐
+│  Client SDK  │ ──────────────→ │  Assignment        │ ────────────→ │  Local Cache│
+│              │                │  Service            │              │  (< 1ms)    │
+│              │  ←──────────── │  (Decision Engine)  │              └──────────────┘
+│  \{variant\}   │                │                    │
+└──────────────┘                │  Cache miss        │
+                                │     ↓              │
+                                │  Redis Cluster    │
+                                │     ↓              │
+                                │  Local cache      │
+                                │  populated        │
+                                └────────────────────┘
+```
+
+1. SDK calls `SDK.variation("checkout_redesign", "user_123")`.
+2. Assignment Service computes `bucket = hash("user_123", "checkout_redesign") % 10000`.
+3. Service checks local memory cache. If hit, returns variant in < 1ms.
+4. If cache miss, queries Redis Cluster, writes result back to local cache, returns variant.
+5. Response: `\{ "checkout_redesign": "variant_a" \}`.
+
+**Fallback chain:** If Redis is unavailable → Assignment Service falls back to locally cached config (refreshed every 30s) and computes assignment in-memory. If that fails too → returns control variant.
+
+### Reporting Query
+
+```
+┌──────────────┐  GET /results   ┌────────────────┐  SQL query   ┌──────────────┐
+│  Dashboard   │ ──────────────→ │  Reporting API │ ────────────→ │  ClickHouse  │
+│              │                │                 │              │              │
+│  \{metrics\}   │  ←──────────── │                 │              │              │
+└──────────────┘                └────────────────┘              └──────────────┘
+                                                                                        ↓
+                                                                              Statistical Engine
+                                                                              (p-values, CI)
+```
+
+1. Dashboard requests `/v1/experiments/\{id\}/results?metrics=conversion_rate`.
+2. Reporting API queries ClickHouse: `SELECT variant_id, count() as impressions, sum(conversion) as conversions FROM experiment_events WHERE experiment_id = ? GROUP BY variant_id`.
+3. ClickHouse returns pre-aggregated results in < 100ms.
+4. Statistical Engine computes p-values and confidence intervals on the aggregated data.
+
+**Design rationale:** Pre-aggregation in ClickHouse avoids full-table scans. The hot path (assignment) never touches disk — it's all memory.
+
+## Sync/Replication Flow
+
+### Config Propagation
+
+```
+┌──────────────┐  REST API    ┌──────────────┐  Change event  ┌────────────────┐   Kafka    ┌──────────────┐
+│  Admin Panel │ ──────────→ │  PostgreSQL  │ ──────────────→ │  Config Prop.  │ ────────→ │  Redis       │
+│              │              │  (primary)   │                 │  (consumer)    │           │  Cluster     │
+└──────────────┘              └──────────────┘                 └────────────────┘            └──────┬───────┘
+                                                                                                      │
+                                                                                             CloudFront Edge
+                                                                                             Cache Invalidate
+                                                                                                      │
+                                                                                                      ↓
+                                                                                              ┌──────────────┐
+                                                                                              │  SDKs polling │
+                                                                                              │  /v1/config   │
+                                                                                              │  (≤ 30s)     │
+                                                                                              └──────────────┘
+```
+
+1. Admin panel creates/updates an experiment via REST API.
+2. Experiment config is written to PostgreSQL for durability.
+3. A change event is published to a `config-changes` Kafka topic.
+4. Config propagator consumes the change event, updates Redis Cluster, and invalidates CloudFront edge cache.
+5. SDKs polling `/v1/config` receive the updated config on the next poll (≤ 30s).
+
+### Data Replication (Multi-Region)
+
+| Component | Replication Strategy | Failover Time |
+|---|---|---|
+| Redis Cluster | Active-passive across regions | < 30s |
+| Kafka | Cross-region replication with configurable factor | < 60s |
+| ClickHouse | ReplicatedMergeTree: sync within DC, async across regions | < 5 min |
+| PostgreSQL | Streaming replication (async) | < 30s |
+
+**Design rationale:** The assignment path is the most latency-sensitive — it must always respond, even if the primary DB is down. Hence the cache-first design with fallback. Config changes propagate eventually (seconds), which is acceptable since experiment configs change infrequently.

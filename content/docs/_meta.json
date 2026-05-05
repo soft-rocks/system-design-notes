@@ -1,0 +1,18 @@
+{
+  "01-delivery-framework": {
+    "title": "Delivery Framework",
+    "description": "Introduction to delivery framework"
+  },
+  "02-basic-concept": {
+    "title": "Basic Concept",
+    "description": "Fundamental concepts"
+  },
+  "03-questions": {
+    "title": "Questions",
+    "description": "Common questions"
+  },
+  "04-references": {
+    "title": "References",
+    "description": "Reference materials"
+  }
+}

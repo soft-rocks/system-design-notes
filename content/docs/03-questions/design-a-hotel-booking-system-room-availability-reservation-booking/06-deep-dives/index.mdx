@@ -1,0 +1,16 @@
+---
+title: Deep Dives
+description: Deep dives into critical design challenges for the hotel booking system.
+---
+
+## Deep Dive Topics
+
+This section covers the most challenging design problems in the hotel booking system.
+
+| Deep Dive | Focus |
+|---|---|
+| [Double-Booking Prevention](./01-double-booking-prevention/) | PostgreSQL row-level locking, blockhold table design, idempotency key enforcement, why distributed locking alternatives were rejected. |
+| [Overbooking Strategy](./02-overbooking-strategy/) | Buffer calculation per room type per date, walk policy, real-time overbooking ratio monitoring, automatic mitigation. |
+| [Search at Scale](./03-search-at-scale/) | Elasticsearch index design (183M docs), geospatial search, CDC-based availability indexing, ranking algorithm, caching strategy. |
+| [Check-In Room Assignment](./04-checkin-room-assignment/) | Room-type-level vs room-instance-level booking, preference-based assignment algorithm, physical state transitions, early check-in/late check-out. |
+| [Channel Manager Integration](./05-channel-manager-integration/) | Multi-protocol translation (Expedia, Booking.com, GDS, Airbnb), per-channel proxy isolation, rate parity enforcement, conflict resolution. |

@@ -1,0 +1,245 @@
+---
+title: Content Moderation
+description: Deep dive into operational content filtering.
+---
+
+### Content Moderation
+
+#### Challenge
+
+Pastes are immutable text that anyone can view via a short key. Without content moderation, the service becomes a vector for:
+- **Phishing URLs** — malicious links disguised as legitimate domains
+- **Malware distributions** — exploit code, reverse shells, credential stealers
+- **Stolen data** — leaked credentials, PII, corporate secrets
+- **Abusive content** — doxxing, harassment, illegal material
+- **Scam content** — crypto scams, fake support, social engineering
+
+At 1M pastes/day, manual review of all content is infeasible. The moderation system must detect abusive content **automatically at ingest time** with high precision (few false positives destroy legitimate content) while maintaining low latency (< 50ms added to paste creation). False negatives are acceptable if there is a secondary detection layer (user reports, periodic re-scanning).
+
+**Constraint**: At this scale, automated moderation is **best-effort detection**, not comprehensive filtering. No automated system can achieve perfect accuracy on arbitrary text content. The system should flag high-confidence violations for rapid response while preserving legitimate content.
+
+**Critical design principle**: Automated moderation should never delete content — only flag for review or quarantine with user notification. False positives are irreversible (content is destroyed). False negatives are tolerable (secondary layers catch missed content).
+
+#### Solution: Three-Layer Moderation Pipeline
+
+**1. Layer 1 — Pre-Storage Detection (Synchronous, < 50ms)**
+
+Fast heuristic checks during paste creation. If any check triggers, the paste is **rejected** at ingest time (not stored):
+
+```python
+async def moderate_create(content: str, metadata: PasteMetadata) -> ModerationResult:
+    # 1. Size/encoding validation (already in security chapter)
+    validate_content_size(content, max_size=64_000)
+    validate_encoding(content, encoding="utf-8")
+
+    # 2. Known malicious hash check (fast lookup)
+    content_hash = sha256(content.encode())
+    if await hash_blocklist_contains(content_hash):
+        # Known malicious content — reject immediately
+        return ModerationResult.rejected(
+            reason="known_malicious",
+            detail="Content matches known malicious database entries"
+        )
+
+    # 3. Phishing URL detection
+    urls = extract_urls(content)
+    for url in urls:
+        if await url_blocklist_contains(url):
+            return ModerationResult.rejected(
+                reason="phishing_url",
+                detail=f"URL matches phishing database: \{url\}"
+            )
+
+    # 4. Sensitive data pattern detection
+    sensitive_patterns = [
+        (r'\b\d\{3\}-\d\{2\}-\d\{4\}\b', 'ssn'),           # SSN
+        (r'\b[A-Z0-9]\{20,\}\b', 'api_key'),             # API keys
+        (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', 'private_key'),
+        (r'(?:password|passwd|pwd)\s*[:=]\s*\S+', 'password'),
+    ]
+    found = []
+    for pattern, category in sensitive_patterns:
+        if re.search(pattern, content):
+            found.append(category)
+
+    if found:
+        # Not rejected — flagged for review. User gets a warning.
+        return ModerationResult.flagged(
+            reason="sensitive_data",
+            detail=f"Possible sensitive data detected: \{found\}"
+        )
+
+    return ModerationResult.accepted()
+```
+
+| Check | Latency | Action | Precision | Recall |
+|-------|---------|--------|-----------|--------|
+| Content size/encoding | < 1ms | Reject if invalid | 100% | 100% |
+| Hash blocklist | < 10ms (Redis lookup) | Reject | ~100% (exact match, only known content) | ~50% of total abuse |
+| URL blocklist | < 20ms (parallel Redis lookup) | Reject | ~95% (domains in curated blocklists are vetted) | ~60% of phishing |
+| Sensitive data regex | < 5ms | Flag (not reject) | 50–65% (varies by pattern; SSN ~90%, private key ~95%, password ~40%) | ~30% of leaks |
+
+**Key decisions**:
+- **Hash blocklist** (like GitLab's DMCA hash list, PhotoDNA for illegal content): Exact hash comparison — zero false positives, only detects known content.
+- **URL blocklist**: Against curated databases (PhishTank, OpenPhish, Google Safe Browsing API). Only rejects if URL domain matches. False positives are rare (domains in blocklists are vetted).
+- **Regex patterns**: Broad enough to catch common patterns (SSNs, private keys, passwords). These **flag** rather than reject because legitimate content may contain these patterns (e.g., a tutorial about password security).
+
+**2. Layer 2 — Async Deep Scan (Post-Storage, < 1s latency tolerance)**
+
+After the paste is stored, a background job performs more expensive checks:
+
+```
+Paste created → Store content → Enqueue moderation job → Worker picks up → Analyze → Flag if needed
+```
+
+```python
+async def moderate_async(paste_key: str, content: str) -> None:
+    # 1. External threat intelligence lookup (slower, more thorough)
+    urls = extract_urls(content)
+    for url in urls:
+        # VirusTotal API (rate-limited, ~100ms per URL)
+        vt_report = await virus_total_lookup(url)
+        if vt_report and vt_report.scores.malicious > 3:
+            await quarantine_paste(paste_key, reason="malicious_url", detail=f"VT score: \{vt_report.scores.malicious\}/89")
+
+    # 2. ML-based content classification (cloud API — no GPU required)
+    # Use lightweight cloud safety APIs (e.g., Google Content Safety, AWS Rekognition text)
+    # that run serverless on per-request basis — no GPU infrastructure needed for a pastebin
+    classification = await cloud_content_safety.analyze(content)
+    if classification.confidence > 0.9 and classification.category in ["phishing", "malware"]:
+        await quarantine_paste(paste_key, reason="ml_classification", detail=f"Category: \{classification.category\}, confidence: \{classification.confidence\}")
+
+    # 3. User report processing
+    report_count = await get_report_count(paste_key)
+    if report_count &gt;= THRESHOLD_FOR_AUTO_QUARANTINE:
+        await quarantine_paste(paste_key, reason="user_reports", detail=f"Reports: \{report_count\}")
+
+    # 4. Periodic re-scan (content blocklists evolve)
+    await rescan_periodic(paste_key, content)
+```
+
+| Check | Latency | Action | Cost |
+|-------|---------|--------|------|
+| VirusTotal/URLScan lookup | ~100ms/URL | Quarantine if malicious | Paid tier (~$93/month for 30K queries, $200/month for 100K); fallback to URLScan.io free tier for non-critical checks |
+| ML content classification | ~200ms/paste | Quarantine if high-confidence | Cloud API ~$0.001/1K requests (no GPU needed) |
+| User report accumulation | Instant (DB query) | Auto-quarantine at N reports | Negligible |
+| Periodic re-scan | Asynchronous | Quarantine if new blocklist entries match | Low (batch processing) |
+
+**3. Layer 3 — User-Driven Reporting + Human Review**
+
+The final layer is user-driven:
+
+```
+Paste page → "Report this paste" button → User selects reason → Queue for human review
+
+Report reasons:
+  - Phishing/Malware
+  - Stolen data/credentials
+  - Harassment/Doxxing
+  - Illegal content
+  - Spam/Scam
+
+Moderation workflow:
+  1. User submits report with reason
+  2. If 3+ reports on same paste within 1 hour → auto-quarantine (hidden from public)
+  3. Quarantined paste: readable by owner (if identifiable) + moderators only
+  4. Human moderator reviews within 24 hours
+  5. If confirmed: permanent deletion + user warning (if API-key based)
+  6. If false positive: restore paste + close report
+```
+
+**Quarantine Behavior**:
+
+```python
+async def quarantine_paste(paste_key: str, reason: str, detail: str) -> None:
+    # Set status to "quarantined" — paste becomes invisible
+    db.execute(
+        "UPDATE pastes SET status = 'quarantined', updated_at = now() "
+        "WHERE paste_key = %s", paste_key
+    )
+    # Invalidate cache
+    redis.delete(f"paste:\{paste_key\}")
+    # Purge CDN cache
+    await cdn_purge(f"/p/\{paste_key\}")
+    # Log for moderator review queue
+    await moderation_queue.enqueue({
+        "paste_key": paste_key,
+        "reason": reason,
+        "detail": detail,
+        "reported_by": "system",
+        "created_at": now().isoformat()
+    })
+```
+
+When a paste is quarantined, `GET /p/\{key\}` returns:
+```json
+{
+  "error": {
+    "code": "content_removed",
+    "message": "This paste has been removed for violating our terms of service.",
+    "status": 410
+  },
+  "appeal": "If you believe this is a mistake, contact support."
+}
+```
+
+**4. Moderation Dashboard (Admin Panel)**
+
+```
+Moderation Queue:
+  - Paste key (clickable)
+  - Content preview (first 500 chars)
+  - Flag reason(s)
+  - Report count
+  - Timestamps
+  - Actions: [Approve] [Quarantine] [Delete] [Ignore]
+
+Stats Dashboard:
+  - Total pastes moderated: 1,234,567
+  - Flagged: 123 (0.01%)
+  - Quarantined: 45 (0.004%)
+  - Deleted: 30 (0.003%)
+  - Average response time: 4.2 hours
+  - Top flag reasons: phishing (45%), malware (25%), stolen data (20%), other (10%)
+```
+
+**5. Scaling Considerations**
+
+| Component | Scale | Strategy |
+|-----------|-------|----------|
+| Hash blocklist | 100M+ entries | RedisBloom module (~150MB for 100M SHA-256 hashes at 1% FPR; ~600MB at 0.1% FPR for stricter detection) |
+| URL blocklist | 10M+ domains | Redis set with wildcard matching |
+| VirusTotal API | ~50 calls/sec (peak) | Rate limiting + retry with exponential backoff |
+| ML classifier | ~100 inferences/sec | Cloud API (serverless); fallback to hash/regex if API unavailable |
+| Moderation queue | ~100 items/hour (manual review) | Standard async job queue (Bull/Redis) |
+
+**6. Privacy and Compliance**
+
+| Requirement | Implementation |
+|-------------|----------------|
+| GDPR deletion request | `DELETE /api/v1/pastes/\{key\}` with verification → soft delete → hard delete after 7 days |
+| DMCA takedown | Dedicated email/form → manual review → quarantine + notify paste creator |
+| Data retention | Moderation logs retained for 1 year (for compliance), paste content deleted per retention policy |
+| User notification | When a paste is quarantined due to automated detection, no notification is sent (to avoid tipping off abuse) |
+
+**7. Accuracy Trade-offs**
+
+| Layer | False Positive Rate | False Negative Rate | Action if Triggered |
+|-------|---------------------|---------------------|---------------------|
+| Hash blocklist | ~0% | ~50% | Reject at ingest (exact hash match — definitive for known content only) |
+| URL blocklist | ~2% | ~30% (only catches known bad domains; misses new/phishing domains not yet in lists) | Reject at ingest (domains are vetted before adding) |
+| Regex patterns | ~10% | ~70% | Flag only (never reject — too noisy) |
+| ML classifier | ~1% | ~40% | Quarantine (high-confidence threshold limits FP) |
+| User reports | ~0.1% | ~50% | Auto-quarantine at 3+ reports (social filtering) |
+
+**8. Summary: Moderation Philosophy**
+
+```
+Automated = detect, not delete
+Flagged content stays live until reviewed
+Auto-quarantine requires multiple data points (reports OR high-confidence ML + blocklist)
+False positives > false negatives in severity
+Human-in-the-loop for all deletions
+```
+
+This approach keeps the paste creation path fast (< 50ms added), catches the majority of obvious abuse (hash blocklist + URL blocklist), and relies on community reporting + human review for edge cases. The system is designed to err on the side of preserving content, which aligns with the service's purpose as an open text-sharing platform.

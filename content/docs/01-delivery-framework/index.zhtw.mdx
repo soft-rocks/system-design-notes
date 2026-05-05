@@ -1,0 +1,162 @@
+---
+title: 架構設計框架
+description: 一套有結構的方法，用來有效應對系統設計面試。
+---
+
+## 六個步驟
+
+```
+## Requirements
+## Core Entities
+## API / System Interface
+## [Optional] Data Flow
+## High Level Design
+## Deep Dives
+```
+
+---
+
+### 1. Requirements（約 5 分鐘）
+
+在開始設計之前，先釐清範圍。向面試官重複你的理解，然後提出精準的問題。
+
+**Functional Requirements**（系統應該要做什麼？）
+
+- 列出核心功能，用 user story 形式描述：「作為一個使用者，我可以發推並且在 timeline 上看到」
+- 優先排序前 3 個功能 —— 先處理「happy path」，再處理 edge cases
+- 確認：read-heavy 還是 write-heavy？real-time 還是 batch？global 還是 regional？
+
+**Non-Functional Requirements**（系統表現如何？）
+
+| Dimension    | 要問的問題                                 | 典型目標               |
+| ------------ | ---------------------------------------- | -------------------- |
+| Scale        | DAU、QPS、每年儲存成長量                 | 例如：500M DAU       |
+| Latency      | p95 / p99 回應時間期望                   | 例如：`\{<\}200ms`         |
+| Availability | Uptime SLA、RTO/RPO（災難復原目標）        | 例如：99.99%         |
+| Consistency  | Strong vs. eventual 可以接受？           | 例如：feeds 可以接受 eventual |
+
+**Capacity Estimation**（只有當它會影響設計決策時才做）
+
+- 粗略公式：daily requests = DAU × actions_per_user × peak_factor
+- Storage = items_per_day × retention × size_per_item
+- 用結果來決定 DB 類型、sharding strategy 或 cache sizing
+- 否則跳過以節省時間
+
+---
+
+### 2. Core Entities（約 2 分鐘）
+
+在畫元件之前先定義 data model。Entities 決定了你的 database design、API endpoints 和儲存選擇。
+
+- 識別主要 nouns / resources：User、Tweet、Timeline、Notification 等
+- 對於每個 entity，記錄關鍵 attributes 和 relationships：
+  - **One-to-many**：User → Tweets
+  - **Many-to-many**：User ↔ Follow（拆解為一個 Follow table）
+  - **One-to-one**：User → Settings/Profile
+- 畫一個輕量的 ER diagram —— 此階段不需要 over-normalize
+- 標記哪些 entity 會是 hot-read（Tweet）vs. hot-write（Notification），以指導後續的 caching / sharding 決策
+
+---
+
+### 3. API / System Interface（約 5 分鐘）
+
+定義 external contract。這直接影響 service boundaries 和 load distribution。
+
+**Endpoint Design**（REST example）
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST | `/tweets` | Create a tweet |
+| GET | `/tweets/\{id\}` | Get tweet by ID |
+| GET | `/users/\{id\}/timeline` | Get user's feed |
+| POST | `/users/\{id\}/follow/\{target\}` | Follow a user |
+| DELETE | `/tweets/\{id\}` | Delete a tweet |
+
+**Protocol Selection**
+
+| Protocol | 使用時機 | Trade-off |
+| ---------- | ---------------------------------------------------------- | ---------------------------- |
+| REST | 預設選擇；simple CRUD、public APIs | Verbose 但大家熟悉 |
+| GraphQL | Client 需要彈性、nested queries | 比較難 caching 和 monitoring |
+| RPC (gRPC) | Internal microservice communication | 效能最好，比較不彈性 |
+
+**Other Considerations**
+
+- Pagination strategy：offset-based（簡單）vs. cursor-based（大規模時一致）
+- Rate limiting & auth：JWT tokens、API keys、OAuth scopes
+- Versioning：`/v1/tweets` —— 為 backward compatibility 做規劃
+
+---
+
+### 4. [Optional] Data Flow（約 5 分鐘）
+
+對於 write-heavy 或 pipeline-style 的系統，一個 sequence diagram 可以釐清資料如何在系統中流動。
+
+- 列出高階 sequence：Fetch URL → Parse → Deduplicate → Store
+- 識別 sync vs. async boundary（即時回應 vs. eventual processing）
+- 標記 message queues 在流程中的位置
+- 簡單的 CRUD 系統可以跳過（user → server → DB）
+
+---
+
+### 5. High Level Design（約 10–15 分鐘）
+
+由上而下建構 architecture。從 client 開始，逐步推到 data storage。
+
+**Layer by Layer**
+
+1. **Client** —— Web / Mobile / Internal API
+2. **Load Balancer** —— NGINX、ALB、Cloudflare
+3. **Application Servers** —— Stateless services，horizontal scaling
+4. **Data Layer** —— Databases、caches、object storage
+5. **Supporting Services** —— Auth、CDN、message queues
+
+**繪圖時的注意事項**
+
+- 標註每條連線：HTTP、TCP、async（Kafka）、sync（gRPC）
+- 在每個 storage box 旁邊寫 DB schema：關鍵 columns、indexes、partition keys
+- 明確標示 read paths vs. write paths
+- 指出 caching 的位置（Redis/Memcached）以及你 cache 的內容（hot data、query results、whole pages）
+
+**Classic Patterns to Mention**
+
+| Pattern | 使用時機 | 範例 |
+| ------- | ---- | ------- |
+| Client pushes to DB, reads via polling | 簡單的 feeds、低 throughput | 舊版 Twitter |
+| Fan-out on write | 小的 follower counts | Social feed writer model |
+| Fan-out on read | 大的 follower counts | Social feed reader model |
+| Leader-follower replication | Read-heavy workloads | Multi-region DB |
+| Sharding | 需要 horizontal scale | 基於 user 或 geo 的 sharding |
+
+---
+
+### 6. Deep Dives（約 10 分鐘）
+
+這是賺取最多分數的環節。挑選 2–3 個領域深入討論，而不是每個都掃一遍。
+
+**Bottleneck Analysis**
+
+- Single point of failure → 加入 redundancy、failover 或 replication
+- DB hot path → cache（Redis）、read replica 或 query optimization
+- Bandwidth bottleneck → CDN 處理 static assets、compression 處理 API responses
+- Hot partition → re-shard key、consistent hashing 或 virtual nodes
+
+**Scaling Strategies**
+
+| Component | Tactic | Impact |
+| --------- | ------ | ------ |
+| Web tier | Horizontal scaling + auto-scaling | 應對 traffic spikes |
+| Cache layer | Multi-tier（L1 app memory → L2 Redis） | 降低 DB load 10–100× |
+| Database | Read replicas → sharding → NewSQL | 先 scale reads，最後才 scale writes |
+| Queues | Kafka/Pub/Sub 做 async decoupling | 改善 tail latency |
+
+**Tradeoff Framework** —— 永遠要明確說明你的 tradeoff：
+
+> 「我們選擇 **eventual consistency** 而非 strong consistency 來處理 feed，因為：(1) 使用者可以容忍暫時的 tweet 延遲，(2) 這樣可以讓我們獨立 sharding feeds，(3) 否則需要在 regions 之間 serializing writes，造成 bottleneck。」
+
+**Edge Cases to Mention**
+
+- 如果一個 service 在 request 中途 crash 了？→ Retry 搭配 idempotency / outbox pattern
+- Database fails over？→ Leader election、replica promotion
+- Cache storm 發生在 restart 之後？→ Slabbing、probabilistic early eviction
+- Follow 的 write amplification → Fan-out on write vs. read

@@ -1,0 +1,162 @@
+---
+title: Delivery Framework
+description: A structured approach to tackle system design interviews effectively.
+---
+
+## The Six Steps
+
+```
+## Requirements
+## Core Entities
+## API / System Interface
+## [Optional] Data Flow
+## High Level Design
+## Deep Dives
+```
+
+---
+
+### 1. Requirements (~5 minutes)
+
+Clarify scope before designing. Repeat the prompt back to the interviewer, then ask targeted questions.
+
+**Functional Requirements** (What should the system do?)
+
+- List core features with user stories: "As a user, I can post a tweet and see it in my timeline"
+- Prioritize top 3 features — the "happy path" before edge cases
+- Ask: read-heavy or write-heavy? Real-time or batch? Global or regional?
+
+**Non-Functional Requirements** (How well should it work?)
+
+| Dimension    | Questions to Ask                         | Typical Target       |
+| ------------ | ---------------------------------------- | -------------------- |
+| Scale        | DAU, QPS, storage growth per year        | e.g., 500M DAU       |
+| Latency      | p95 / p99 response time expectations     | e.g., `\{<\}200ms`         |
+| Availability | Uptime SLA, RTO/RPO for disasters        | e.g., 99.99%         |
+| Consistency    | Strong vs. eventual acceptable?          | e.g., eventual for feeds |
+
+**Capacity Estimation** (Only if it drives a design decision)
+
+- Rough formula: daily requests = DAU × actions_per_user × peak_factor
+- Storage = items_per_day × retention × size_per_item
+- Use results to pick between DB types, sharding strategy, or cache sizing
+- Otherwise, skip to save time
+
+---
+
+### 2. Core Entities (~2 minutes)
+
+Define the data model before drawing components. Entities drive your database design, API endpoints, and storage choices.
+
+- Identify main nouns/resources: User, Tweet, Timeline, Notification, etc.
+- For each entity, note key attributes and relationships:
+  - **One-to-many**: User → Tweets
+  - **Many-to-many**: User ↔ Follow (resolve to a Follow table)
+  - **One-to-one**: User → Settings/Profile
+- Sketch a lightweight ER diagram — don't over-normalize at this stage
+- Flag entities that will be hot-read (Tweet) vs. hot-write (Notification) to guide later caching/sharding decisions
+
+---
+
+### 3. API / System Interface (~5 minutes)
+
+Define the external contract. This directly informs your service boundaries and load distribution.
+
+**Endpoint Design** (REST example)
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST | `/tweets` | Create a tweet |
+| GET | `/tweets/\{id\}` | Get tweet by ID |
+| GET | `/users/\{id\}/timeline` | Get user's feed |
+| POST | `/users/\{id\}/follow/\{target\}` | Follow a user |
+| DELETE | `/tweets/\{id\}` | Delete a tweet |
+
+**Protocol Selection**
+
+| Protocol | When to Use | Trade-off |
+| ---------- | ---------------------------------------------------------- | ---------------------------- |
+| REST | Default choice; simple CRUD, public APIs | Verbose but well-understood |
+| GraphQL | Clients need flexible, nested queries | Harder caching & monitoring |
+| RPC (gRPC) | Internal microservice communication | Best performance, less flexible |
+
+**Other Considerations**
+
+- Pagination strategy: offset-based (simple) vs. cursor-based (consistent at scale)
+- Rate limiting & auth: JWT tokens, API keys, OAuth scopes
+- Versioning: `/v1/tweets` — plan for backward compatibility
+
+---
+
+### 4. [Optional] Data Flow (~5 minutes)
+
+For write-heavy or pipeline-style systems, a sequence diagram clarifies how data moves through the system.
+
+- List the high-level sequence: Fetch URL → Parse → Deduplicate → Store
+- Identify sync vs. async boundaries (immediate response vs. eventual processing)
+- Flag where message queues fit in the flow
+- Skip for simple CRUD systems (user → server → DB)
+
+---
+
+### 5. High-Level Design (~10–15 minutes)
+
+Build the architecture top-down. Start with the client, work toward data storage.
+
+**Layer by Layer**
+
+1. **Client** — Web / Mobile / Internal API
+2. **Load Balancer** — NGINX, ALB, Cloudflare
+3. **Application Servers** — Stateless services, horizontal scaling
+4. **Data Layer** — Databases, caches, object storage
+5. **Supporting Services** — Auth, CDN, message queues
+
+**While Drawing**
+
+- Annotate each connection: HTTP, TCP, async (Kafka), sync (gRPC)
+- Write DB schema next to each storage box: key columns, indexes, partition keys
+- Mark read paths vs. write paths explicitly
+- Call out where caching happens (Redis/Memcached) and what you cache (hot data, query results, whole pages)
+
+**Classic Patterns to Mention**
+
+| Pattern | When | Example |
+| ------- | ---- | ------- |
+| Client pushes to DB, reads via polling | Simple feeds, low throughput | Old Twitter |
+| Fan-out on write | Small follower counts | Social feed writer model |
+| Fan-out on read | Large follower counts | Social feed reader model |
+| Leader-follower replication | Read-heavy workloads | Multi-region DB |
+| Sharding | Horizontal scale needed | User-based or geo-based |
+
+---
+
+### 6. Deep Dives (~10 minutes)
+
+This is where you earn the most points. Pick 2–3 areas to discuss in depth rather than skimming everything.
+
+**Bottleneck Analysis**
+
+- Single point of failure → add redundancy, failover, or replication
+- DB hot path → cache (Redis), read replica, or query optimization
+- Bandwidth bottleneck → CDN for static assets, compression for API responses
+- Hot partition → re-shard key, consistent hashing, or virtual nodes
+
+**Scaling Strategies**
+
+| Component | Tactic | Impact |
+| --------- | ------ | ------ |
+| Web tier | Horizontal scaling + auto-scaling | Handle traffic spikes |
+| Cache layer | Multi-tier (L1 app memory → L2 Redis) | Reduce DB load by 10–100× |
+| Database | Read replicas → sharding → NewSQL | Scale reads first, writes last |
+| Queues | Kafka/Pub/Sub for async decoupling | Improve tail latency |
+
+**Tradeoff Framework** — always state your tradeoff explicitly:
+
+> "We choose **eventual consistency** over strong consistency for the feed because: (1) users tolerate stale tweets, (2) it lets us shard feeds independently, and (3) the alternative would require serializing writes across regions, creating a bottleneck."
+
+**Edge Cases to Mention**
+
+- What happens if a service crashes mid-request? → Retry with idempotency / outbox pattern
+- Database fails over? → Leader election, replica promotion
+- Cache storm after restart? → Slabbing, probabilistic early eviction
+- Write amplification on follow → Fan-out on write vs. read

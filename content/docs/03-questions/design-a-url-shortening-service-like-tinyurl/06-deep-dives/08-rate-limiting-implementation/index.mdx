@@ -1,0 +1,128 @@
+---
+title: "Rate Limiting Implementation"
+description: "Enforcing rate limits per client across distributed API instances"
+---
+
+### Rate Limiting Implementation
+
+#### Challenge
+
+Enforcing rate limits per client (IP or API key) across distributed API instances with sub-1ms overhead. The limits must be accurate enough to prevent abuse while not rejecting legitimate traffic.
+
+#### Solution: Distributed Sliding Window Log with Redis
+
+1. **Rate Limiting Policies**:
+
+| Policy | Window | Limit | Scope | Use Case |
+| --- | --- | --- | --- | --- |
+| Shorten (public) | 1 minute | 10 requests | IP address | Prevent spam from anonymous users |
+| Shorten (API key) | 1 minute | 1,000 requests | API key | Tiered access for registered users |
+| Redirect | 1 hour | 10,000 requests | IP address | Prevent redirect flooding (DDoS mitigation) |
+| Admin API | 1 minute | 30 requests | IP address | Prevent abuse of admin endpoints |
+
+- **Why different limits for shorten vs redirect:** Redirects are read-heavy and cacheable — 10K/hour is generous. Shortens are write operations that create DB entries — much stricter.
+- **Why IP-based for public:** No authentication needed. API-key-based for registered users (more accurate per-user throttling).
+
+2. **Algorithm: Sliding Window Log (NOT Token Bucket)**:
+
+We use a **sliding window log** (not token bucket) because:
+- Token bucket allows bursts (e.g., 100 requests at once, then nothing for a minute). For a URL shortener, bursts of shorten requests are exactly the abuse pattern we want to limit.
+- Sliding window log counts actual requests in the window — no burst tolerance, strict enforcement.
+
+```python
+import redis
+import time
+
+class RateLimiter:
+    def __init__(self, redis_client: redis.Redis, instance_id: str):
+        self.redis = redis_client
+        # Unique per process, used to differentiate concurrent requests
+        self.instance_id = instance_id or f"\{os.getpid()\}-\{uuid4().hex[:8]\}"
+
+    def allow_request(self, client_id: str, limit: int, window_seconds: int) -> tuple[bool, int]:
+        """Check if request is allowed. Returns (allowed, remaining)."""
+        key = f"rl:\{client_id\}"
+        now_ms = int(time.time() * 1000)  # millisecond timestamp
+        window_start = now_ms - (window_seconds * 1000)
+
+        # Lua script: atomic check + add + cleanup
+        lua_script = """
+        local key = KEYS[1]
+        local window_start = tonumber(ARGV[1])
+        local limit = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        local member = ARGV[4]
+
+        -- Remove expired entries
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+
+        -- Count current entries in window
+        local count = redis.call('ZCARD', key)
+
+        if count < limit then
+            -- Add this request
+            redis.call('ZADD', key, now, member)
+            -- Set expiry to auto-cleanup
+            redis.call('PEXPIRE', key, window_seconds * 1000)
+            return \{1, limit - count - 1\}
+        else
+            return \{0, 0\}
+        end
+        """
+
+        member = f"\{now_ms\}:\{self.instance_id\}"
+        result = self.redis.eval(lua_script, 1, key, window_start, limit, now_ms, member)
+        allowed = bool(result[0])
+        remaining = int(result[1])
+        return allowed, remaining
+```
+
+- **Why the member includes instance ID:** Without it, two requests on the same millisecond would collide (same score, same member). The instance_id makes each entry unique.
+- **Why PEXPIRE instead of EXPIRE:** PEXPIRE works in milliseconds, matching the window granularity.
+- **Atomicity via Lua script:** A single Lua script ensures the check+add is atomic. No race condition between two simultaneous requests from the same client.
+
+3. **Redis Data Structure**:
+- **Type:** Sorted Set (`ZSET`)
+- **Key:** `rl:\{client_id\}` (e.g., `rl:192.168.1.1`)
+- **Score:** millisecond timestamp
+- **Member:** `\{timestamp\}:\{instance_id\}` (guarantees uniqueness)
+- **Auto-expiry:** `PEXPIRE` on each write cleans up old keys automatically
+
+4. **Performance**:
+- Single Lua script evaluation in Redis: ~0.5ms (same-node) to ~2ms (cross-region)
+- No separate operations needed: cleanup + count + add in one atomic script
+- Redis can handle ~100K Lua script evaluations/sec per node
+
+5. **Distributed Architecture**:
+- Single Redis node (or Redis Sentinel for HA) is sufficient at ~23K redirects/sec. The rate limiters themselves are per-client, not per-redirect.
+- Rate limit keys are a small fraction of total Redis traffic (most requests hit the URL cache, not the rate limiter).
+- Estimated rate limit key count: 1M unique IPs × 1 key = 1M keys (~100MB total in Redis).
+
+6. **Response Headers**:
+
+```http
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 97
+X-RateLimit-Reset: 1645000000
+```
+
+When rate limited:
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 45
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1645000000
+```
+
+7. **Fallback Strategy** — **Fail-open with per-instance counter**:
+- If Redis is unreachable, fall back to a local in-memory counter.
+- **Important:** This is **per-instance**, not global. With 20 instances, a determined attacker can send 20× the limit (1 instance per connection). This is acceptable — it's better to have some abuse than to break the service entirely.
+- Set a **higher local limit** (e.g., 2× the global limit) to account for this.
+- Log a critical alert immediately. Once Redis recovers, switch back to global enforcement.
+
+8. **Monitoring**:
+- Prometheus metrics: `rate_limit_hits_total\{policy="shorten_public"\}`, `rate_limit_exceeded_total\{policy="shorten_public"\}`
+- Alert: > 5% of shorten requests exceeding rate limit (indicates possible abuse or misconfigured limit)
+- Track per-client rate limit hits for identifying repeat offenders

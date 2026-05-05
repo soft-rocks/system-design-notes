@@ -1,0 +1,62 @@
+---
+title: Transcoding & Adaptive Bitrate Streaming
+description: Deep dive into video transcoding and adaptive bitrate streaming
+---
+
+## Transcoding Pipeline Design
+
+**Goal**: Convert a single raw upload into multiple quality variants optimized for different network conditions and device capabilities.
+
+**Pipeline architecture:**
+```
+Client → Upload → S3 Raw → S3 Event → Kafka → Transcoder Pool → S3 Variants
+```
+
+1. Upload completion triggers: client calls `/upload/complete` → metadata service creates `TranscodeJob` (status=QUEUED) → pushes to Kafka topic `transcode-queue`
+2. Worker scaling: auto-scaling group monitors Kafka lag → scales transcoder workers from 100 (off-peak) to 5,000 (peak)
+3. Encoding strategy: each worker fetches raw video, encodes into each resolution/codec combination in parallel using multi-pass encoding
+4. Progress tracking: workers periodically update TranscodeJob status via DynamoDB (low-latency writes)
+5. Completion notification: on success, worker emits to `transcode-complete` topic → metadata service updates video status to PUBLISHED and creates VideoVariant records
+
+**Key design decisions:**
+- **Parallel encoding per resolution** (not per-frame): each resolution encoded independently; within a resolution, keyframe-aligned slicing enables parallel segment encoding
+- **GPU-accelerated encoding**: H.265/VP9 encoding on NVIDIA GPU instances — 5-10x speedup over CPU-only
+- **Back-pressure via Kafka partitions**: partitioned by `videoId` hash to ensure ordering per video while allowing parallel processing across videos
+
+## Resolution & Bitrate Ladder
+
+**Principle**: Each step up should provide a noticeable quality improvement. The gap between adjacent steps determines how many variants users actually benefit from.
+
+| Resolution | Width | Bitrate (Mbps) | Codec | Target Audience |
+|------------|-------|----------------|-------|-----------------|
+| 360p | 640x360 | 0.5 | H.264 | Mobile, poor connectivity |
+| 480p | 854x480 | 1.0 | H.264 | Standard mobile |
+| 720p | 1280x720 | 2.5 | H.264 | Standard desktop |
+| 1080p | 1920x1080 | 5.0 | H.264 | HD desktop |
+| 1080p | 1920x1080 | 4.0 | H.265 | HD desktop (save 20% bandwidth) |
+| 4K | 3840x2160 | 16.0 | H.265 | Premium devices |
+| 4K | 3840x2160 | 13.0 | VP9 | Alternative (WebM support) |
+
+**Adaptive bitrate logic:**
+- Client measures download throughput over last 10 seconds
+- If throughput > 2x current bitrate → step up 1 level
+- If throughput < 0.5x current bitrate → step down 1 level
+- Never skip more than 1 level in a single switch (avoids visible quality jump)
+- Manifest refresh every 6-10 seconds
+
+## Codec Selection Trade-offs
+
+| Codec | Compression | CPU Cost | Patent/Royalty | Browser Support |
+|-------|-------------|----------|----------------|-----------------|
+| H.264 | Baseline | Low | MPEG LA (royalties) | Universal |
+| H.265/HEVC | ~50% better than H.264 | High (GPU recommended) | MPEG LA / VIA License | Safari, limited Chrome |
+| VP9 | ~30% better than H.264 | Medium | Open (royalty-free) | Chrome, Firefox, Android |
+| AV1 | ~30% better than H.265 | Very High (hardware needed) | Open (royalty-free) | Modern browsers, newer chips |
+
+**Selection strategy:**
+- **Default encode**: H.264 for maximum compatibility (covers 99.5% of devices)
+- **Premium tier**: H.265 for 1080p+ (20% bandwidth savings justifies royalty complexity)
+- **Android default**: VP9 for 4K (broad Android support, no royalties)
+- **Future-proof**: Encode AV1 on latest models — saves 15% over H.265 on devices that support it (Apple M-series, recent Intel/AMD GPUs, flagship mobile SoCs)
+
+**Storage cost trade-off**: Storing 7 variants for every video multiplies storage 7x. For a platform with 100M videos, this is ~1400PB at 2MB/variant average. Mitigation: encode AV1/VP9 only for top 10% of popular videos; H.264 only for long-tail content.

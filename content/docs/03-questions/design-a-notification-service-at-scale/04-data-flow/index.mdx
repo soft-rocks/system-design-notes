@@ -1,0 +1,265 @@
+---
+title: Data Flow
+description: Write path, read path, and replication flow for a distributed notification service.
+---
+
+## Write Path
+
+### Notification Send Write Path
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Tenant API)
+    participant LB as API Gateway
+    participant API as API Server
+    participant DB as PostgreSQL
+    participant ETCD as etcd
+    participant KAFKA as Kafka
+    participant DW as Dispatch Workers
+    participant P as Push (FCM/APNs)
+    participant E as Email (SES/SendGrid)
+    participant S as SMS (Twilio)
+    participant W as Webhook HTTP
+    participant LS as Log Store
+    participant A as Analytics
+
+    C->>API: POST /notifications/batch
+    API->>API: Validate API key, rate limit
+    API->>DB: Insert Notification (status=QUEUED)
+    DB-->>API: notification_id
+    API->>DB: Insert Recipients (one per user)
+    DB-->>API: OK
+    API->>ETCD: Cache user preferences
+    API->>KAFKA: Publish notification.created
+    API-->>C: \{ notification_id, status: QUEUED \}
+
+    Note over DW: Dispatch workers consume from Kafka
+
+    DW->>KAFKA: Consume notification.created
+    DW->>DB: Read Notification + Recipients
+    DW->>ETCD: Check UserPreference (opt-out, quiet hours)
+    DW->>DW: Filter opt-out recipients
+
+    loop For each recipient
+        DW->>P: Send push notification
+        DW->>E: Send email
+        DW->>S: Send SMS
+        DW->>W: Send webhook
+    end
+
+    P-->>DW: Delivery receipt (SENT/FAILED)
+    E-->>DW: Delivery receipt (SENT/BOUNCED)
+    S-->>DW: Delivery receipt (SENT/REJECTED)
+    W-->>DW: HTTP response (2xx/4xx/5xx)
+
+    alt Success
+        DW->>DB: Update status=SENT, delivered_at
+        DW->>KAFKA: Publish notification.sent
+        DW->>A: Analytics event
+    else Failure (max retries)
+        DW->>DB: Update status=FAILED, error_code
+        DW->>KAFKA: Publish notification.failed
+        DW->>LS: Dead-letter queue entry
+    else Retryable failure
+        DW->>DB: Increment retry_count, status=RETRYING
+        DW->>KAFKA: Requeue with backoff
+    end
+```
+
+1. **Client sends notification** via REST API with template, recipients, and channels.
+2. **API Server** validates tenant auth, checks rate limits, renders template if provided.
+3. **Persistence**: Notification record with QUEUED status created in PostgreSQL. Recipient records created.
+4. **Event published**: `notification.created` to Kafka for downstream consumers.
+5. **Dispatch workers** consume the event, check user preferences (opt-out, quiet hours), and filter recipients.
+6. **Per-channel dispatch**: Workers send to FCM/APNs (push), SES/SendGrid (email), Twilio (SMS), or HTTP POST (webhook).
+7. **Receipt handling**: On delivery receipt, status updated to SENT. On failure, retry with backoff. After max retries, moved to dead-letter queue.
+
+### Scheduled Notification Write Path
+
+```mermaid
+flowchart TD
+    A[Client schedules notification] --> B[API stores scheduled_at]
+    B --> C[Publish notification.created with scheduled_at]
+    C --> D[Scheduler polls Kafka for due notifications]
+    D --> E\{scheduled_at &lt;= now?\}
+    E -->|No| F[Wait]
+    E -->|Yes| G[Dispatch to workers]
+    G --> H[Process like regular send]
+    F --> D
+```
+
+1. Scheduled notification stored with `scheduled_at` timestamp and QUEUED status.
+2. A scheduler component polls Kafka (or uses Kafka's time-based offset) for notifications whose `scheduled_at` less than or equal to now.
+3. At the scheduled time, the notification is dispatched through the normal flow.
+
+### Read Receipt Tracking Write Path
+
+```mermaid
+flowchart LR
+    A[User opens app] --> B[Client requests notification inbox]
+    B --> C[Server marks unread notifications as READ]
+    C --> D[Server sends read receipt via WebSocket]
+    D --> E[Kafka: notification.read]
+    E --> F[Analytics updates]
+```
+
+For push notifications: APNs/FCM callback → notification.read event → update database.
+For email: open tracking pixel hits → server logs event → update database.
+
+## Read Path
+
+### Notification Status Query
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Tenant UI)
+    participant LB as API Gateway
+    participant API as API Server
+    participant DB as PostgreSQL (Primary)
+    participant REPLICA as PostgreSQL (Read Replica)
+    participant REDIS as Redis Cache
+
+    C->>API: GET /notifications?tenant_id=X
+    API->>REDIS: Check cache (notifications:tenant:X)
+    alt Cache hit
+        REDIS-->>API: Cached results
+    else Cache miss
+        API->>DB: Query notifications (paginated)
+        DB-->>API: Results
+        API->>REDIS: Set cache (TTL 60s)
+    end
+    API-->>C: Paginated results
+```
+
+1. Tenant queries notification status via REST API (GET /notifications).
+2. **Cache layer**: Redis cache keyed by tenant_id + filter criteria. 60-second TTL to balance freshness vs. load.
+3. **DB query**: Falls back to read replica for pagination and filtering (by status, channel, date range).
+4. **Response**: Paginated list with status, channel, priority, and creation timestamp.
+
+### Notification Detail Lookup
+
+```mermaid
+flowchart LR
+    A[GET /notifications/\{id\}] --> B\{Cache hit?\}
+    B -->|Yes| C[Return cached detail]
+    B -->|No| D[Query PostgreSQL]
+    D --> E[Cache result 30s]
+    E --> F[Return detail]
+    C --> G[Return detail]
+```
+
+### Tenant Analytics Read Path
+
+```mermaid
+sequenceDiagram
+    participant C as Analytics Dashboard
+    participant API as API Server
+    participant DDB as DynamoDB (aggregated stats)
+    participant ES as Elasticsearch (raw log search)
+
+    C->>API: GET /tenants/\{id\}/stats?range=24h
+    API->>DDB: Query aggregated stats (delivery rate, latency)
+    DDB-->>API: Pre-computed metrics
+    API-->>C: Charts and KPIs
+
+    C->>API: POST /audit-log/search
+    API->>ES: Full-text search on audit logs
+    ES-->>API: Matching audit entries
+    API-->>C: Paginated audit results
+```
+
+## Sync/Replication Flow
+
+### Multi-Region Replication
+
+```mermaid
+flowchart TD
+    subgraph RegionA["Region A (Primary)"]
+        A_API[API Server]
+        A_DB[PostgreSQL Primary]
+        A_Kafka[Kafka Cluster]
+    end
+    subgraph RegionB["Region B (Replica)"]
+        B_API[API Server]
+        B_DB[PostgreSQL Read Replica]
+        B_Kafka[Kafka Cluster]
+    end
+    subgraph RegionC["Region C (Replica)"]
+        C_API[API Server]
+        C_DB[PostgreSQL Read Replica]
+        C_Kafka[Kafka Cluster]
+    end
+
+    A_DB -->|CDC via Debezium| A_Kafka
+    A_Kafka -->|MirrorMaker| B_Kafka
+    A_Kafka -->|MirrorMaker| C_Kafka
+    B_Kafka --> B_DB
+    C_Kafka --> C_DB
+    B_API -.->|Route to Region A| A_DB
+    C_API -.->|Route to Region A| A_DB
+```
+
+1. **Primary region** (Region A) handles all writes via PostgreSQL Primary.
+2. **CDC (Change Data Capture)** via Debezium replicates DB changes to local Kafka.
+3. **MirrorMaker** streams Kafka topics to replica regions (B, C) for read-replica sync.
+4. **Replica regions** serve read queries (GET /notifications) from local read replicas.
+5. **Write routing**: Cross-region write requests are routed to primary region API.
+
+### Redis Cross-Region Cache Sync
+
+```mermaid
+flowchart LR
+    A[Write to Region A Redis] --> B[Cache invalidation event]
+    B -->|Kafka Stream| C[Region B Redis: Invalidate]
+    B -->|Kafka Stream| D[Region C Redis: Invalidate]
+```
+
+- Cache invalidation events published to Kafka and streamed to replicas.
+- No cross-region cache warm-up; miss penalty acceptable for notification reads.
+
+### etcd Consensus for Leader Election
+
+```mermaid
+sequenceDiagram
+    participant API1 as API Server A
+    participant API2 as API Server B
+    participant API3 as API Server C
+    participant ETCD as etcd Cluster
+
+    API1->>ETCD: Acquire leader lock (TTL 15s, auto-renew)
+    ETCD-->>API1: Leader granted
+    Note over API1: Active leader
+
+    API2->>ETCD: Try acquire lock (blocked)
+    API1->>ETCD: Heartbeat (auto-renew)
+
+    Note over API1: Leader crashes
+    API3->>ETCD: Acquire leader lock
+    ETCD-->>API3: Leader granted
+    API3->>API2: Notify: new leader (API3)
+```
+
+- etcd uses Raft consensus for leader election across 3 API server instances per region.
+- Leader handles write coordination; followers queue writes via leader forwarding.
+- TTL-based lease (15s) with auto-renewal; stale leaders naturally expire.
+
+### Notification Inbox Replication
+
+```mermaid
+flowchart TD
+    A[In-app notification write] --> B[Primary DB]
+    B -->|CDC| C[Kafka]
+    C --> D[Region A Inbox Store]
+    C -->|MirrorMaker| E[Kafka Replica]
+    E --> F[Region B Inbox Store]
+
+    subgraph Query["Read: user opens inbox"]
+        G[Request with region hint] --> H\{Region match?\}
+        H -->|Yes| I[Local read]
+        H -->|No| J[Cross-region read]
+    end
+```
+
+- Each region maintains a local in-app notification store for low-latency reads.
+- CDC ensures eventual consistency across regions (typically < 100ms lag).
+- Reads prefer local region; cross-region reads are acceptable for edge cases.

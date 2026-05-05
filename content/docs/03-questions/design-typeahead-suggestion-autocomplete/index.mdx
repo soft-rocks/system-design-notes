@@ -1,0 +1,23 @@
+---
+title: Design Typeahead / Autocomplete
+description: System design for a real-time typeahead autocomplete service that returns ranked suggestions from a massive dictionary in sub-50ms latency.
+---
+
+## Overview
+
+A typeahead (autocomplete) service returns ranked term suggestions as a user types, matching input prefixes against a massive dictionary of billions of terms. It must support typo tolerance, personalization, trending detection, and multi-language queries while maintaining sub-50ms p99 latency at 10M+ QPS.
+
+Key design challenges:
+- **Latency**: Sub-50ms p99 end-to-end from a dictionary of 100B+ terms
+- **Scale**: 10M+ QPS with 10B+ distinct prefix entries
+- **Quality**: Relevance scoring that balances global popularity, user personalization, and recency
+- **Resilience**: Graceful degradation when parts of the system fail
+
+## Sections
+
+- [Requirements](design-typeahead-suggestion-autocomplete/01-requirements) — Functional, non-functional requirements, scale estimates, and assumptions
+- [Core Entities](design-typeahead-suggestion-autocomplete/02-core-entities) — Domain entities, attributes, constraints, access patterns, relationships, and volume estimates
+- [API / System Interface](design-typeahead-suggestion-autocomplete/03-api-system-interface) — API endpoints, internal services, and async interfaces
+- [Data Flow](design-typeahead-suggestion-autocomplete/04-data-flow) — Suggestion lookup, dictionary build, and trending detection flows
+- [High Level Design](design-typeahead-suggestion-autocomplete/05-high-level-design) — Architecture overview, component breakdown, data flow optimization, scaling, availability
+- [Deep Dives](design-typeahead-suggestion-autocomplete/06-deep-dives) — Detailed examination of key subsystems: Radix Tree / Trie data structure, fuzzy matching, caching strategy, multi-lingual support and personalization

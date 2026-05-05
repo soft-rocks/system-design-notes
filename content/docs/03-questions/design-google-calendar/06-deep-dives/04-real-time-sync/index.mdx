@@ -1,0 +1,81 @@
+---
+title: Real-Time Sync
+description: CDC, Sync Service architecture, WebSocket push, webhook delivery, polling-based sync, and consistency.
+---
+
+## Change Data Capture (CDC)
+
+CockroachDB changefeed captures row-level changes: insert, update, delete.
+
+**Changefeed format (JSON):**
+```json
+{
+  "after": \{"id": "abc123", "summary": "Team standup", "version": 42\},
+  "source": \{"ts": 1714712345678, "partition": 7, "offset": 12345\},
+  "operation": "update"
+}
+```
+
+- Sink: Kafka `calendar-changefeed` topic
+- Partitioning: keyed by `event_id` (ordering guarantee per event)
+- Latency: CDC → Kafka < 50ms (internal network)
+
+## Sync Service Architecture
+
+```
+Kafka: calendar-changefeed (partitions by event_id)
+  │
+  ▼
+Sync Service (consumer group, 10 instances)
+  │
+  ├─ State Store: Redis (active subscriptions per user)
+  ├─ Fan-out Engine: WebSocket sessions per user
+  ├─ Webhook Dispatcher: async HTTP POST to registered endpoints
+  └─ Polling Index: incrementing version numbers for pageToken
+```
+
+On changefeed message:
+1. Parse event_id → find subscribing users
+2. Fan-out to WebSocket sessions (batch: 100 events per frame)
+3. Queue webhook deliveries in Redis list per endpoint
+4. Update polling version counter: `sync:version:\{calendarId\} = N`
+
+## WebSocket Push
+
+**Connection lifecycle:**
+```
+Client → wss://push.googleapis.com/event/v1/\{userId\}
+  │
+  ├─ Authenticate: query param token=<JWT>
+  ├─ Subscribe: initial frame with calendarIds
+  ├─ Heartbeat: server ping every 30s; client responds with pong
+  ├─ Event frames: batched JSON on changes
+  └─ Reconnect: exponential backoff (1s, 2s, 4s, 8s, max 30s)
+```
+
+Session recovery: on reconnect, client sends `cursor=N`; server sends all events since version N.
+
+## Webhook Delivery
+
+- **Registration:** `POST /admin/directory/v1/hook` with endpoint URL + conditions
+- **Pipeline:** queue in Redis → dispatcher pool (50 workers) → HTTP POST
+- **Retry:** exponential backoff (1m, 5m, 15m, 1h, 4h)
+- **Dead letter:** after 5 retries → mark failed; notify admin
+- **Verification:** endpoint must return 2xx; Google sends `X-Goog-Verification` header
+
+## Polling-Based Sync
+
+`GET /calendar/v3/calendars/\{calendarId\}/changes?pageToken=xyz`
+
+- pageToken encodes `\{version: N, cursor: "..."\}`
+- **SyncToken:** stable token valid for 1 hour; subsequent polls return delta since creation
+- **Backoff:** clients use exponential backoff with jitter (30s start, 5min max)
+
+## Sync Consistency
+
+| Guarantee | Details |
+|-----------|---------|
+| Per-calendar ordering | Events ordered by `updated_at` (monotonically increasing) |
+| Per-event ordering | Strict, single-writer constraint per event_id |
+| Cross-calendar | No global ordering; may see out-of-order across calendars |
+| End-to-end latency | < 5s (write → CDC → Kafka → fan-out → client) |

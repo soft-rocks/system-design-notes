@@ -1,0 +1,60 @@
+---
+title: Sampling Strategy
+description: Why sampling is necessary, algorithms, implementation, and error bounds.
+---
+
+## Why Sampling Is Necessary
+
+Custom reports with multiple dimensions + segments can produce 100M+ row combinations. Full scan of 13-month raw event data costs thousands of dollars in BigQuery. Sampling provides a practical tradeoff: slightly inaccurate results vs. instant, cheap results.
+
+## Sampling Algorithms
+
+| Algorithm | Description | Use Case |
+|-----------|-------------|----------|
+| **Constant-proportion** | Randomly select 1/N of events (e.g., 1% = 1/100) | Simple queries with single dimensions |
+| **Deterministic hash-based** | `hash(event_id) % N == 0` — consistent across repeated queries | Queries requiring result consistency |
+| **Hierarchical** | Pre-aggregate at multiple rates (1%, 10%, 100%) | Answer at appropriate granularity |
+| **Misery heuristic** | Take max error across sampled datasets | Combining multiple sampled sources |
+
+## Sampling Implementation
+
+**Aggregated store sampling:** Pre-computed samplings stored alongside full aggregates.
+
+```
+Key: property_id:date:dimension_hash:sample_rate
+Values: \{users, sessions, pageviews, ...\} at each sample rate
+```
+
+**Raw event sampling:** Ingestion-time assignment via hash-based method.
+
+- Events with `hash < threshold`: included in sample
+- Events with `hash &gt;= threshold`: only in full dataset
+
+**Sampling decision logic:**
+
+| Estimated Rows | Action | Sample Rate |
+|---------------|--------|-------------|
+| < 10M | Unsampled (full data) | 100% |
+| 10M – 100M | Auto-sample | 10% |
+| > 100M | Auto-sample | 1% |
+
+## Error Bounds & Transparency
+
+**Response metadata:**
+
+```json
+{
+  "metadata": {
+    "sampled": true,
+    "samplingSpaceSizes": {
+      "shortRunSize": 5000000,
+      "longRunSize": 500000000
+    },
+    "estimated": true
+  }
+}
+```
+
+**Relative error model:** Result is within ±X% of true value with 95% confidence.
+
+**User control:** `samplingThresholdSize` parameter lets users set minimum sample size.

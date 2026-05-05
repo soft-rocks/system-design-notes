@@ -1,0 +1,171 @@
+---
+title: "API System Interface"
+description: "API design for ETA service and location sharing between driver and rider"
+---
+
+## REST/WebSocket Endpoints
+
+### Driver Location Upload (Hot Path)
+
+```
+POST /v2/location/ping
+Request headers: Authorization: Bearer <driver_token>
+Request body:
+  {
+    "trip_id": "uuid",
+    "lat": 37.7749,
+    "lng": -122.4194,
+    "heading": 45,
+    "speed_kmh": 35.2,
+    "accuracy_m": 5.0
+  }
+Response 200: { "status": "received", "buffered_count": 3 }
+```
+
+Called every 5-10 seconds by the driver's app. This is the highest-write endpoint in the system (~1M writes/sec globally). Response is fire-and-forget — no acknowledgment needed.
+
+**Why simple POST**: No need for request parsing complexity. The driver app handles serialization. The server batches writes to reduce disk I/O on the time-series store.
+
+### Rider Location Query (Hot Path)
+
+```
+GET /v2/trip/{trip_id}/driver-location
+Response 200:
+  {
+    "lat": 37.7749,
+    "lng": -122.4194,
+    "heading": 45,
+    "speed_kmh": 35.2,
+    "eta_minutes": 4,
+    "eta_minutes_to_dropoff": 18,
+    "polyline": "_p~iF~ps|U...",
+    "updated_at": "2025-01-01T12:00:00Z"
+  }
+Response 404: { "error": "trip_not_found_or_expired" }
+```
+
+Called every 5-10 seconds by the rider's app. Returns the latest driver position, ETA to pickup, ETA to dropoff, and the route polyline.
+
+**Why GET not WebSocket**: WebSockets are harder to scale (long-lived connections consume server resources and are firewalled in some networks). Polling at 5-10 second intervals gives a smooth map experience (6-12 FPS equivalent) without the overhead of persistent connections.
+
+### ETA Query
+
+```
+GET /v2/trip/{trip_id}/eta
+Response 200:
+  {
+    "eta_to_pickup_minutes": 4,
+    "eta_to_dropoff_minutes": 18,
+    "distance_m": 8500,
+    "route_version": 3,
+    "last_updated": "2025-01-01T12:00:00Z"
+  }
+```
+
+Called at a lower frequency (~1 per minute) during active trips. Used by the rider's ETA display (not the map).
+
+### Trip State Query
+
+```
+GET /v2/trip/{trip_id}
+Response 200:
+  {
+    "trip_id": "uuid",
+    "status": "IN_PROGRESS",
+    "driver": {
+      "name": "John D.",
+      "photo_url": "https://...",
+      "vehicle": {"make": "Toyota", "model": "Camry", "color": "Silver", "plate": "ABC1234"},
+      "rating": 4.92,
+      "lat": 37.7749,
+      "lng": -122.4194
+    },
+    "pickup": { "lat": 37.7749, "lng": -122.4194 },
+    "dropoff": { "lat": 37.7849, "lng": -122.4094 },
+    "eta_to_pickup_minutes": 4,
+    "eta_to_dropoff_minutes": 18
+  }
+```
+
+Called every 10 seconds by both rider and driver apps. Used for the trip summary screen.
+
+### WebSocket for Real-Time Updates (Optional)
+
+```
+ws/wss://eta-service.example.com/v2/trip/{trip_id}/stream
+Protocol: JSON over WebSocket
+
+Server → Client:
+  {"type": "location_update", "lat": 37.7749, "lng": -122.4194, "heading": 45, "updated_at": "..."}
+  {"type": "eta_update", "eta_to_pickup_minutes": 3, "eta_to_dropoff_minutes": 17}
+  {"type": "trip_status", "status": "IN_PROGRESS"}
+```
+
+Optional WebSocket endpoint for premium riders or specific app configurations. Most traffic goes through REST polling. WebSockets reduce battery usage on the rider's device (no need to poll).
+
+## Internal Service Interfaces
+
+### LocationService (in-process module)
+
+```
+interface LocationService {
+  // Ingest a driver GPS ping
+  RecordLocation(tripId string, lat float, lng float, heading int, speed float) error
+
+  // Get latest driver location for a trip
+  GetLatestLocation(tripId string) (*DriverLocation, error)
+
+  // Get location history for a trip (last N minutes)
+  GetLocationHistory(tripId string, since time.Time) ([]DriverLocation, error)
+
+  // Update trip record with latest driver position
+  UpdateTripPosition(tripId string, lat float, lng float) error
+}
+
+interface ETACalculator {
+  // Compute ETA from driver position to destination
+  ComputeETA(originLat, originLng float, destLat, destLng float, tripType ETAType) (*ETARecord, error)
+
+  // Get cached ETA (if available and fresh)
+  GetCachedETA(tripId string, maxStale time.Duration) (*ETARecord, error)
+
+  // Invalidate ETA cache
+  InvalidateETA(tripId string) error
+}
+
+interface RouteService {
+  // Compute or retrieve a route between two points
+  GetRoute(originLat, originLng, destLat, destLng float, routeType RouteType) (*Route, error)
+
+  // Check if a cached route is still valid
+  IsRouteValid(route *Route) bool
+
+  // Recalculate route if traffic has changed significantly
+  RecalculateRoute(tripId string) (*Route, error)
+}
+```
+
+**Why separate ETA Calculator and Route Service**: Route computation is expensive (graph search on a 200M edge graph). ETA computation depends on route data but also requires real-time traffic layer. They have different caching strategies and different failure modes.
+
+### Real-Time Store Interface
+
+```
+interface RealTimeStore {
+  // Write driver position (atomic, with TTL)
+  SetDriverPosition(tripId string, lat float, lng float, heading int) error
+
+  // Read driver position (fastest path)
+  GetDriverPosition(tripId string) (lat float, lng float, heading int, ok bool)
+
+  // Write ETA cache (with TTL)
+  SetETACache(tripId string, etaToPickup int, etaToDropoff int, routeVersion int) error
+
+  // Read ETA cache
+  GetETACache(tripId string) (toPickup int, toDropoff int, routeVersion int, ok bool)
+
+  // Delete expired entries
+  CleanupExpired() error
+}
+```
+
+**Key**: Trip-based partitioning. Each trip_id maps to exactly one real-time store key. No cross-trip operations on the real-time store.

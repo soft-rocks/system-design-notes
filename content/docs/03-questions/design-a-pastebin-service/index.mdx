@@ -1,0 +1,17 @@
+---
+title: Pastebin Service
+description: Design a Pastebin-like service (like pastebin.com) for creating, storing, and sharing text snippets with expiration, access control, and high availability.
+---
+
+## Overview
+
+A Pastebin-like service allows users to create, store, and share text snippets (pastes). Paste content is assigned a unique key for retrieval, with configurable expiration, visibility, and access controls. Users can view pastes via shareable URLs, and administrators can manage content moderation.
+
+## Sections
+
+- [Requirements](design-a-pastebin-service/01-requirements) — Functional, non-functional requirements, scale estimates, and assumptions
+- [Core Entities](design-a-pastebin-service/02-core-entities) — Domain entities, attributes, constraints, access patterns, relationships, and volume estimates
+- [API / System Interface](design-a-pastebin-service/03-api-system-interface) — RESTful API endpoints, security requirements, observability, versioning, and integration points
+- [Data Flow](design-a-pastebin-service/04-data-flow) — Sequence diagrams and data flow design for creating, reading, and expiring pastes
+- [High Level Design](design-a-pastebin-service/05-high-level-design) — Architecture overview, component breakdown, data flow optimization, scaling, availability, security, and cost analysis
+- [Deep Dives](design-a-pastebin-service/06-deep-dives) — Detailed examination of key subsystems: paste storage, content moderation, expiration, caching, rate limiting, CDN integration, and security

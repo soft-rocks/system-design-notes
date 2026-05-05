@@ -1,0 +1,56 @@
+---
+title: API / System Interface
+description: Ranking query API, admin API, and internal service interfaces.
+---
+
+## Ranking Query API
+
+**Top-K by category:**
+
+`GET /v1/rankings/\{category\}/topk?k=100&region=US`
+
+```json
+{
+  "category": "Games",
+  "region": "US",
+  "updated_at": "2026-05-03T12:00:00Z",
+  "entries": [
+    {
+      "rank": 1,
+      "app_id": "com.game1",
+      "app_name": "Game One",
+      "score": 98.7,
+      "score_delta": 1.2,
+      "previous_rank": 3,
+      "diversity_filtered": false
+    }
+  ]
+}
+```
+
+**Global Top-K:** `GET /v1/rankings/topk?k=100&region=US&category=ALL`
+
+**Per-app ranking:** `GET /v1/rankings/app/\{app_id\}?region=US` — App's rank across all categories it belongs to, with score breakdown.
+
+**Trend comparison:** `GET /v1/rankings/trend?app_id=com.game1&region=US&days=7` — Historical rank and score trajectory.
+
+## Ranking Admin API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/apps/\{app_id\}/score-breakdown` | GET | Per-signal contributions, weights, decay factors |
+| `/admin/apps/\{app_id\}/gaming-score` | GET | Fraud risk score, flagged signals, reason codes |
+| `/admin/apps/\{app_id\}/score-adjustment` | POST | Add boost/penalty to app score |
+| `/admin/weights` | PATCH | Update signal weights (with audit log) |
+| `/admin/rankings/validate` | POST | Run consistency check, report anomalies |
+
+## Internal Service Interfaces
+
+| Service | Methods | Responsibility |
+|---------|---------|----------------|
+| `SignalProcessor` | `Ingest/Aggregate` | Signal ingestion and aggregation |
+| `ScoreCalculator` | `ComputeScore/UpdateScores` | Composite score computation |
+| `RankingEngine` | `Rank/ApplyDiversity` | Ranking computation and diversity rules |
+| `RankingCache` | `GetTopK/SetTopK` | Cached ranking results |
+| `GamingDetector` | `Analyze/Flag` | Fraud detection and suppression |
+| `DecayService` | `ApplyDecay/GetDecayFactor` | Time-decay weighting |

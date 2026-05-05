@@ -1,0 +1,76 @@
+---
+title: Message Persistence
+description: File-based message store, WAL, index structure, GC, and crash recovery.
+---
+
+## Message Store Architecture
+
+- Single file per broker: `mnesia-<node>.ms` (message store)
+- Append-only: sequential writes at tail
+- Segmented by date: `mnesia-<node>-<YYYYMMDD>.ms` — new segment daily
+- Segment max size: ~2GB; rotated when full
+- Format: `\{offset, message_id, header_size, headers, body_size, body, crc32\}`
+
+| Field | Description |
+|-------|-------------|
+| offset | Byte position in file (index seek) |
+| message_id | UUID for deduplication |
+| headers | AMQP properties (zlib-compressed if > 1KB) |
+| body | Raw payload |
+| crc32 | Integrity check |
+
+## Write Path (Persistent Messages)
+
+```
+1. Encode message → append to WAL buffer
+2. fsync WAL → durability guarantee
+3. Update in-memory index (FUBAR B-tree): message_id → offset
+4. Insert into queue index: delivery_tag → message_id
+5. Return basic.ack to publisher
+```
+
+- WAL: sequential writes, fsync per message (or batched via `sync_interval_ms`, default: sync every message)
+- fsync latency: ~2ms SSD, ~5ms HDD
+- Batch mode: `sync_interval_ms = 250ms` (trade durability for throughput)
+- Zero-copy: `mlock()` pinned memory avoids page faults
+
+## Index Structure
+
+- **Message store index:** memory-mapped FUBAR B-tree mapping `message_id → file offset`
+  - Built on startup by scanning WAL; cached in RAM
+  - Eviction: LRU at 70% of memory_high_watermark
+- **Queue index:** in-memory sorted array `delivery_tag → message_id`
+  - FIFO order; priority queues use B-tree keyed by (priority DESC, delivery_order ASC)
+  - Ready set: waiting for consumer
+  - Unacked set: delivered, waiting ack
+- **Delivery_tag:** monotonically increasing per-channel
+
+## Read Path
+
+Consumer requests message → queue index returns delivery_tag → message_id → store index: `message_id → offset`
+
+| Cache State | Latency |
+|-------------|---------|
+| In memory index | ~0.1ms (page fault-free) |
+| Not in memory index | ~2ms SSD, ~5ms HDD |
+
+Body decompressed if zlib-compressed (>1KB).
+
+## GC & Log Compaction
+
+- Acks mark entries deleted in FUBAR index
+- GC runs: background process on memory pressure or every 30s
+- Truncation point: max(offset of all queue head messages)
+- WAL segment files deleted when no queue references any message in them
+
+## Crash Recovery
+
+```
+1. Open WAL file
+2. Replay each entry → rebuild FUBAR index
+3. Durable queues: rebuild head pointers → identify pending messages
+4. Non-durable queues: dropped on crash
+5. Unacked messages: requeued for consumers
+```
+
+Recovery time: proportional to WAL size; typically < 30s for 100K messages.

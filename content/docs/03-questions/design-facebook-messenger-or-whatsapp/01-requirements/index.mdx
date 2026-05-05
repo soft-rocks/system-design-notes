@@ -1,0 +1,33 @@
+---
+title: Requirements
+description: Functional and non-functional requirements for a messaging platform like Messenger or WhatsApp
+---
+
+## Functional Requirements
+
+- **Real-time messaging**: Users can send and receive text messages in real time
+- **Group chats**: Users can create and participate in multi-party conversations
+- **Media sharing**: Users can share photos, videos, and documents within conversations
+- **Message status**: Users see delivery status (sent, delivered, read) and typing indicators
+- **Voice and video calls**: 1-to-1 and group voice/video calling
+- **Conversation management**: Users can create, join, leave, and manage chats and groups
+- **Message search**: Users can search their message history
+- **Safety features**: Users can block contacts and delete messages
+
+## Non-Functional Requirements
+
+| Requirement | Target |
+|---|---|
+| **Latency** | ~1s P99 message delivery globally |
+| **Availability** | 99.99% uptime |
+| **Scale** | Billions of MAU; hundreds of millions of concurrent connections |
+| **Reliability** | No message loss; support for end-to-end encryption |
+| **Scalability** | Handle growing message volume and new users without degradation |
+| **Consistency** | Ordered delivery per conversation; eventual cross-device consistency |
+
+## Constraints & Assumptions
+
+- **Mobile-first**: Most traffic from smartphones on varying network conditions (WiFi, 4G/5G)
+- **Global distribution**: Uneven geographic user distribution with regional hotspots
+- **Offline support**: Store-and-forward for messages when recipients are offline
+- **Cross-device sync**: Support multiple devices per user (phone, tablet, desktop)

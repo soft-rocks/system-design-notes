@@ -1,0 +1,106 @@
+---
+title: Message Ordering & Deduplication
+description: Ensuring ordered delivery and idempotent message handling at scale
+---
+
+## Problem
+
+Messages within a conversation must arrive in the correct order. Network retries and client crashes can cause duplicate messages. Both ordering and deduplication must work across distributed, sharded infrastructure.
+
+## Message ID: Snowflake / ULID
+
+### Snowflake Format (64-bit)
+
+```mermaid
+flowchart LR
+    TS["Timestamp (ms)\n41 bits ~69 years"] --> SF["Snowflake ID"]
+    WI["Worker ID\n10 bits 1024 workers"] --> SF
+    SEQ["Sequence\n12 bits 4096/ms"] --> SF
+    SG["Sign (1 bit)"] --> SF
+    EM["Empty (1 bit)"] --> SF
+```
+
+- **Timestamp**: Current time in milliseconds (41 bits = ~69 years)
+- **Worker ID**: Message Service shard/instance ID (10 bits = 1024 workers)
+- **Sequence**: Monotonic counter per worker per millisecond (12 bits = 4096 msgs/ms)
+
+**Property**: IDs are globally unique and monotonically increasing by send time.
+
+### ULID Alternative
+- 48-bit timestamp (milliseconds) + 80-bit random
+- Not guaranteed monotonic by sender (random component), but sortable by time prefix
+
+## Ordering Guarantee
+
+### Within a Conversation
+All messages in one conversation are stored on the same DB shard (sharded by conversation_id). The Message Service assigns IDs sequentially within the shard.
+
+```mermaid
+flowchart LR
+    subgraph Conv["Conversation #100 (shard A)"]
+        M1["msg_1: 1780abc0001"]
+        M2["msg_2: 1780abc0002"]
+        M3["msg_3: 1780abc0003"]
+    end
+    M1 --> M2 --> M3
+    Note["Naturally ordered by ID"]
+```
+
+### Cross-Conversation
+No ordering needed between conversations. Each conversation has independent ordering.
+
+### Client-Side Ordering
+- Client receives messages via WebSocket in ID order (guaranteed by server)
+- If out-of-order delivery occurs (rare, due to network), client sorts by message ID before rendering
+
+## Deduplication
+
+### Idempotent Message Send
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Redis
+    participant S as Server
+
+    C->>S: POST /messages with send_id (UUID)
+    S->>R: Check dedup:\{user_id\}:\{send_id\}
+    R-->>S: Not found
+    S->>R: Set dedup:\{user_id\}:\{send_id\} TTL 5min
+    S->>S: Process message normally
+    S-->>C: Return message_id
+```
+
+On retry with same send_id:
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Redis
+    participant S as Server
+
+    C->>S: POST /messages (retry, same send_id)
+    S->>R: Check dedup:\{user_id\}:\{send_id\}
+    R-->>S: Found (duplicate)
+    S-->>C: Return original message_id (no double-write)
+```
+
+### Delivery ACK Handling
+
+```mermaid
+flowchart LR
+    A["Client receives delivered"] --> B["Send ACK"]
+    B --> C["Server updates status to delivered"]
+    C --> D\{"ACK arrives twice?"\}
+    D -->|Yes| E["Idempotent: status stays delivered"]
+    D -->|No| F["Update to delivered"]
+```
+
+## Edge Cases
+
+| Scenario | Handling |
+|---|---|
+| Worker restart (sequence reset) | Sequence resets to 0; timestamp advances, so ID still unique |
+| Clock skew | Use monotonic clock; if skew detected, increment sequence instead |
+| High throughput (>4096 msgs/ms per worker) | Overflow: use next millisecond, increment sequence to 0 |
+| Cross-worker ordering | Same conversation on same shard = same worker, so no cross-worker ordering needed |
+| Client crash mid-send | send_id dedup handles retries; DB unique constraints prevent double-insert |

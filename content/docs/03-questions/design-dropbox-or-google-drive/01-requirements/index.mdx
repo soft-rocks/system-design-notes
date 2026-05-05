@@ -1,0 +1,35 @@
+---
+title: Requirements
+description: Functional and non-functional requirements for a cloud file storage and sync service
+---
+
+## Functional Requirements
+
+1. **File upload and download** — clients across web, desktop, and mobile must upload and retrieve files.
+2. **File synchronization** — detect local changes and propagate them across all linked devices.
+3. **File sharing** — generate public share links and grant permission-based access (view / edit) to specific users.
+4. **File and folder operations** — create, delete, rename, and move files and folders within a hierarchical namespace.
+5. **Versioning** — retain previous versions of files and allow users to roll back to any prior version.
+6. **Conflict resolution** — handle concurrent edits across devices via sync algorithm (typically last-write-wins with conflict copies preserved for user review).
+7. **Access control** — enforce per-file and per-folder permissions with inheritance from parent directories.
+
+## Non-Functional Requirements
+
+| Requirement | Target |
+|---|---|
+| Durability | 99.999999999% (11 nines) — data loss must be essentially zero |
+| Availability (read) | 99.99% |
+| Availability (write) | 99.9% |
+| Consistency | Sequential consistency per user; eventual across share recipients |
+| Scale | ~1B files stored, ~3.3PB effective storage after dedup (30× dedup factor), millions of concurrent users |
+| Sync latency | Propagation within seconds |
+| Storage efficiency | Server-side deduplication; optional compression |
+| Security | AES-256 at rest, TLS in transit |
+
+## Scale Assumptions
+
+- **100M** active users
+- Average **1GB** storage per user → 100PB raw, ~3.3PB effective after 30× deduplication, growing ~1PB/year raw
+- **10K** new files per user per year (~27 files/day)
+- **~50K** metadata lookups per second; **~5K** data read/write operations per second; peak combined ~200K during US business hours
+- File size distribution: 90% < 10MB, 9% 10MB–1GB, 1% > 1GB

@@ -1,0 +1,86 @@
+---
+title: Core Entities
+description: Record, Sort Key, Sort Task, Spill File, and Merge Node.
+---
+
+## Record
+
+A single data row with typed columns and associated sort key(s).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `row_id` | long | Monotonic global identifier |
+| `columns[]` | typed | Array of column values |
+| `sort_keys[]` | comparable | Values of configured sort columns |
+| `raw_bytes` | bytes | Original row bytes for output |
+
+**Serialization:** Row-based format (Avro/Parquet) for spill files; columnar for merge reads.
+**Size:** Average 1 KB; variable length with prefix-encoded lengths.
+
+## Sort Key
+
+The value(s) used to determine row ordering.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `key_columns[]` | ColumnRef | Which columns participate in sort |
+| `order[]` | ASC/DESC | Direction per column |
+| `type[]` | DataType | Comparable type for comparison |
+| `null_order` | FIRST/LAST | Null handling per key |
+
+**Comparator:** Type-aware comparison function.
+- Integer: signed comparison
+- Float: NaN-aware comparison
+- String: lexicographic with configured collation
+- Date/Timestamp: chronological
+
+## Sort Task
+
+A unit of work assigned to a node: read → sort → spill.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | string | Unique task identifier |
+| `input_range` | OffsetRange | Byte offsets in input files |
+| `assigned_node` | string | Node executing this task |
+| `status` | Enum | reading → sorting → spilling → merging → done |
+| `spill_files[]` | SpillFile | Intermediate spill files |
+| `progress` | double | bytes_read / total |
+
+**Phases:**
+1. **Read:** Fixed-size chunks (64 MB) from input
+2. **In-memory sort:** Sort each chunk using standard sort
+3. **Spill:** Write sorted run to local disk
+4. **Merge:** Merge all spill files locally
+5. **Final merge:** Participate in global merge (shuffle + merge)
+
+**Checkpoint:** Spill file paths + offsets written to distributed store for recovery.
+
+## Spill File
+
+A sorted run written to local disk during the spill phase.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `spill_id` | string | Unique spill identifier |
+| `task_id` | string | Owning task |
+| `node_id` | string | Node where spill resides |
+| `record_count` | long | Number of records |
+| `size_bytes` | long | Spill file size |
+| `sort_key_range` | (min, max) | Key range for skip-merge |
+
+**Format:** Block-encoded sorted run. 1 MB blocks with headers containing magic, block size, record count, and first key for binary search during merge.
+
+## Merge Node
+
+A cluster node participating in the global merge phase.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `node_id` | string | Unique node identifier |
+| `spill_files[]` | SpillFile[] | Local spills to merge |
+| `remote_sources[]` | Source[] | Other nodes' spills to pull |
+| `output_file` | string | Merged result path |
+
+**Merge strategy:** k-way merge with min-heap (priority queue of size k).
+**Buffer:** Per-source 1 MB input buffer; one record buffered at a time.

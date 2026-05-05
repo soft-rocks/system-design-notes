@@ -1,0 +1,75 @@
+---
+title: Storage Engine - LSM-Tree Design
+description: Memtable, SSTable, and write path of an LSM-Tree based key-value store
+---
+
+## Memtable Design
+
+The memtable is an in-memory sorted structure that buffers all writes before they are flushed to disk. It serves as the first stop for every write, providing O(log n) insertion and lookup.
+
+**Why a skip-list over a B-tree in memory?**
+
+A skip-list provides O(log n) insert, delete, and lookup with very simple implementation. A B-tree in memory would be more cache-friendly for range scans, but its restructuring operations during insert (node splits) introduce non-deterministic latency — unacceptable for low-latency key-value stores. Skip-list nodes are allocated independently, so inserts are O(1) pointer updates.
+
+**Memtable flush trigger:**
+
+When the memtable reaches a configured size threshold (typically 64MB), a new immutable memtable is created and a background flush thread writes the old memtable as an SSTable. The flush is fast because it writes sorted key-value pairs sequentially to a new file — no random disk I/O.
+
+```
+Write arrives: key="user:123", value="..."
+  -> Skip-list insert (O(log n) comparisons)
+  -> WAL append (fsync for durability)
+  -> Ack client
+
+Memtable reaches 64MB threshold
+  -> Create new empty skip-list (swap pointer)
+  -> Background thread: write old skip-list to SSTable file (sequential)
+  -> Delete old skip-list (GC collects nodes)
+```
+
+## SSTable Structure
+
+An SSTable is an immutable, sorted file on disk containing key-value pairs. The file structure from beginning to end:
+
+```
++------------------+
+|  Magic Footer    |  -- File format version, checksum algorithm
++------------------+
+|  Compression     |  -- Compressed key-value blocks (zstd, snappy, or none)
++------------------+
+|  Bloom Filter    |  -- Per-SSTable bloom filter (1% false positive rate)
++------------------+
+|  Index Block     |  -- Hash map: key_hash -> (file_offset, block_length)
++------------------+
+|  Data Blocks     |  -- Sorted key-value pairs, split into blocks (4KB)
++------------------+
+```
+
+**Key optimizations:**
+
+- **Block-level indexing**: Instead of indexing every key (too much memory), SSTables group keys into blocks (typically 4KB). The index maps block boundaries to offsets. For a key within a block, the block is read and a linear scan finds the key.
+- **Bloom filter**: Before reading a block, the bloom filter checks whether the key could possibly be in that SSTable. A false negative is impossible; a false positive (1% rate) causes an unnecessary disk read. This eliminates 90%+ of disk reads for missing keys.
+- **Variable-length compression**: Keys are often prefix-similar (e.g., "user:123:name", "user:123:email"). Delta encoding stores only the differing suffix after the first key in a block, reducing storage by 30-50%.
+
+## Write Amplification
+
+LSM-Tree write amplification is the ratio of total bytes written to disk per byte of user data. The breakdown:
+
+| Stage | Bytes Written | Amplification |
+|---|---|---|
+| WAL | 2x user data (fsync + journal) | 2.0 |
+| Memtable flush | 1x user data (SSTable) | 1.0 |
+| Compaction L0->L1 | up to 2x (merge of multiple L0 files) | ~2.0 |
+
+Total: ~5x user data for a single write. Compared to B-Tree's 3-4x per write (read-modify-write on disk), LSM-Tree's amplification is higher but sequential, making it faster for high-throughput writes.
+
+**Why 5x amplification is acceptable:**
+
+1. Sequential disk writes sustain 200-500MB/s vs random IOPS at ~10K. 5x 100KB/s = 500KB/s sequential is trivial for any modern disk.
+2. Compaction runs at low I/O priority and uses read-ahead prefetching, so it does not compete with client latency.
+3. The memtable absorbs bursts of writes, batching them into large sequential flushes rather than small random writes.
+
+verification
+[] ## Memtable Design
+[] ## SSTable Structure
+[] ## Write Amplification

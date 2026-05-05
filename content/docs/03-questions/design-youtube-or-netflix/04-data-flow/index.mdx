@@ -1,0 +1,44 @@
+---
+title: Data Flow
+description: Data flow for YouTube/Netflix streaming platform design
+---
+
+## Upload & Transcode Pipeline
+
+1. Client requests upload initiation from Metadata API
+2. Metadata API creates a video record (status=PENDING) and gets presigned URL from Storage Service
+3. Client uploads raw video directly to object storage via presigned URL (bypasses app servers)
+4. Client signals completion via `/upload/complete`
+5. Object storage emits S3 event → Kafka topic
+6. Transcoding workers consume from Kafka, fetch raw video, transcode into each resolution/codec variant
+7. Workers upload variants directly to object storage
+8. Metadata API is notified (via Kafka) to update video status to PUBLISHED
+
+## Video Playback Flow
+
+1. Client requests video metadata from Metadata API
+2. Metadata API reads from **Redis cache** (hot) or fallback to **relational DB** (cold)
+3. Manifest URL is redirected (302) to CDN for direct access
+4. Client parses HLS manifest, requests segments directly from CDN edge
+5. CDN serves cached segments; cache miss triggers fetch from origin (object storage)
+6. Client sends analytics events in batches during playback
+
+## Search & Recommendation Pipeline
+
+### Search
+- Video metadata is indexed into **Elasticsearch** via CDC (Change Data Capture) from primary DB
+- Search queries hit Elasticsearch with faceted filtering (duration, upload date, visibility)
+- Index is refreshed near-real-time (1s lag) via Debezium connector
+
+### Recommendations
+- **Retrieval (recall)**: Batch model (nightly training) produces candidate shortlist (top 100) for each user → stored in Redis
+- **Ranking (precision)**: Real-time features from streaming events re-rank candidates → top 10 returned
+- **Two-stage architecture**: wide recall → precise ranking, balancing latency and personalization
+
+## Analytics Pipeline
+
+- Clients batch events locally, POST in bursts (every 10s or 50 events)
+- Analytics API validates and produces to **Kafka** topic
+- **Flink** processes real-time aggregations (viewer counts, trending)
+- **BigQuery** stores raw events for batch analytics and model training
+- Retention: 90 days hot (streaming), indefinite cold (BigQuery)

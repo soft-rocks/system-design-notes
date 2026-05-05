@@ -1,0 +1,63 @@
+---
+title: "Cost Analysis"
+description: "Monthly infrastructure cost estimate"
+---
+
+### Cost Analysis
+
+#### Monthly Infrastructure Cost Estimate
+
+**Assumptions:** 50M shortens/day (40M/day free tier, 10M/day for API users), 2B redirects/day (95% cache hit rate), 36.5B total URLs after 2 years, 3-year data retention.
+
+| Component | Configuration | Qty | Cost/Month | Notes |
+| --- | --- | --- | --- | --- |
+| API Gateway | 4 vCPU, 8GB RAM (c6i.xlarge) | 100 | $3,000 | 23K RPS avg, ~230 RPS per instance; auto-scales to 200+ on peak |
+| Redis Cluster | 6 vCPU, 14GB (r6g.large) | 10 | $1,500 | 5 AZs, 5 primaries + 5 replicas (10-node cluster); ~100GB for hot data |
+| PostgreSQL Shards | 8 vCPU, 32GB (db.r6g.2xlarge) | 20 | $20,000 | 20 shards × 1 primary. Each ~500GB NVMe SSD |
+| PostgreSQL Replicas | Same as shard | 40 | $20,000 | 2 read replicas per shard (for DB-cache-miss redirects) |
+| PgBouncer (per shard) | 2 vCPU, 4GB (t3.large) | 60 | $1,200 | Primary + 2 replicas per shard |
+| Kafka | 4 vCPU, 8GB (m6i.xlarge) | 9 | $1,620 | 3 brokers × 3 AZs, 20 partitions, replication factor 3 |
+| ClickHouse | 4 vCPU, 32GB (clickhouse.ch.q1.large) | 9 | $1,800 | 3-node × 3 AZs for analytics |
+| Blacklist Service | 2 vCPU, 4GB (t3.small) | 4 | $160 | 4 instances for admin UI + pub/sub |
+| CDN (Cloudflare Pro) | — | 1 | $500 | WAF + bandwidth |
+| Monitoring | Prometheus + Grafana Cloud | 1 | $500 | SaaS, 30-day retention |
+| S3 Backup + Archive | 100TB total | — | $1,150 | Standard-IA for hot analytics, Glacier for old data |
+| **Total** | | | **~$51,430** | Per month (unoptimized) |
+
+#### Cost Per Operation Breakdown
+
+| Operation | Monthly Cost | Monthly Volume | Cost Per Operation |
+| --- | --- | --- | --- |
+| Redirect | ~$40,000 (API + Redis + replicas + CDN) | 60B redirects/month | **~$0.00000067** (0.000067 cents) |
+| Shorten | ~$10,000 (API + DB primary + Kafka) | 1.5B shortens/month | **~$0.0000067** (0.00067 cents) |
+| Analytics (ClickHouse ingest) | ~$2,500 (ClickHouse + S3) | 60B events/month | **~$0.00000004** (0.000004 cents) |
+
+**Calculation note:** Redirect cost includes API instances, Redis, read replicas, CDN, and monitoring. Shorten cost is separate because it writes to the DB primary and Kafka. Analytics is ClickHouse-specific.
+
+#### Why the Original Estimate Was Wrong (scale: 50M/day, not 2M/day)
+
+1. **Scale underestimation:** 2M shortens/day and 2.5B redirects/day were 25× too low compared to the actual 50M/day and 2B/day figures used throughout this document. The entire cost table has been recalculated for the correct scale.
+2. **Instance counts too low:** At 23K RPS average (92K/sec peak), 20 API instances at ~460 RPS each would be at ~50% CPU — appropriate for average, but peak requires 100+ instances with autoscaling. Fixed.
+3. **Kafka under-provisioned:** 3 brokers × 3 AZs with 20 partitions is correct. 9 brokers (3 per AZ × 3 AZs) for full HA with 3× replication.
+4. **PostgreSQL under-provisioned:** 16 shards at ~300GB each cannot handle 50M/day writes and 23K RPS reads. Scaled to 20 shards, db.r6g.2xlarge (more CPU + NVMe for write throughput).
+5. **ClickHouse under-provisioned:** 3 nodes in single AZ is a SPOF for analytics. Scaled to 3-node × 3 AZs.
+6. **Missing S3 costs:** Original had 5TB total; at 50M URLs/day × 365 days × 2 years with 3× replication, storage is ~100TB+. Fixed.
+
+#### Cost Optimization Levers
+
+| Lever | Savings | Impact |
+| --- | --- | --- |
+| Use Graviton instances (r6g instead of r6) | ~30% | No functional impact; Graviton is ARM-based but works with standard Docker images |
+| Reduce replica count from 2 to 1 (for PostgreSQL read replicas) | ~25% | 95%+ redirects hit cache; acceptable latency risk during replica failure |
+| Move ClickHouse and Kafka to Spot instances | ~50% | ClickHouse recovers via Kafka replay; Kafka brokers can be spot with replication factor 3 |
+| Move S3 to Intelligent Tiering | ~20% | Auto-tiers between Standard and Glacier based on access patterns |
+| **Estimated optimized total** | **~$28,000/month** | |
+
+#### Annual Projection (2-year active retention)
+
+| Year | Active URLs | Redirects (monthly avg) | Infrastructure | Growth Driver |
+| --- | --- | --- | --- | --- |
+| 1 | 18.25B | 60B | $600K | +4 shards, +30 API instances, S3 growth |
+| 2 | 36.5B | 60B | $900K | +4 more shards, S3 tiering, ClickHouse expansion |
+
+The dominant cost driver is **PostgreSQL shards and replicas** (~75% of infrastructure cost). The redirect path is dominated by cache hits (~95%), so most reads don't hit the database — read replica count could potentially be reduced to 1 without impacting P95 latency for the hot set.

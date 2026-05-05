@@ -1,0 +1,59 @@
+---
+title: Exchange Routing
+description: Direct, topic, fanout, headers exchange types, exchange-to-exchange binding, and mandatory/immediate flags.
+---
+
+## Routing Key Format
+
+- String, max 255 bytes
+- Dot-separated convention: `orders.created`, `user.signup.verified`
+- Wildcard syntax for topic exchange: `*` = exactly one word, `#` = zero or more words
+
+## Direct Exchange (Exact Match)
+
+Binding key == routing_key: message delivered to queue.
+
+- No pattern matching; exact string comparison
+- Optimized: exchange maintains hash map `binding_key → [queue_ids]` → O(1) lookup
+- Default exchange: empty string name `""`; implicit direct exchange; routing_key is queue name
+
+## Topic Exchange (Wildcard Match)
+
+| Pattern | Matches | Doesn't Match |
+|---------|---------|---------------|
+| `*.invoice.*` | `us.invoice.email`, `eu.invoice.sms` | `invoice`, `us.invoice.email.extra` |
+| `#` | Everything | Nothing |
+| `invoice.#` | `invoice.email`, `invoice.email.sent` | `email.invoice` |
+| `*.invoice` | `us.invoice`, `eu.invoice` | `invoice`, `us.eu.invoice` |
+
+Matching algorithm: split routing_key and binding_key by `.` → compare word-by-word.
+
+Performance: O(B × W) where B = bindings, W = max words per key (typically < 10).
+
+## Fanout Exchange (Broadcast)
+
+- Ignores routing_key entirely; delivers to all bound queues
+- Performance: O(B) where B = number of bindings
+- Optimized: exchange maintains array of queue_ids → O(1) per queue
+
+## Headers Exchange (Header-Based)
+
+- Matches on AMQP message headers instead of routing_key
+- `x-match`: `all` (all headers match) or `any` (at least one matches)
+- Performance: O(B × H) where B = bindings, H = number of headers
+
+## Exchange-to-Exchange Binding
+
+Exchange binds to another exchange: publisher → exchange A → exchange B → queue.
+
+**Use cases:**
+- Fan-out hierarchies: topic exchange → fanout exchanges → individual queues
+- Message transformation chains
+- Namespace separation: internal exchanges shield downstream queues
+
+Recursive limit: max 100 hops.
+
+## Mandatory & Immediate Flags
+
+- `mandatory=true`: no queue bound → message returned to publisher (basic.return, reply_code=312 NO_ROUTE)
+- `immediate=true` (deprecated): deliver only to active consumer; race condition replaced by explicit consumer management + DLQ pattern

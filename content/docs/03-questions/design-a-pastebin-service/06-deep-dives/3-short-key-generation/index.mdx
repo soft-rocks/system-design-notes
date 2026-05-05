@@ -1,0 +1,121 @@
+---
+title: Short Key Generation Algorithm
+description: Deep dive into short key generation strategy for paste access.
+---
+
+### Short Key Generation Algorithm
+
+#### Challenge
+
+Generating unique, non-guessable paste access keys at 1M pastes/day (~12/sec) while supporting both random server-generated keys and optional user-requested custom keys. The key space must be large enough to keep collision probability negligible, and the keys must resist enumeration attacks since anyone with a valid key can read and delete the paste.
+
+**Key constraints**:
+- Keys are the sole access control — no passwords, no authentication gate. Compromising a key = full access.
+- Users may request custom keys (e.g., `/p/my-custom-key`) — these enter the same namespace and inherit all access privileges.
+- Keys must be human-friendly: no ambiguous characters (`0/O`, `1/I/l`), pronounceable, copy-paste safe.
+
+#### Solution: Two-Tier Strategy (Random CSPRNG for server-generated, Custom with Conflict Resolution)
+
+**1. Key Space: Base32 Encoding with Safe Alphabet**
+
+```
+Alphabet: a-z (26 lowercase letters) + 2-7 (6 digits) = 32 characters
+Key length: 8 characters
+Key space: 32^8 = 1,099,511,627,776 ≈ 1.1T combinations
+```
+
+The `a-z2-7` alphabet excludes ambiguous characters (`0/O`, `1/I/l`) to reduce user errors when typing or verbally sharing keys. The 32-character alphabet is a power of 2, making base-32 operations efficient.
+
+**2. Birthday Problem Analysis**
+
+Expected collisions ≈ n² / (2N) where n = total pastes created, N = key space size. This gives the expected number of collision *pairs* — the number of paste creations that would hit an already-taken key.
+
+| Total Pastes | Expected Collision Pairs | Retries Needed? |
+|-------------|-------------------------|-----------------|
+| 1M | ~0.45 | No — retry logic handles the rare hit |
+| 10M | ~45 | Yes — ~45 pastes hit a key and retry, succeeding on 2nd attempt |
+| 100M | ~4,500 | Yes — retry logic absorbs the hits transparently |
+| 1B | ~450,000 | Retries still work; ~99.7% succeed on first attempt |
+
+The 3-retry mechanism handles collisions at scale. Only at ~1B+ pastes does it meaningfully impact write latency (adding a few ms for ~4% of writes that collide and need a retry).
+
+**3. Server-Generated Keys — CSPRNG with Retry**
+
+```python
+import secrets
+import string
+
+ALPHABET = string.ascii_lowercase + "234567"  # 32 chars
+KEY_LENGTH = 8
+MAX_RETRIES = 3
+
+def generate_key() -> str:
+    for _ in range(MAX_RETRIES):
+        key = ''.join(secrets.choice(ALPHABET) for _ in range(KEY_LENGTH))
+        if not db.pastes.exists(paste_key=key):
+            return key
+    # Safety net: 4th attempt with 9-char key
+    return ''.join(secrets.choice(ALPHABET) for _ in range(KEY_LENGTH + 1))
+```
+
+- **`secrets` module** (CSPRNG) — not `random`. Predictable keys compromise paste security.
+- **3 retries** — with 1M pastes in 1.1T space, collision probability per attempt is ~1M/1.1T ≈ 9 × 10^-7. Probability of all 3 retries failing = (9 × 10^-7)^3 ≈ 7 × 10^-19 per paste creation. With 1M pastes created, the probability that ANY creation fails all retries is ~7 × 10^-13 — effectively zero.
+- **4th attempt with extended key** — safety net only. Never observed in practice.
+
+**4. Custom Key Submission — Conflict Resolution**
+
+```
+Client POST /api/v1/pastes \{ content, key: "my-snippet" \}
+  → Validate: 3–16 chars, [a-z2-7] only
+  → Check DB uniqueness on paste_key
+  → If available: INSERT paste (paste_key = "my-snippet", ...)
+  → If conflict: return 409 Conflict
+```
+
+- **Custom keys share the same namespace** — no separate prefix to keep lookups simple and consistent.
+- **No retry or queue for custom keys** — 409 Conflict tells the user immediately they need a different key. Custom keys are opt-in, and users expect personal control over failures.
+- **Validation uses the same safe alphabet** `[a-z2-7]` as server-generated keys. Rejects ambiguous characters (`0/O`, `1/I/l`), hyphens, whitespace, unicode, and special characters. This ensures all keys — whether user-provided or server-generated — are visually consistent and equally safe for verbal sharing.
+
+**5. Reserved Keyword Protection**
+
+```python
+RESERVED_KEYS = {
+    # Application routes
+    "admin", "api", "auth", "health", "login", "logout", "me",
+    "public", "settings", "static", "signup", "support",
+    # Documentation
+    "about", "docs", "help", "privacy", "terms", "webhook",
+    # Route-confusable tokens
+    "404", "500", "ok", "error", "new",
+    # Numerics (confuse URL routers)
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+}
+```
+
+- Numbers (0-9) reserved to prevent URL router ambiguity (e.g., `/404`).
+- Single-character keys reserved to prevent route ambiguity.
+- Route-proximate names (`health`, `api`, `docs`) prevent user pastes from shadowing application endpoints.
+
+**6. Key Length Trade-off**
+
+| Length | Space | Collisions at 1M pastes | Human Usability |
+|--------|-------|------------------------|-----------------|
+| 6 | ~1.07B | ~0.0005 | Short, easy to share |
+| 7 | ~34.4B | ~0.00002 | Reasonable |
+| **8** | **1.1T** | **~0** | Clean, copy-paste friendly |
+| 9 | 34.4T | 0 | Getting long |
+
+**8 characters is the sweet spot** — 1.1T space with zero practical collision risk at any scale the system will reach, and keys like `abc23def` are easy to share in chat or verbally.
+
+**7. Failure Modes**
+
+| Failure | Behavior | Mitigation |
+|---------|----------|------------|
+| DB unreachable during key check | Write fails with 500 | Retry once; if still down, reject |
+| CSPRNG failure (extremely unlikely) | Key generation stalls | Fallback to `os.urandom`-based generator |
+| Enumeration attack | Attacker guesses a valid key | With 1.1T space and 20 req/min rate limit, attacker tries 1,200 keys/hour — statistically irrelevant against any paste set |
+| Burst of creation requests | Key generation is fast (< 5ms each) | Not a bottleneck at 12/sec sustained |
+
+**8. Why CSPRNG Over ID Sequencing**
+
+Auto-increment IDs (1, 2, 3...) are fully guessable and enable enumeration attacks. CSPRNG keys break enumeration entirely. ULIDs/UUIDs are longer (16+ chars), harder to share, and provide no meaningful advantage over 8-char base32 for this use case.

@@ -1,0 +1,74 @@
+---
+title: Query Engine
+description: Query model, optimization, aggregation store, BigQuery path, and caching.
+---
+
+## Query Model
+
+**Core model:** `SELECT dimensions, metrics FROM events WHERE filters AND segments GROUP BY dimensions`
+
+**Filter types:**
+
+| Type | Example | Pushdown |
+|------|---------|----------|
+| Equality | `page_path = "/home"` | Yes — key lookup |
+| In-list | `country IN ("US", "UK", "CA")` | Yes — range scan |
+| Regex | `page_path =~ /\/product\/.*/` | Partial — post-filter |
+| Numeric | `user_value > 100` | No — post-filter |
+| Timestamp | `_PARTITIONTIME BETWEEN ...` | Yes — partition pruning |
+
+**Segments:** Reusable filter expressions applied as WHERE clauses at query time (no pre-computation).
+
+## Query Optimization
+
+| Technique | Purpose | Impact |
+|-----------|---------|--------|
+| Dimension pushdown | Filter at storage layer | Reduce scan scope |
+| Pre-aggregation | Aggregates computed at ingestion | O(1) per shard |
+| Bloom filters | In-list on high-cardinality dims | O(1) membership check |
+| Histogram estimation | Cardinality of dimension groups | Avoid full scans |
+| Result caching | LRU cache keyed on query hash | 30% hit rate on L1 |
+
+## Aggregation Store Query
+
+**Storage:** Bigtable with column families per metric type.
+
+| Column Family | Metrics |
+|---------------|---------|
+| `CF_users` | user_count, unique_users |
+| `CF_sessions` | session_count, bounce_rate, avg_session_duration |
+| `CF_revenue` | revenue, transaction_count |
+
+**Row key:** `property_id:date:dimension_hash`
+
+**Query patterns:**
+- Single dimension: key lookup → O(1)
+- Two dimensions: range scan on adjacent keys → O(K)
+- Three+ dimensions: may fall back to raw scan
+
+## BigQuery Query Path
+
+Report Service translates query into BigQuery SQL:
+
+```sql
+SELECT
+  page_path,
+  COUNT(*) AS pageviews,
+  COUNT(DISTINCT user_pseudo_id) AS users
+FROM `project.dataset.events_20260501`
+WHERE _PARTITIONTIME = '2026-05-01'
+  AND geo.country = 'US'
+GROUP BY page_path
+ORDER BY pageviews DESC
+LIMIT 100
+```
+
+**Constraints:** 5min query timeout; user must approve queries > 1TB scanned.
+
+## Query Engine Caching
+
+| Cache | Target | Size | TTL | Hit Rate |
+|-------|--------|------|-----|----------|
+| L1: Report Service | Hot queries | 10K entries | 5min | 30% |
+| L2: Redis | Popular reports | 100K entries | 15min | 20% |
+| L3: BigQuery | Materialized views | Per-view | Daily | 15% |

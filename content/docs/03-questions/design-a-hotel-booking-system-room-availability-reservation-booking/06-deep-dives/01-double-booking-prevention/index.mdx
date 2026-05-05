@@ -1,0 +1,150 @@
+---
+title: Double-Booking Prevention
+description: Deep dive into the mechanisms that guarantee zero double-bookings under extreme contention.
+---
+
+## Why This Is Hard
+
+A single Deluxe King room type at peak season could receive 20 concurrent booking requests in a 1-second window. Each request checks availability, sees 1 room left, and attempts to book. Without coordination, all 20 would succeed.
+
+Traditional web applications handle this via application-level locks or optimistic concurrency control. But those break at our scale: 50K peak booking/sec, 5M rooms globally, with downstream dependencies (Stripe, search index) that can fail or timeout mid-flow. We need a mechanism that is correct even under extreme contention, even across multiple regions, even when parts of the system are degraded.
+
+## PostgreSQL Row-Level Locking (SELECT FOR UPDATE)
+
+The core anti-double-booking mechanism is PostgreSQL's `SELECT FOR UPDATE` row-level locking, applied on the availability table keyed by `(room_type_id, date)`.
+
+```sql
+BEGIN;
+
+-- 1. Acquire a row-level lock on the availability record
+SELECT available_rooms, availability_id
+FROM availability
+WHERE room_type_id = $1 AND date = $2
+FOR UPDATE;
+
+-- 2. Decrement if available (atomic check-and-update)
+UPDATE availability
+SET available_rooms = available_rooms - 1,
+    booked_rooms = booked_rooms + 1,
+    updated_at = NOW()
+WHERE room_type_id = $1 AND date = $2 AND available_rooms > 0
+RETURNING availability_id;
+
+-- 3. If 0 rows returned → no room available, return 409
+-- 4. If 1 row returned → proceed with booking
+
+COMMIT;
+```
+
+**Key properties:**
+
+- **Row-level, not table-level**: Only the specific `(room_type_id, date)` row is locked. Other room types on the same date are unaffected. With 500K room types globally, each row has a tiny lock queue (~0-5 transactions at peak).
+- **Serializable isolation**: PostgreSQL's default isolation level prevents phantom reads. Two concurrent transactions updating the same row serialize — one acquires the lock, the other waits.
+- **Timeout**: Lock wait timeout is 3 seconds. If a client doesn't receive a response within 3s, it retries with the same idempotency key (which deduplicates on retry).
+- **Deadlock handling**: Extremely rare with single-row locks. PostgreSQL rolls back one transaction automatically; the client retries with the same idempotency key.
+
+**Why room-type-level, not room-instance-level**: Tracking availability per room type (count of available rooms) instead of per room instance reduces write contention 5x: one room type for 50 individual rooms means 50 guests compete on one lock row instead of 50. Room-instance booking is supported but not the default.
+
+## Blockhold Table Design
+
+The blockhold bridges the gap between "availability check" and "reservation confirmed." During the 15-minute checkout window, the guest's selected room must not be bookable by someone else.
+
+```sql
+CREATE TABLE blockholds (
+    blockhold_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_type_id    UUID NOT NULL,
+    date            DATE NOT NULL,
+    user_id         UUID,
+    expires_at      TIMESTAMP NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+    reservation_id  UUID,
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    INDEX idx_room_date (room_type_id, date),
+    INDEX idx_expires (expires_at) WHERE status = 'ACTIVE'
+);
+```
+
+**Lifecycle:**
+
+1. User clicks "Book" → blockhold record created with `expires_at = NOW() + INTERVAL '15 minutes'` + atomic availability decrement.
+2. User completes payment → reservation created + blockhold set to `CONVERTED`.
+3. User abandons checkout → cron job (every 5 min) reclaims the room.
+4. Reservation cancelled → blockhold set to `CANCELLED` + availability restored.
+
+```sql
+-- Cron job (runs every 5 minutes): reclaim expired blockholds
+UPDATE availability SET available_rooms = available_rooms + 1
+FROM blockholds
+WHERE blockholds.room_type_id = availability.room_type_id
+  AND blockholds.date = availability.date
+  AND blockholds.status = 'ACTIVE'
+  AND blockholds.expires_at < NOW();
+
+UPDATE blockholds SET status = 'EXPIRED'
+WHERE expires_at < NOW() AND status = 'ACTIVE';
+```
+
+**Safety net**: If the booking transaction rolls back (e.g., Stripe timeout), the availability decrement is also rolled back. But the blockhold record persists — the cron job catches these "leaked" holds on the next run. This prevents availability from being permanently stuck in a held state.
+
+**Audit trail**: Blockhold records are never deleted. They transition through states: `ACTIVE` → `CONVERTED` / `EXPIRED` / `CANCELLED`. All states are retained for compliance.
+
+## Idempotency Key Enforcement
+
+Idempotency is the final defense when clients retry due to network timeouts (Stripe took 8 seconds, did the booking succeed?).
+
+```sql
+CREATE TABLE reservations (
+    reservation_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key VARCHAR(64) UNIQUE NOT NULL,
+    guest_id        UUID NOT NULL,
+    -- ... other fields
+);
+```
+
+**How it works:**
+
+1. Client generates a UUID v4 as `Idempotency-Key` header on first request.
+2. Booking Service includes the key in the reservation INSERT.
+3. If the client retries with the same key, PostgreSQL rejects the INSERT with a UNIQUE constraint violation.
+4. The Booking Service detects the duplicate and returns the existing reservation (status, price, etc.) instead of creating a new one.
+
+**Why UNIQUE on the reservation table, not a separate idempotency table**: Single write operation — the key and the record are created atomically in the same transaction. A separate table would require two writes (one for the idempotency record, one for the reservation) or a transaction spanning both tables.
+
+**Key lifecycle**: Stored indefinitely alongside the reservation. After 90 days, a cleanup job archives the key to cold storage while keeping a placeholder (hash only) to prevent duplicate keys from creating orphaned reservations.
+
+**Key format**: Client generates UUID v4. Stored as case-insensitive `VARCHAR(64)` because some mobile SDKs lowercase UUIDs.
+
+## Distributed Locking Alternatives Considered
+
+### Redis SETNX (Distributed Lock) — Rejected
+
+```
+SETNX lock:availability:{room_type_id}:{date} 15
+-- do the booking
+DEL lock:availability:{room_type_id}:{date}
+```
+
+**Problems**: Single point of failure — if Redis goes down, all booking writes halt. No serializable isolation — two clients could read the same availability count and both proceed. The lock must be acquired and released in the same network round-trip (adds latency). Redis durability (fsync policy) means we could lose locks on crash, allowing double-bookings.
+
+### Optimistic Concurrency (Version Column) — Rejected
+
+```sql
+UPDATE availability SET available_rooms = available_rooms - 1, version = version + 1
+WHERE room_type_id = $1 AND date = $2 AND version = $old_version AND available_rooms > 0;
+```
+
+**Problems**: Under high contention, every concurrent request fails (version mismatch). The client retries, and the retry might also fail — creating a busy-wait loop that degrades UX. With row-level locking (pessimistic), one request succeeds and others wait in the lock queue — predictable behavior vs. random-wait retries.
+
+### Kafka Partition-Based Serialization — Rejected
+
+All writes for key `room_type_id:date` are serialized in one partition.
+
+**Problems**: Kafka ordering guarantees ensure requests arrive in order, but the consumer still needs to write to the availability table — which requires its own locking. Kafka serializes the queue but doesn't replace the need for a locking mechanism at the storage layer. With our scale, we'd need thousands of partitions (one per room type per date), and one consumer thread per partition creates a throughput bottleneck.
+
+### Decision: PostgreSQL Row-Level Locking
+
+Simplest correct solution. Combines:
+- **Correctness**: Serializable isolation guarantees zero double-bookings.
+- **Performance**: Row-level locking handles ~50K SELECT FOR UPDATE/sec per node.
+- **Operational simplicity**: One database, no distributed lock infrastructure.
+- **Familiarity**: The team knows PostgreSQL; no new infrastructure to operate.

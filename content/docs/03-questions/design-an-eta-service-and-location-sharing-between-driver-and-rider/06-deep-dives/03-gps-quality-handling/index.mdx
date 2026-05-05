@@ -1,0 +1,78 @@
+---
+title: "GPS Quality Handling"
+description: "Filtering drift, detecting anomalies, and optimizing battery while maintaining accuracy"
+---
+
+## GPS Drift Detection
+
+GPS signals can bounce off buildings, bridges, and other structures, causing "multipath" errors. In urban canyons (dense high-rise areas), position jumps of 50-100m are common. The system must distinguish between real movement and signal artifacts.
+
+**Primary signal: accuracy_m field**
+
+Modern GPS chips report an estimated accuracy radius. Values > 50m indicate poor signal quality. When accuracy > 50m, the position is still recorded but marked with a `quality_score` (0.0-1.0) that is used by downstream consumers:
+
+```
+quality_score = clamp(1.0 - (accuracy_m - 5.0) / 45.0, 0.0, 1.0)
+```
+
+Where:
+- accuracy_m ≤ 5m → quality_score = 1.0 (excellent)
+- accuracy_m = 50m → quality_score = 0.0 (unusable)
+
+**Secondary signal: speed consistency**
+
+A sudden jump of 100m in 2 seconds implies a speed of 180 km/h — unrealistic for urban driving. If the implied speed between consecutive pings exceeds a threshold, the ping is flagged:
+
+```
+implied_speed = distance(ping_n, ping_{n-1}) / (received_at_n - received_at_{n-1})
+if implied_speed > 200 km/h (urban) or > 350 km/h (highway):
+    flag as potential_gps_glitch
+```
+
+**Tertiary signal: road matching**
+
+Map-match the ping to the nearest road segment. A ping that falls > 30m from any road segment is suspicious — the driver isn't teleporting into a building or park. This is a filter, not a discard: if map matching fails, the ping is still stored but down-weighted.
+
+**Implementation**: All three signals are checked in the Location Service (in-process) before writing to Redis. The check is a simple O(1) operation (compare a few floats) and takes &lt;0.1ms.
+
+## Teleportation Filter
+
+Teleportation is the most obvious GPS failure mode: the driver's position jumps >1km in &lt;5 seconds, which is physically impossible at any ground vehicle speed.
+
+**Filter rule:**
+
+```
+distance_m = havers(driver_prev_lat, driver_prev_lng, driver_curr_lat, driver_curr_lng)
+delta_s = (received_at_curr - received_at_prev).total_seconds()
+if distance_m > 1000 and delta_s < 5:
+    DISCARD (log with reason=teleportation)
+```
+
+**Why 1km/5s**: This is conservative. A car traveling at 200 km/h (unrealistic urban speed) covers ~278m in 5 seconds. A helicopter could cover 1km in 5 seconds, but we're not modeling aerial vehicles. The 1km threshold catches GPS resets (e.g., the phone switched from GPS to cell-tower positioning) without discarding legitimate high-speed movement.
+
+**After discard**: The system does NOT send the discarded ping to Redis or the stream. The last valid position remains in Redis. If no new pings arrive for >10 seconds, the system begins to age out the position (rider sees a progressively stale driver). This is the "fail-open" behavior described in the availability requirements.
+
+## Battery Optimization
+
+A driver's phone continuously sampling GPS and transmitting pings drains battery rapidly. The system must balance location accuracy with driver app battery life.
+
+**Adaptive sampling rate:**
+
+```
+if speed < 5 km/h for > 30s:
+    sample_rate = 1 ping / 60s    (stationary)
+elif speed < 15 km/h:
+    sample_rate = 1 ping / 10s    (slow movement, parking lot)
+elif speed < 60 km/h:
+    sample_rate = 1 ping / 5s     (normal urban driving)
+else:
+    sample_rate = 1 ping / 2s     (highway, position changes rapidly)
+```
+
+**How it works**: The server sends back a `recommended_interval_ms` in the response to each `POST /location/ping`. The driver app respects this recommendation (it's a hint, not a command — the app can override if it detects its own GPS quality issues). This avoids a protocol negotiation; the server knows the global load and can throttle all drivers uniformly during peak periods.
+
+**Battery estimation**: If the driver app reports low battery (&lt;15%), the server automatically reduces the sampling rate by 2× across the board. This is communicated via a device capability field in the auth token (set by the app during login when battery is low).
+
+**Offline buffering**: When the driver's network is unavailable (tunnel, dead zone), the app buffers pings locally (SQLite, limited to 100 pings). On reconnect, pings are sent in a batch (up to 20 at a time, 500ms apart). The server reconstructs the trajectory from `sampled_at` timestamps and fills in any gaps.
+
+**Why not use the OS location services**: Android's `FUSED_LOCATION_PROVIDER` and iOS's `CORE_LOCATION` offer power-efficient location updates, but they use smoothing algorithms that introduce latency (2-5s) and reduce positional accuracy (50-100m). For a ride-sharing system where the rider sees the driver's live position, raw GPS at a controlled rate is more important than OS-level battery optimization.

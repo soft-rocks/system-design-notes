@@ -1,0 +1,67 @@
+---
+title: Statistical Analysis Engine
+description: Metric aggregation, multiple comparison correction, and sequential testing for experiment results.
+---
+
+## Metric Aggregation
+
+For each experiment, the statistical engine computes three base metrics per variant:
+
+| Metric | Formula | Notes |
+|--------|---------|-------|
+| Impressions | `count(*)` | Number of users exposed to the variant |
+| Conversions | `sum(conversion_event)` | Count of target events per variant |
+| Conversion Rate | `conversions / impressions` | Primary metric per variant |
+| Mean Value | `sum(event_value) / impressions` | E.g., revenue per user |
+| Std Dev | `sqrt(sum(x²)/n - mean²)` | For confidence interval computation |
+
+Aggregation is done in ClickHouse using native `statefulMergeTree` — it maintains running sums and counts incrementally as events stream in. This avoids full-table scans and enables sub-100ms query response even with billions of events.
+
+**Per-user counting (not per-event):** The key invariant is that each user contributes at most once to the conversion count for a given experiment-metric pair. If a user fires a `purchase_completed` event 5 times, the conversion is counted once. This requires deduplication by `\{user_id, experiment_id, event_name, event_date\}` before aggregation.
+
+**Denominator selection:** Impressions count users who were *assigned* to the variant and saw the experiment (i.e., an impression event was fired). Using impression denominator instead of conversion denominator avoids bias when the variant affects whether users trigger the tracking event.
+
+## Multiple Comparison Correction
+
+When evaluating many metrics (e.g., 20 KPIs) across multiple variants simultaneously, the probability of false positives (Type I errors) increases dramatically. If we test 20 metrics at α=0.05, we expect 1 false positive purely by chance.
+
+**Bonferroni correction (conservative):** Adjust α by dividing by the number of comparisons: `α_adjusted = α / n_comparisons`. For 20 metrics, α_adjusted = 0.05/20 = 0.0025. The advantage is simplicity and strong control of family-wise error rate (FWER). The disadvantage is reduced statistical power — real effects may be missed.
+
+**Benjamini-Hochberg (FDR control):** More powerful than Bonferroni. Sort p-values from smallest to largest, then find the largest k where `p_k ≤ (k/m) * α`. Reject all hypotheses 1 through k. This controls the false discovery rate (proportion of false positives among rejected hypotheses) rather than the family-wise error rate.
+
+**Recommendation:** Use Benjamini-Hochberg by default for exploratory analysis (when experiment creators are browsing metrics). Use Bonferroni for confirmatory analysis (pre-specified primary metric). Display both in the dashboard.
+
+**Multiple variants:** With 5 variants (control + 4 treatments), there are 4 comparison pairs against control. The correction must account for these 4 comparisons per metric. The total number of comparisons = `n_metrics × n_treatment_variants`.
+
+## Sequential Testing & Early Stopping
+
+**The problem:** Waiting for a fixed sample size ignores information gathered so far. In practice, experiment creators want to see results as early as possible. But checking p-values repeatedly during the experiment inflates the Type I error rate (the "peeking problem").
+
+**Alpha-spending functions:** Instead of a fixed α=0.05 threshold, we "spend" alpha as the experiment progresses. By the end of the experiment, the total alpha spent equals the original α. Early looks use a stricter threshold; later looks become progressively less strict.
+
+### O'Brien-Fleming spending function
+
+Conservative early looks, liberal later looks. At look i of n total planned looks:
+
+`α_spent(i) = 2 - 2 * Φ(z_\{α/2\} * sqrt(i/n))`
+
+where Φ is the standard normal CDF and z_\{α/2\} is the critical value (1.96 for α=0.05).
+
+**Example — 6-look experiment:**
+
+| Look | Alpha spent | Effective p-value threshold |
+|------|-------------|----------------------------|
+| 1/6  | 0.0001      | p < 0.0001 (very strict)  |
+| 2/6  | 0.001       | p < 0.001                  |
+| 3/6  | 0.005       | p < 0.005                  |
+| 4/6  | 0.015       | p < 0.015                  |
+| 5/6  | 0.035       | p < 0.035                  |
+| 6/6  | 0.050       | p < 0.050 (standard)       |
+
+**Group sequential method:** Alternatively, use the Lan-DeMets alpha-spending approach with a pre-defined spending function. This allows irregular looks (e.g., when sample size milestones are reached) while maintaining strict error rate control.
+
+**Guardrail metrics:** Every experiment should have guardrail metrics (e.g., page load time, crash rate, support tickets) that must not significantly degrade. If a guardrail metric shows p < 0.05 in the negative direction, the experiment stops automatically even if the primary metric is significant. This prevents "significant wins" that come at an unacceptable cost.
+
+### Sample Ratio Mismatch (SRM) detection
+
+After collecting data, we verify that the observed traffic distribution matches the intended distribution. A significant SRM (χ² test, p < 0.001) indicates a bug in the assignment system — results should be flagged as unreliable. SRM is the primary signal of assignment bugs.

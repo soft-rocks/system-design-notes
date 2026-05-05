@@ -1,0 +1,115 @@
+---
+title: Distributed Coordination
+description: ZooKeeper vs Raft, leader election, and metadata management
+---
+
+## ZooKeeper vs Raft
+
+The coordination layer manages cluster metadata: broker liveness, partition leadership, consumer group membership, and topic configuration. Two architectures are viable:
+
+**ZooKeeper (Kafka 0-2.x):**
+
+ZooKeeper is an external coordination service with a hierarchical namespace of ephemeral znodes. Brokers register themselves as ephemeral znodes under `/brokers/ids/`. If a broker crashes, its znode disappears, triggering a callback in the ZooKeeper client. The controller (also a ZooKeeper-elect) watches these events and triggers leader elections.
+
+```
+/zookeeper
+  /brokers
+    /ids
+      /1  <- ephemeral, contains broker 1's metadata JSON
+      /2  <- ephemeral
+      /3  <- ephemeral
+    /topics
+      /orders -> partition assignments
+    /controller -> broker ID of current controller (ephemeral)
+  /consumers
+    /groups
+      /order-processors
+        /members
+          /consumer-1 -> ephemeral
+          /consumer-2 -> ephemeral
+        /offsets
+          /orders/0 -> offset value
+```
+
+**Raft (Kafka KRaft, 3.3+):**
+
+KRaft removes ZooKeeper by running every broker with a Raft-based metadata quorum. A small subset of brokers (typically 3 or 5) form the metadata quorum and replicate the metadata log. All brokers participate in the cluster but only quorum brokers store and replicate metadata.
+
+**Tradeoff analysis:**
+
+| Aspect | ZooKeeper | Raft (KRaft) |
+|---|---|---|
+| Operational complexity | External dependency to manage | No external dependency |
+| Metadata scaling | ZK session limit (~10K clients) | Scales with quorum size |
+| Failure mode | ZK outage = cluster can read but not change metadata | Quorum loss = full cluster outage |
+| Controller failover | ~300ms (ZK session expiry) | ~100ms (Raft leader election) |
+| ZooKeeper cost | Extra infrastructure to deploy and monitor | None |
+| Maturity | Battle-tested since 2010 | Proven in production since 2022 |
+
+**Why move away from ZooKeeper?**
+
+Kafka's metadata operations (topic creation, partition reassignment, consumer group rebalancing) all go through ZooKeeper. At 100K topics, ZooKeeper's znode count becomes a bottleneck. The ZK client connection pool saturates with 100 brokers x 10K partitions x N clients. KRaft eliminates the ZK client connection overhead and scales metadata operations linearly.
+
+**Why not Etcd?**
+
+Etcd and ZooKeeper serve similar purposes (key-value stores with watch capability), but Etcd uses Raft internally while ZooKeeper uses ZAB. Etcd has a 1MB key-value limit and is not designed for the hierarchical, ephemeral-node patterns that ZooKeeper supports natively. KRaft was built as a custom Raft implementation optimized for Kafka's metadata model, not a generic key-value store.
+
+## Partition Assignment and Leader Election
+
+The controller maintains the authoritative assignment of partitions to brokers. This assignment is stored in the metadata store and watched by all brokers and clients.
+
+**Partition assignment model:**
+
+```
+Topic "orders" with 12 partitions -> 3 brokers
+
+Broker 1: Leader for P0, P4, P8        Follower for P1,P2,P3, P5,P6,P7, P9,P10,P11
+Broker 2: Leader for P1, P5, P9        Follower for P0,P2,P3, P4,P6,P7, P8,P10,P11
+Broker 3: Leader for P2, P3, P10, P11  Follower for P0,P1, P4,P5, P6,P7, P8,P9
+
+Preferred replica = the first replica in the list (set at topic creation).
+```
+
+**Leader election process:**
+
+1. Controller detects broker N is dead (ZooKeeper session expired or Raft heartbeat timeout).
+2. Controller loads the partition metadata for all partitions led by broker N.
+3. For each partition, controller selects the first ISR member as the new leader.
+4. Controller updates the partition metadata and writes it to the metadata store.
+5. The new leader starts accepting reads and writes immediately.
+
+**Why the controller is a single point of metadata change:**
+
+Having a single controller prevents split-brain in partition assignments. Two controllers could assign the same partition to different leaders, causing data corruption. The controller's authority is enforced by the metadata store's linearizability (ZK sequential consistency or Raft linearizable reads).
+
+**Standby controllers:**
+
+A secondary controller caches the full metadata state and can take over in seconds. It subscribes to metadata changes and maintains a local copy. When the primary controller fails, the standby reads the latest metadata offset and becomes the new controller. This reduces failover time from minutes (if it had to rebuild metadata from scratch) to seconds.
+
+## Metadata Caching in Clients
+
+Clients (producers and consumers) cache partition metadata locally to avoid a round-trip to the broker for every message. The cache maps `(topic, partition)` to `(leader broker, ISR brokers)`.
+
+**When metadata is refreshed:**
+
+1. **On startup**: Fetch the full metadata snapshot from a known broker.
+2. **On NotLeaderForPartition error**: Force a metadata refresh.
+3. **On periodic interval**: Default 5 minutes (configurable via `metadata.max.age.ms`).
+4. **On unknown topic/partition error**: Force a refresh.
+
+**Why client-side caching works:**
+
+Metadata changes (leader elections, partition reassignments) are relatively rare events compared to message throughput. A 5-minute cache max age means clients may briefly send to an old leader after a failover, but the broker responds with `NOT_LEADER_FOR_PARTITION`, triggering an immediate refresh. This is a design pattern: accept stale metadata temporarily and self-correct on error.
+
+**Metadata payload size at scale:**
+
+With 100K topics, 12 partitions each, 100 brokers:
+- 1.2M partition records x ~100 bytes each = 120KB of metadata per fetch.
+- Each client fetches this 120KB on every metadata refresh.
+- With 10K connected clients: 1.2GB of metadata traffic per refresh cycle.
+
+At 5-minute intervals, this is 4MB/s of metadata fetch traffic — manageable but non-trivial. KRaft reduces this by allowing partition-level metadata queries (fetch only the partitions a client cares about) rather than a full cluster snapshot.
+
+**The bootstrap broker concept:**
+
+Clients connect to a small set of bootstrap brokers (typically 3). Any bootstrap broker can serve the full metadata. Clients then connect to the actual leader brokers for data transfer. This decouples discovery from data path: you only need to know 3 broker addresses to find the entire cluster.

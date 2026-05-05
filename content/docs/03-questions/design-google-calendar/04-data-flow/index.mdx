@@ -1,0 +1,167 @@
+---
+title: Data Flow
+description: Write path, read path, and sync/replication flow for Google Calendar.
+---
+
+## Write Path
+
+### Event Creation Flow
+
+```
+Client → API Gateway → Event Service → CockroachDB → Kafka
+  │          │            │
+  │     TLS 1.3, JWT   validate + write
+  │          │            │
+  ▼          ▼            ▼
+ Auth       route       ACL check
+```
+
+1. Client sends `POST /events` to API Gateway (TLS 1.3, JWT auth)
+2. API Gateway routes to Event Service (consistent hash on `calendarId`)
+3. Event Service validates:
+   - User owns/writes to `calendarId` (ACL cache, 5ms TTL)
+   - Time constraints: `end > start`, past-event rules
+   - Recurrence rule validity (RFC 5545 parser)
+   - Overlap check against primary calendar (Redis set, O(n))
+4. Event Service writes to CockroachDB:
+   - INSERT event row with `created_at`, `updated_at`, `etag` (UUIDv7)
+   - If recurring: insert master row, mark `is_recurring=true`
+   - Write TTL: 10 years (past events auto-archive)
+5. Publish `event.created` to Kafka topic `calendar-events` (3 replicas, ack=all)
+6. Return 200 with event resource + ETag
+
+### Event Update Flow
+
+1. Client sends `PATCH /events/\{id\}` with `If-Match: <etag>`
+2. Event Service compares ETag → 412 on mismatch
+3. UPDATE event row, increment version, return new ETag
+4. Publish `event.updated` to Kafka
+5. Recurrence override: atomic update to exception row only
+
+### Event Deletion Flow
+
+1. `DELETE /events/\{id\}`
+2. Recurring master → soft-delete all (`status=cancelled`)
+3. Single occurrence → delete exception or insert cancellation override
+4. Publish `event.deleted` to Kafka
+5. Return 204 No Content
+
+### Write Path Latency Budget
+
+| Step | Component | Budget | Actual |
+|------|-----------|--------|--------|
+| Auth + ACL check | API Gateway + Redis | 5ms | 2ms |
+| Validation + overlap | Event Service | 10ms | 5ms |
+| DB write | CockroachDB | 50ms | 15ms |
+| Kafka publish | Event Service | 10ms | 5ms |
+| **Total** | | **75ms** | **~27ms** |
+
+---
+
+## Read Path
+
+### Calendar View Load Flow
+
+```
+Client → API Gateway → Event Service → Redis (cache)
+                                    → CockroachDB (replica)
+                                    → RecurrenceEngine (expand)
+```
+
+1. Client sends `GET /events?timeMin=...&timeMax=...&singleEvents=true`
+2. API Gateway routes to Event Service (hash on `calendarId`)
+3. Check Redis cache:
+   - Key: `calendar:view:\{calendarId\}:\{timeMin\}:\{timeMax\}`
+   - TTL: 30s
+   - Hit: return cached (2ms)
+4. Query CockroachDB read replica:
+   - Index: `idx_events_calendar_time` on `(calendar_id, start, end)`
+   - Single query: events + pending exceptions via UNION
+5. RecurrenceEngine expands recurrences in-memory:
+   - Compute occurrences in time window
+   - Apply exceptions
+   - Deduplicate by `recurringEventId + originalStartTime`
+6. Sort by `start.time`, group by calendar
+7. Write to cache, return to client
+
+### Read Path Latency Budget (cache miss)
+
+| Step | Component | Budget | Actual |
+|------|-----------|--------|--------|
+| Cache check | Redis | 2ms | 1ms |
+| DB query | CockroachDB replica | 50ms | 20ms |
+| Recurrence expansion | Event Service (in-memory) | 100ms | 30ms |
+| Sort + group | Event Service | 20ms | 10ms |
+| Cache write | Redis | 5ms | 2ms |
+| **Total** | | **177ms** | **~63ms** |
+
+### Read Path Latency Budget (cache hit)
+
+| Step | Component | Budget | Actual |
+|------|-----------|--------|--------|
+| Cache check + return | Redis | 5ms | 2ms |
+| **Total** | | **5ms** | **2ms** |
+
+### Multi-Calendar View
+
+- Up to 30 calendarIds in single call
+- Fan-out via `calendar_id IN (...)`
+- Results merged by `singleEvents=true` expansion
+
+---
+
+## Sync/Replication Flow
+
+### Cross-Region Replication (Active-Active)
+
+```
+Region A (Primary)          Region B (Secondary)
+┌──────────────┐           ┌──────────────┐
+│ CockroachDB  │──Raft──▶ │ CockroachDB  │
+│ (Local Quorum)│ Replication│ (Local Quorum)│
+└──────────────┘           └──────────────┘
+      │                           │
+ writes (local)           reads (local) +
+                          fallback writes
+```
+
+- CockroachDB multi-region with LEASING mode
+- Local reads/writes to nearest region
+- Cross-region Raft replication: RPO < 1s guaranteed
+- Conflict resolution: multi-primary replication with vector clocks
+
+### Cache Replication
+
+- Redis Cluster: sharded by `calendarId`, 3 replicas per shard
+- Write-through: all event writes invalidate/update cache
+- Cross-region cache sync: background diff sync, 5s stale tolerance
+
+### Kafka Event Stream (internal)
+
+```
+Event Service → Kafka `calendar-events` (100 partitions, key=calendarId)
+  ├─ SearchIndex → Elasticsearch
+  ├─ NotificationService → schedule reminders
+  ├─ Analytics → aggregate metrics
+  └─ AuditLog → compliance trail
+```
+
+- Partitions keyed by `calendarId` (ordering guarantee per calendar)
+- Retention: 7d (search/notifications), 90d (analytics), 1y (audit)
+- Consumers track offsets; max lag < 3s under normal load
+
+### Real-Time Sync Propagation
+
+```
+DB Write → CDC (Changefeed) → Kafka → Sync Service
+                                     │
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+             WebSocket push    Webhook push     Polling pageToken
+             (immediate, &lt;1s)  (async, &lt;5s)    (polling, 5-30s)
+```
+
+- CDC captures CockroachDB changefeed
+- Sync Service fans out to connected WebSocket sessions
+- Webhook endpoint invoked asynchronously with retry
+- Polling clients get incrementing version numbers; `changes` API returns delta since cursor

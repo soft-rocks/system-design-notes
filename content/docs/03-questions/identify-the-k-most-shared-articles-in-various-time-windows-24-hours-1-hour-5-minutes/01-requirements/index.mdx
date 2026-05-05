@@ -1,0 +1,72 @@
+---
+title: "Requirements"
+description: "Functional and non-functional requirements for the K most shared articles tracking system"
+---
+
+## Functional Requirements
+
+### Scope of "Most Shared"
+
+The system tracks **share events** — atomic actions where a user shares an article via social media, email, SMS, messaging apps, or direct link copying. Each share event is recorded as `\{article_id, timestamp, source, user_id\}`.
+
+We are **not** measuring:
+- Page views or clicks (that's a separate analytics pipeline)
+- Re-shares (we track the originating share action)
+- Engagement metrics (likes, comments)
+
+### Sliding Window Top-K
+
+The core query: **"What are the top K articles shared in the last T?"** where T ∈ \{5 minutes, 1 hour, 24 hours\}.
+
+Requirements:
+- Windows are **sliding**, not tumbling. A query issued at 10:30am about the last 5 minutes includes events from 10:25–10:30, not a fixed bucket.
+- **Multiple window sizes** must be supported from the same ingestion pipeline.
+- K is typically 10–100 per query.
+- The system should support optional filters: by category, by sharing source, by time boundaries.
+
+### Real-time Event Ingestion
+
+- Share events arrive **asynchronously** from many sources (social APIs, email gateways, client-side webhooks).
+- End-to-end latency: < 1 second for 5-minute window queries.
+- Events may arrive out of order by up to a few seconds (network jitter, retry logic).
+- The system must handle **bursty traffic** — a viral article can cause a 10x–100x spike in share rate.
+
+### Query API
+
+```
+GET /api/v1/trending/top-k?window=5m&k=10&category=tech
+GET /api/v1/trending/top-k?window=1h&k=100
+GET /api/v1/trending/top-k?window=24h&k=10&source=twitter
+```
+
+- Response: `[\{article_id, count, title, ...metadata\}]`
+- Results can be **eventually consistent** — it's acceptable for the count to lag behind reality by a few seconds.
+- Cache-friendly: the same query can be served from cache.
+
+## Non-Functional Requirements
+
+| Requirement    | Target                          |
+| -------------- | ------------------------------- |
+| Throughput     | 500K events/sec peak (~10B/day) |
+| Query latency  | < 100ms p99                     |
+| Availability   | > 99.99%                        |
+| Durability     | Zero event loss                 |
+| Scalability    | Horizontal scaling              |
+| Consistency    | Eventual (seconds-level lag OK) |
+
+## Scale Assumptions
+
+- **Articles**: ~100M total, ~100K actively shared at any time
+- **Events**: ~10B shares/day, ~115K/sec average, peak ~500K/sec
+- **Event size**: ~100 bytes → ~1TB/day raw event log
+- **Storage**: 3-day raw event log = ~3TB; aggregated counters are much smaller (~100MB–1GB)
+- **QPS**: ~1K query/sec average, peak ~10K/sec
+
+## Why This Is Hard
+
+This is not a simple counter problem. The key challenges:
+
+1. **Multiple sliding windows** require different aggregation granularities without storing raw events for 24 hours.
+2. **Skewed distribution** — a viral article can account for 1%+ of all shares. The solution must handle Zipf-like distributions.
+3. **Real-time updates** — the 5-minute window must reflect new shares almost instantly, while the 24-hour window needs to maintain accuracy across a much larger history.
+4. **Top-K computation** on billions of events must be efficient. We cannot scan all articles on every query.

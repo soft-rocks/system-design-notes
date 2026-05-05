@@ -1,0 +1,62 @@
+---
+title: Core Entities
+description: Core entities for API rate limiter system design
+---
+
+## Entity Definitions
+
+### Client
+| Field | Type | Notes |
+|-------|------|-------|
+| `clientId` | String | Unique identifier — API key, user ID, or account ID |
+| `tier` | Enum | FREE / PRO / ENTERPRISE — determines default policy |
+| `status` | Enum | ACTIVE / SUSPENDED / BLOCKED |
+| `metadata` | JSON | Tenant info, tags, custom attributes |
+| `createdAt` | Timestamp | Registration time |
+
+### RateLimitPolicy
+| Field | Type | Notes |
+|-------|------|-------|
+| `policyId` | String | Unique policy identifier |
+| `tier` | Enum | Applicable subscription tier |
+| `scopes` | Map | `\{second: {rate: 10, burst: 20\}, minute: \{rate: 500, burst: 800\}, hour: \{rate: 10000, burst: 15000\}, day: \{rate: 100000, burst: 150000\\&#125;&#125; ` |
+| `whitelisted` | Boolean | Bypass all rate limiting |
+| `blacklisted` | Boolean | Block all requests |
+| `customRules` | List | Per-endpoint or per-path override rules |
+| `updatedAt` | Timestamp | Last policy update |
+
+Each `scopes` entry defines a **token bucket** with:
+- `rate`: tokens added per second (sustained throughput)
+- `burst`: maximum bucket capacity (peak burst tolerance)
+
+### ClientScope
+| Field | Type | Notes |
+|-------|------|-------|
+| `clientId` | String | Parent client |
+| `scopeType` | Enum | API_KEY / IP_ADDRESS / USER_ID / COMPOSITE |
+| `scopeValue` | String | The actual key/IP/user ID being scoped |
+
+A single client may have multiple scopes — each enforced independently against the policy.
+
+### RateLimitBucket (runtime state, per client + scope + window)
+| Field | Type | Notes |
+|-------|------|-------|
+| `clientId` | String | Client ID |
+| `scopeType` | String | Which scope this bucket tracks |
+| `window` | Enum | SECOND / MINUTE / HOUR / DAY |
+| `tokens` | Float | Current available tokens (float for fractional refill precision) |
+| `lastRefill` | Timestamp | Last time tokens were refilled |
+| `lastRefillAmount` | Float | Tokens added in last refill (for audit) |
+
+Each bucket is independently managed. The **most restrictive** bucket determines whether a request is allowed.
+
+## Relationships
+
+```
+Client ──[1:1]──► RateLimitPolicy (via tier lookup)
+Client ──[1:N]──► ClientScope (multiple identity dimensions)
+RateLimitPolicy ──[1:N]──► RateLimitBucket (one bucket per window scope per client)
+```
+
+Policy lookup: `Client → tier → RateLimitPolicy → scopes`
+Enforcement: `ClientScope → RateLimitBucket[window]` for each window, deny if **any** bucket has zero tokens.

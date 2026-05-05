@@ -1,0 +1,177 @@
+---
+title: "High Level Design"
+description: "High-level architecture for ETA service"
+---
+
+## Architecture Overview
+
+```
+                            ┌─────────────────────────────────────────────────────────────────────────────┐
+                            │                              API Gateway                                    │
+                            │                   (Auth, Rate Limit, SSL Termination, Routing)               │
+                            └────┬──────────────────────────────┬──────────────────────┬───────────┬────────┘
+                                 │                              │                      │           │
+                 ┌───────────────┘                              │                      │           │
+                 │  Rider/Driver requests (HTTP)                 │                      │           │
+                 ▼                                               │                      │           │
+        ┌────────────────┐                                       │                      │           │
+        │  Matching       │◄──── Discover nearby drivers         │                      │           │
+        │  Service        │   (Redis GEOSEARCH by GeoHash)       │                      │           │
+        │                 │                                       │                      │           │
+        │ • GeoHash grid  │                                       │                      │           │
+        │ • Ranking       │                                       │                      │           │
+        │ • Soft assign   │                                       │                      │           │
+        └───────┬─────────┘                                       │                      │           │
+                │ trip_id created                                  │                      │           │
+                ▼                                                  │                      │           │
+        ┌────────────────┐                                         │                      │           │
+        │  Trip Service   │◄── State machine (ACID txns)           │                      │           │
+        │                 │                                        │                      │           │
+        │ • Lifecycle     │                                        │                      │           │
+        │ • Notifications │                                        │                      │           │
+        └───────┬─────────┘                                        │                      │           │
+                │ trip active                                        │                      │           │
+                └──────────────────────────────────────────────────┼──────────────────────┘           │
+                                                                   │                                  │
+                                                         ┌─────────┴──────────┐     ┌──────────────┴──────┐
+                                                         │  Location Service  │     │  ETA Service    │
+                                                         │                    │     │                 │
+                                                         │ • Ingest GPS       │     │ • Compute ETA   │
+                                                         │ • Write Redis      │     │ • Cache ETA     │
+                                                         │ • Pub/Sub push     │     │ • Route mgmt    │
+                                                         └─────────┬──────────┘     └───────┬─────────┘
+                                                                   │                        │
+                                                             ┌─────▼──────────┐   ┌────────▼─────────┐
+                                                             │  Redis Cluster │   │  Route Cache     │
+                                                             │  (Real-Time    │   │  (Redis, TTL 5-  │
+                                                             │   Store)       │   │  10 min)         │
+                                                             └─────┬──────────┘   └──────────────────┘
+                                                                   │
+                                                              ┌────┴────┐
+                                                              │ Kinesis │  location-pings events
+                                                              │ Stream  │
+                                                              └────┬────┘
+                                                                   │
+                                                    ┌──────────────┼────────────────┐
+                                                    ▼              ▼                ▼
+                                             ┌──────────┐   ┌────────┐   ┌──────────┐
+                                             │  Flink   │   │ Redis  │   │ Cassandra│
+                                             │Processor │   │Pub/Sub │   │/Timescale│
+                                             └──────────┘   └────────┘   └──────────┘
+```
+
+**Key architectural decisions:**
+
+1. **Service decomposition by access pattern**: The Location Service and ETA Service are split because their access patterns are fundamentally different. Location is write-heavy (1M writes/sec), low-latency (Redis). ETA is compute-heavy (graph search) but read-light (cached). Combining them would create resource contention — a CPU-bound ETA query could block a location write.
+
+2. **Redis as real-time store**: Every active trip has a Redis key (`driver:location:{trip_id}`). This is the single source of truth for "where is the driver right now?" — both polling and WebSocket paths read from here. Redis cluster is sharded by `hash(trip_id)` — all reads/writes for the same trip hit the same shard.
+
+3. **Event-driven architecture**: GPS pings flow through Kinesis to enable multiple downstream consumers (analytics, fraud detection, archival) without impacting the hot path. This is the "write once, read many" pattern.
+
+4. **Multi-region active-active**: Each region handles its own trips independently. No cross-region hot path communication — RTT between continents (~80ms LA→Frankfurt) would violate the &lt;50ms p99 latency SLA.
+
+## Component Diagram
+
+```
+┌─────────────────────────────────────────────── Trip Lifecycle ──────────────────────────────────────────────────┐
+│                                                                                                                 │
+│   Rider App                  Matching Service           Trip Service              Rider/Driver App              │
+│       │                              │                         │                           │                  │
+│       │  Request Ride                │                         │                           │                  │
+│       │─────────────────────────────►│                         │                           │                  │
+│       │                              │  Query Redis (nearby    │                           │                  │
+│       │                              │   drivers by GeoHash)   │                           │                  │
+│       │                              │────────────────────────►│                           │                  │
+│       │                              │                         │                           │                  │
+│       │         Offer to Driver N    │                         │                           │                  │
+│       │                              │──────────────────────────────────────────────────►│                  │
+│       │                              │                         │                           │◄─────────────────│
+│       │                              │                         │                           │  Accept/Decline   │
+│       │         Driver Accepted!     │                         │                           │                  │
+│       │◄─────────────────────────────│                         │                           │                  │
+│       │                              │  Update Trip State      │                           │                  │
+│       │                              │────────────────────────►│                           │                  │
+│       │                              │                         │  Notify Driver of Trip    │                  │
+│       │                              │                         │◄──────────────────────────│                  │
+│       │                              │                         │                           │                  │
+│       │                              │                    IN_PROGRESS                       │                  │
+│       │                              │                    │                          IN_PROGRESS                 │
+│       │◄────────────── Polls every 5s ──────────────────────│◄─────────── Polls Trip State ────────────│       │
+│       │    GET /trip/{id}/driver-loc  │                       │       GET /trip/{id}                     │       │
+│       │    Returns: {lat,lng,eta}    │                       │                                       │       │
+│       │                              │                         │◄────────── Driver GPS pings ────────│       │
+│       │                              │                         │POST /location/ping                     │       │
+│       │                              │                         │                                         │       │
+│       │                    (background)                         │                                         │       │
+│       │                              │◄─── ETA updates ────────┤                                         │       │
+│       │◄─── Map Marker Update ───────┤                         │                                         │       │
+│       │    (every 5-10s)             │                         │                                         │       │
+│       │                              │                         │                                       │       │
+│       │  Trip Completed              │                         │   Trip Completed                    │       │
+│       │─────────────────────────────►│────────────────────────►│   ───────────────────────────►        │       │
+│       │                              │                         │                                       │       │
+│       │                              │  Clean up Redis keys    │                                       │       │
+│       │                              │────────────────────────►│                                       │       │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component responsibilities:**
+
+| Component | Role | Tech |
+|---|---|---|
+| API Gateway | Auth, rate limiting, SSL termination, request routing | Kong / AWS ALB |
+| Matching Service | Driver discovery, ranking, offer logic | Go, Redis GeoHash |
+| Location Service | GPS ingestion, Redis write, pub/sub | Go, Redis Cluster |
+| ETA Service | ETA computation, caching, route management | Java/Go, Redis + Route Cache |
+| Trip Service | State machine, trip lifecycle, notification triggers | Java, PostgreSQL |
+| Redis Cluster | Real-time store (location + ETA) | Redis Cluster (sharded by trip_id) |
+| Kinesis Stream | Event distribution for downstream consumers | AWS Kinesis |
+| Flink Processor | Anomaly detection, aggregation, enrichment | Apache Flink |
+| Time-Series DB | Historical location storage | Cassandra / TimescaleDB |
+| Connection Manager | WebSocket session management | Go, Redis-backed |
+
+## Technology Choices
+
+### Real-Time Store: Redis vs Memcached vs Hazelcast
+
+**Chosen: Redis Cluster (sharded)**
+
+- **Why Redis over Memcached**: Need atomic TTL per key (`SET key val EX ttl`), Pub/Sub for WebSocket push, and atomic operations for GeoHash queries (nearby driver search). Memcached has none of these.
+- **Why Redis Cluster over single-node**: 500K+ keys with sub-10ms latency requires horizontal sharding. Redis Cluster distributes keys across N nodes with automatic failover via cluster gossip protocol.
+- **Sharding strategy**: `hash(trip_id) % num_shards`. Consistent hashing ring ensures minimal reassignment on shard add/remove.
+- **Why not Hazelcast**: Hazelcast is in-memory data grid, good for Java-based systems. However, it requires application-level coordination and has higher memory overhead per key. Redis is purpose-built for this exact pattern and has better operational tooling.
+
+### Time-Series Storage: Cassandra vs TimescaleDB
+
+**Chosen: Cassandra (with Cassandra Query Language)**
+
+- **Write throughput**: Cassandra handles 500K+ writes/sec per region with linear scalability. Append-only writes (location pings) map naturally to Cassandra's write-optimized storage engine.
+- **Time-to-live**: Built-in TTL per row — `INSERT INTO location_history ... USING TTL 2592000` (30 days). No background cleanup job needed.
+- **Why not TimescaleDB**: TimescaleDB (PostgreSQL extension) is great for moderate-scale time-series but would struggle with 500K writes/sec. PostgreSQL write bottleneck is WAL (write-ahead log) throughput.
+- **When to reconsider**: If we need complex analytics queries (e.g., "find all drivers who were at location X between time Y and Z"), TimescaleDB's SQL capabilities would be valuable. Cassandra is better for simple range scans by (trip_id, timestamp).
+
+### Stream Processing: Kinesis vs Kafka vs Pulsar
+
+**Chosen: AWS Kinesis Data Streams**
+
+- **Integration**: Already using other AWS services (EC2, DynamoDB, S3). Kinesis has native integration with Flink (via Kinesis Data Analytics), Lambda, and S3 export.
+- **Managed service**: No operational overhead of managing Kafka brokers. Auto-scales shards based on throughput.
+- **Retention**: 7-day default retention (up to 365 days) is sufficient for replaying recent events for debugging.
+- **Why not Kafka**: Kafka offers better throughput and lower latency but requires significant operational expertise (ZooKeeper, broker tuning, partition management). For a single-provider cloud deployment, Kinesis is lower operational risk.
+- **Why not Pulsar**: Pulsar has great storage-separation architecture but is complex to deploy and has less mature cloud-native integration.
+
+### Database for Trip State: PostgreSQL vs DynamoDB
+
+**Chosen: PostgreSQL**
+
+- **Trip state requires strong consistency**: Both rider and driver must see the same trip status. PostgreSQL's ACID guarantees (row-level locking, transactions) are essential for state machine transitions.
+- **Complex queries**: "Find all active trips for driver X", "Find all trips in bounding box Y" — PostgreSQL handles these well with proper indexes (GIN for GeoJSON, partial indexes for active trips).
+- **Why not DynamoDB**: DynamoDB is eventually consistent (unless using ConditionalWrite with strong read). Trip state machine transitions need to be atomic and prevent race conditions. PostgreSQL transactions handle this elegantly.
+- **When to reconsider**: If we need single-digit millisecond read latency for trip state, DynamoDB's single-digit ms is compelling. But our target is &lt;50ms p99 and PostgreSQL with connection pooling (PgBouncer) and read replicas easily meets this.
+
+### WebSocket Connection Manager: Why Separate Service
+
+- **Stateful connections**: Each WebSocket connection holds a subscription to Redis Pub/Sub for a specific trip channel. The Connection Manager must route messages to the correct connection.
+- **Memory per connection**: A single WebSocket connection consumes ~16KB of memory (buffer, TLS state). 500K connections = ~8GB RAM. This is a separate concern from stateless REST services.
+- **Auto-scaling**: WebSocket connections are geographically distributed (users connect to nearest edge). The Connection Manager can auto-scale per region using auto-scaling groups with sticky sessions.
+- **Tech choice**: Go — high concurrency with goroutines, low memory footprint (~5MB per 10K connections).

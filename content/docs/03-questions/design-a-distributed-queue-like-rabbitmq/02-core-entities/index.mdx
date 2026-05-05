@@ -1,0 +1,84 @@
+---
+title: Core Entities
+description: Message, Queue, Exchange, Binding, Virtual Host, Connection, and Consumer entities for a distributed message queue.
+---
+
+## Message
+
+Core unit: properties (contentType, contentEncoding, headers, messageId, timestamp, correlationId, replyTo, expiration/TTL, userId, appId, clusterId) + body (binary payload).
+
+**Delivery states:** pending (in queue) → delivered (in-flight, waiting ack) → acknowledged / rejected / nacked / requeued / dead-lettered.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `priority` | 0-9 | Higher priority dequeued first |
+| `persistence` | persistent/transient | persistent = disk-backed before ack |
+| `ttl` | string (ms) | Time-to-live; expired messages dropped or dead-lettered |
+| `headers` | map | Key-value pairs for header-based exchange routing |
+| `delivery_mode` | 1/2 | 1 = transient, 2 = persistent |
+
+## Queue
+
+Named collection of messages; declared by consumer or producer.
+
+**Properties:**
+| Property | Type | Description |
+|----------|------|-------------|
+| `durable` | boolean | Survives broker restart |
+| `auto_delete` | boolean | Deleted when last consumer disconnects |
+| `exclusive` | boolean | Connection-scoped only |
+| `x-message-ttl` | int (ms) | Default TTL for messages |
+| `x-max-length` | int | Max message count (back-pressure) |
+| `x-max-length-bytes` | int | Max queue size in bytes |
+| `x-dead-letter-exchange` | string | DLQ exchange |
+| `x-dead-letter-routing-key` | string | DLQ routing key |
+
+**State metrics:** message_count (ready + unacknowledged), consumer_count, disk_read_count, memory_usage.
+
+## Exchange
+
+Message routing point; receives messages from publishers and routes to queues.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `name` | string | Exchange name ("" = default) |
+| `type` | string | direct/topic/fanout/headers/direct-reply-to |
+| `durable` | boolean | Survives restart |
+| `auto_delete` | boolean | Deleted when no bindings remain |
+| `arguments` | map | Type-specific (x-match for headers) |
+
+## Binding
+
+Relationship between exchange and queue (or exchange and exchange).
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `source` (exchange) | string | Routing source |
+| `destination` (queue/exchange) | string | Routing target |
+| `routing_key` | string | Routing pattern |
+| `arguments` | map | Header match parameters |
+
+## Virtual Host (vhost)
+
+Logical namespace isolation within a broker. Contains separate set of exchanges, queues, bindings, and users. Each user has permissions scoped to a vhost (configure, write, read).
+
+## Connection
+
+TCP connection between publisher/consumer and broker. **Channels** are multiplexed over a single connection; each channel is an independent stream of commands.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `heartbeat` | int (seconds) | TCP keepalive equivalent; detects dead connections |
+| `max_channel` | int | Max channels per connection |
+| `frame_max` | int | Max frame size in bytes |
+
+## Consumer
+
+Client entity consuming messages from a queue via a channel.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `prefetch_count` | int | Unacked messages buffered per consumer (0 = unlimited) |
+| `auto_ack` | boolean | false = manual ack; true = auto-ack on delivery |
+| `consumer_tag` | string | Unique identifier for the consumer |
+| `state` | string | connected, paused (back-pressure), throttled (TCP flow control) |

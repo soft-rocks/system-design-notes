@@ -1,0 +1,103 @@
+---
+title: Data Flow
+description: Key data flows for message delivery, offline sync, history sync, typing, and calls
+---
+
+## 1. Send Message Flow
+
+```
+Client A (Sender)          WS Gateway          Message Service          Storage         Client B (Receiver)
+       |                       |                     |                    |                    |
+       |-- POST /messages ---->|                     |                    |                    |
+       |                       |-- Write to DB ------->|                   |                    |
+       |                       |   (pending status)    |                   |                    |
+       |                       |                     |-- Publish event --->|                    |
+       |                       |                     |  (message.created) |                    |
+       |                       |                     |                    |                    |
+       |                       |                     |<-- Subscribe ------|                    |
+       |                       |                     |  (real-time)       |                    |
+       |                       |                     |                    |                    |
+       |<-- message.new -------|                     |                    |                    |
+       |   (queued confirm)    |                     |                    |                    |
+       |                       |                     |                    |                    |
+       |                       |                     |                    |    message.new ---->|
+       |                       |                     |                    |   (via WebSocket)   |
+       |                       |                     |                    |                    |
+       |                       |                     |-- Update status -->|                    |
+       |                       |                     |   (delivered)      |                    |
+       |<-- message.status ----|                     |                    |                    |
+       |   (delivered)         |                     |                    |                    |
+```
+
+### Sequence
+1. Client A POSTs message -> WS Gateway -> Message Service
+2. Message Service writes to DB with `pending` status
+3. Message Service publishes `message.created` event to broker
+4. Delivery worker consumes event, finds recipient's gateway node
+5. Gateway pushes message to Client B via WebSocket
+6. Client B ACKs -> status updated to `delivered`
+7. Client B opens message -> sends `read` ACK -> status updated to `read`
+8. Client A receives delivery/read receipts via WebSocket
+
+## 2. Offline Message Delivery (Store & Forward)
+
+### Sequence
+1. Sender message written to DB with `pending` status
+2. Message Service checks recipient presence (Redis) -> offline
+3. Notification Service creates push notification via FCM/APNs
+4. Sender receives message ID back (queued)
+5. When recipient comes online and connects WebSocket, server fetches pending messages
+6. Deliver queued messages with cursor-based deduplication
+
+## 3. Message History Sync
+
+### Sequence
+1. Client connects WebSocket, sends session token + last known cursor
+2. Gateway authenticates and forwards to Message Service
+3. Message Service queries DB for messages after cursor
+4. Messages streamed back in batches via WebSocket
+5. Client ACKs receipt -> server updates `last_read` cursor
+
+## 4. Typing Indicator Flow
+
+### Sequence
+1. Client A sends typing start via WebSocket
+2. Gateway writes to Redis with 3s TTL
+3. Presence service broadcasts typing to other participants in the conversation
+4. On stop or TTL expiry, Redis entry deleted -> broadcast stopped state
+
+**Storage:** In-memory (Redis/Memcached), not persisted. Auto-expire after 3s.
+
+## 5. Voice/Video Call Flow
+
+```
+Client A           Call Service          Signaling WS       Client B
+   |                    |                      |                |
+   |-- call.invite ---->|                      |                |
+   |                    |-- Route to recipient >|                |
+   |                    |   gateway node         |                |
+   |                    |                      |-- invite ------|
+   |                    |                      |                |
+   |                    |                      |-- call.answer -|
+   |                    |<----- answer ---------|                |
+   |                    |                      |                |
+   |-- ICE via WS ------>|                      |-- ICE --------|
+   |                    |                      |                |
+   +------------------- WebRTC Media Stream ----------------------------------->|
+```
+
+### Sequence
+1. Caller sends `call.invite` to Call Service
+2. Call Service routes invite to recipient's gateway node
+3. Recipient accepts -> `call.answer` sent back
+4. ICE candidates exchanged via WebSocket signaling
+5. Media flows P2P via WebRTC (SFU for group calls)
+
+## Storage Data Distribution
+
+| Entity | Distribution Strategy |
+|---|---|
+| **Messages** | Sharded by `conversation_id` (hash -> shard). All messages in one conversation stay on same shard for ordering. |
+| **Users** | Hashed by `user_id` -> assigned to gateway node pool |
+| **Presence** | Redis cluster, keyed by `user_id` for low-latency reads |
+| **Delivery Receipts** | Sharded by `message_id`, composite query on `(message_id, user_id)` |

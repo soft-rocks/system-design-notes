@@ -1,0 +1,142 @@
+---
+title: API / System Interface
+description: REST endpoints, internal service interfaces, and event messaging for the Netflix screen-limit system.
+---
+
+## REST/GraphQL Endpoints
+
+### Playback Gate (Hot Path)
+This is the critical API called every time a user presses play. It must be extremely fast and is often served from edge cache.
+
+```
+POST /v2/stream/authenticate
+Request:
+  {
+    "account_id": "uuid",
+    "device_id": "string",
+    "video_id": "string",
+    "region": "string"
+  }
+Response 200:
+  {
+    "allowed": true,
+    "session_id": "uuid",
+    "active_count": 2,
+    "limit": 4
+  }
+Response 409:
+  {
+    "allowed": false,
+    "active_count": 4,
+    "limit": 4,
+    "active_streams": [
+      \{"device_id": "dev-abc", "display_name": "Living Room TV", "video_id": "tt123", "started_at": "2025-01-01T10:00:00Z"\}
+    ]
+  }
+```
+
+**Why POST not GET**: The request body is small but contains sensitive account info. POST allows future extensibility without changing the URL pattern. In practice, this call may be bundled with the video start request to the CDN, reducing round trips.
+
+**Why session_id is returned**: The client uses this for heartbeat reporting and clean deregistration. If the client crashes without sending STOP, the server can clean up via TTL.
+
+### Stream Heartbeat
+```
+POST /v2/stream/\{session_id\}/heartbeat
+Request: \{ "account_id": "uuid", "device_id": "string", "video_id": "string", "position_sec": int \}
+Response 200: \{ "status": "ok", "ttl_remaining_ms": 30000 \}
+```
+
+Sent every 10 seconds by the client. Updates `last_heartbeat_at` in Redis. The server responds with remaining TTL so the client can adjust its heartbeat frequency.
+
+### Stream Stop
+```
+POST /v2/stream/\{session_id\}/stop
+Request: \{ "account_id": "uuid", "device_id": "string", "video_id": "string", "stopped_at": "timestamp" \}
+Response 200: \{ "status": "stopped" \}
+```
+
+Called when the user explicitly stops playback, switches apps, or the app goes to background. This is the primary deregistration path. **Not** called on crash — those are handled via TTL expiration.
+
+### Device Management
+```
+GET /v2/devices?account_id=uuid
+Response 200: \{ "devices": [ { "device_id": "string", "platform": "SMART_TV", "display_name": "Living Room TV", "app_version": "8.15.0", "last_active_at": "timestamp", "registered_at": "timestamp" \} ] }
+
+POST /v2/devices/\{device_id\}/deactivate
+Response 200: \{ "status": "deactivated" \}
+```
+
+### Device Registration (Implicit)
+Registration is not a separate API call — it happens implicitly during playback authentication. If the device_id is not yet in the DeviceProfile table, it is inserted asynchronously via an event. Users who want to pre-register devices (e.g., for parental controls) can use:
+
+```
+POST /v2/devices/register
+Request: \{ "device_id": "string", "display_name": "string", "platform": "string", "app_version": "string" \}
+Response 200: \{ "status": "registered" \}
+```
+
+## Internal Service Interfaces
+
+### LimitService (in-process module)
+```
+interface LimitService {
+  // Hot path: O(1) Redis check + in-memory cache
+  CheckCapacity(accountId string) (allowed bool, activeCount int, limit int, err error)
+
+  // Register a new stream session. Atomic increment in Redis.
+  RegisterSession(sessionId string, accountId string, deviceId string, region string) error
+
+  // Deregister a session. Atomic decrement in Redis.
+  UnregisterSession(sessionId string, accountId string) error
+
+  // Get active streams for a given account (used in 409 response)
+  GetActiveStreams(accountId string) ([]StreamInfo, error)
+
+  // Get plan tier for an account (cached, refreshed every 60s)
+  GetPlanTier(accountId string) (PlanTier, error)
+
+  // Invalidate plan cache on plan change
+  InvalidatePlanCache(accountId string) error
+}
+```
+
+**Why an internal interface, not gRPC**: This is all in-process code. The LimitService is a module within the Stream Limit Service. It interacts with Redis, the local plan cache, and publishes events. This separation exists for testability and to swap out the Redis implementation if needed.
+
+### Redis Key Design
+
+| Key Pattern | Type | TTL | Purpose |
+|---|---|---|---|
+| `stream:count:\{account_id\}` | int (atomic counter) | Never | Current active stream count |
+| `stream:session:\{session_id\}` | hash | 10 min (extended per heartbeat) | Session metadata |
+| `stream:account:\{account_id\}:sessions` | set of session_ids | Never | Active session enumeration for 409 responses |
+| `device:\{device_id\}` | hash | 24 hours | Device profile cache |
+| `plan:\{account_id\}` | hash \{tier, stream_limit\} | 60 seconds | Plan tier cache |
+
+**Why Redis over Memcached**: Redis provides atomic counters (INCR/DECR), sets (for enumerating active sessions), and key expiration — all needed for the limit service. Memcached lacks atomic operations and key expiration callbacks.
+
+**Why TTL on session keys**: If a client crashes without sending STOP, the TTL-based cleanup ensures the session is eventually removed. 10 minutes is generous enough to cover temporary network issues but short enough to prevent stale sessions from bloating the counter.
+
+### Plan Cache (Local, within each service instance)
+Each service instance maintains a local LRU cache of plan tiers (key: account_id, TTL: 60s, invalidate on PlanChanged event). This reduces plan lookups from ~1ms (Redis round-trip) to ~50μs (local memory). The 60s TTL with event-based invalidation ensures plan changes propagate within 60s worst case — < 1s in practice via event invalidation.
+
+## Event / Messaging Interfaces
+
+### Events Published by Stream Limit Service
+
+| Event | When | Key Fields |
+|---|---|---|
+| `StreamStarted` | New playback begins | session_id, account_id, device_id, video_id, region |
+| `StreamEnded` | Playback stops | session_id, account_id, device_id, stopped_at, reason |
+| `DeviceProfileCreated` | New device implicitly registered | device_id, account_id, platform, app_version |
+
+### Events Consumed by Stream Limit Service
+
+| Event | Source | Effect |
+|---|---|---|
+| `PlanChanged` | Billing Service | Invalidate local plan cache for account |
+| `AccountStatusChanged` | Auth Service | Block streams if status = PAST_DUE |
+| `DeviceDeactivated` | Device Management Service | Remove device, optionally stop its streams |
+
+**Why events over synchronous calls**: The Stream Limit Service is the hot-path service. It should not be slowed down by synchronous calls to Billing or Auth services. Events decouple the dependency — if Billing is down, existing streams continue to work. The plan cache TTL (60s) bounds the inconsistency window.
+
+**Why Kafka (not a queue)**: Kafka provides persistence, replay, and ordering — critical for audit and debugging. If a new Stream Limit Service instance comes online, it can replay events from a watermark to rebuild state. Dead-letter queues capture failed events for manual inspection.

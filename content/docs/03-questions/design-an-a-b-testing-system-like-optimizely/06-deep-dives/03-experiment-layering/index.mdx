@@ -1,0 +1,53 @@
+---
+title: Experiment Layering
+description: How multiple concurrent experiments can run without interference using layers and negative control groups.
+---
+
+## Layer Architecture
+
+When multiple experiments run on the same page, they can interfere with each other. For example, two experiments both trying to change the color of the same button would produce ambiguous results.
+
+Layers solve this by grouping mutually exclusive experiments. A user can be in at most one experiment per layer.
+
+### Assignment algorithm for layers
+
+1. Compute `layerHash = hash(userId, layerId) % 10000`
+2. If `layerHash` falls in the experiment's traffic allocation range, assign to that experiment's variant
+3. If not, the user is a "negative control" (sees all experiments in this layer in their default state)
+
+### Layer design best practices
+
+- Group experiments that touch the same UI element into the same layer
+- Group experiments with similar objectives (e.g., "checkout flow" experiments) into one layer
+- Use a separate layer for "above the fold" vs "below the fold" experiments if they don't interact
+- Maximum ~5-10 layers to avoid complexity
+
+### Hash separation
+
+Within a layer, we use `hash(userId, layerId)` (not `hash(userId, experimentId)`) to determine if the user enters any experiment in the layer at all. If they do, we then use `hash(userId, experimentId)` to determine which variant within that experiment. This ensures mutual exclusion at the layer level.
+
+**Edge case — user in multiple layers:** A user can participate in one experiment per layer, and multiple layers can run concurrently. The SDK evaluates layers independently and merges variant configurations. If two experiments in different layers both modify the same feature, we use a precedence policy (e.g., most recent experiment takes precedence, or explicit conflict resolution rules).
+
+## Negative Control Groups
+
+Negative controls are users assigned to see the default experience in a layer. They are the complement of all experiment traffic.
+
+| Layer | Allocation | Traffic | Control |
+|-------|-----------|---------|---------|
+| Checkout Flow | 20% experiments | 80% negative control | 80% of users see default |
+
+**Negative control size matters:** If experiments capture 20% of traffic in a layer, the remaining 80% serve as the negative control. This is the baseline for comparison. We need sufficient negative control size for statistical power.
+
+**Cross-layer negative control:** If a user is in 3 experiments across 3 layers, the probability they're in the negative control for all layers is the product of individual control probabilities. For 3 layers with 20% experiment traffic each, the probability of being in all negative controls is 0.8³ = 51.2%. This is why we track per-layer participation.
+
+**Impact on power calculations:** The effective sample size for an experiment is: `total_users × traffic_allocation × (1 - interference_from_other_layers)`. If other experiments in the same layer affect the same metric, the control group contamination must be accounted for.
+
+## Interference Detection
+
+**SRM (Sample Ratio Mismatch) per layer:** Each layer should independently check that observed traffic matches expected allocation. If layer "Checkout Flow" expects 20% but observes 15%, something is wrong.
+
+**Metric correlation analysis:** If two experiments in the same layer show correlated metric shifts, it may indicate that users are crossing layer boundaries (a bug in the assignment logic).
+
+**Cannibalization detection:** When experiments in the same layer affect the same user journey, we detect cannibalization by comparing the combined effect against individual effects. If Experiment A lifts conversion by 5% and Experiment B lifts by 3%, but the combined effect is only 2%, there is negative interference that suggests the experiments cancel each other out.
+
+**User journey analysis:** We track the user's path through the product and detect if layer participation affects journey completion. If users in layer 1 experiment + layer 2 experiment have a 10% lower conversion than users in negative control for both layers, we flag this as potential layer interference.

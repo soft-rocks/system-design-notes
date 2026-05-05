@@ -1,0 +1,156 @@
+---
+title: Requirements
+description: Functional and non-functional requirements, scale assumptions, and notification profile for a distributed notification service.
+---
+
+## Functional Requirements
+
+A notification service must support the following core functionalities:
+
+### Notification Channels
+
+The service supports multiple delivery channels, each with its own protocol and delivery semantics:
+
+| Channel | Provider | Delivery Pattern | Delivery Guarantee |
+|---------|----------|------------------|-------------------|
+| Push (FCM/APNs) | Firebase Cloud Messaging, Apple Push Notification | Real-time, push-based | Best-effort; APNs returns receipt |
+| Email | SMTP, SES, SendGrid | Async queue-based | Persistent; bounce/complaint tracking |
+| SMS | Twilio, Vonage | Real-time API | Confirmed delivery receipt from carrier |
+| In-app | WebSocket, SSE | Real-time stream | Persistent (stored until read) |
+| Webhook | HTTP POST | Real-time request | Retryable; response-driven |
+| Slack/Teams | Incoming webhook | Real-time request | Retryable; app-level confirmation |
+
+### Message Delivery & Retry
+
+- Each notification is delivered per-channel based on the recipient list and channel preferences.
+- Transient failures (rate limits, network errors) trigger exponential backoff retry (default max 5 retries).
+- Permanent failures (invalid token, blocked number, opt-out) are delivered to a dead-letter queue.
+- Failure reasons: `INVALID_TOKEN` (push), `BOUNCED` (email), `CARRIER_REJECTED` (SMS), `HTTP_4XX` (webhook).
+
+### Batch & Scheduling
+
+- **Single send**: One notification to one recipient.
+- **Batch send**: One notification payload sent to N recipients (up to 100K per API call).
+- **Scheduled send**: Send at a specific timestamp (cron or one-shot).
+- **Rate limiting**: Per-channel, per-tenant, and per-user rate limits to prevent overload and spam.
+
+### Template Engine & Personalization
+
+- Jinja2-style template language with variable substitution: `Hello \&#123;&#123; user.name \\&#125;&#125; , your order \&#123;&#123; order.id \\&#125;&#125;  has shipped.`
+- Multi-language: templates indexed by `locale` (e.g., `en`, `es`, `ja`); fallback to `en` if locale not available.
+- Dynamic content: subject line and body text per language; push notification supports title + body per locale.
+
+### User Preferences & Quiet Hours
+
+- **Per-user opt-out**: Users can disable specific channels (e.g., opt out of SMS but keep email).
+- **Per-tenant rules**: Tenants define which channels are available per notification type.
+- **Quiet hours**: Users set a time window where non-urgent notifications are batched and delivered as a digest.
+- **Urgency levels**: SYSTEM_CRITICAL notifications bypass quiet hours (e.g., security alerts).
+
+### Delivery Tracking & Status
+
+Notifications follow a well-defined lifecycle:
+
+```
+QUEUED → SENDING → SENT | FAILED | REJECTED
+               ↘ RETRYING → SENDING (up to max_retries)
+```
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| QUEUED | Accepted but not yet dispatched | Scheduled delivery or queued for concurrency control |
+| SENDING | Being delivered to the provider | Provider API call in progress |
+| SENT | Provider confirmed delivery | Stored read receipt if applicable |
+| FAILED | Provider rejected after max retries | Added to dead-letter queue |
+| REJECTED | Pre-flight validation failure (opt-out, invalid payload) | No retry; immediate failure |
+
+**Read & engagement tracking:**
+- Push: APNs/FCM delivery receipt → `SENT`. User tap → `READ`.
+- Email: Open via pixel tracking; click via redirect URL.
+- In-app: Stored in notification inbox; `READ` when user views the inbox.
+- Webhook: HTTP 2xx = success; 4xx/5xx = retry.
+
+### Observability & Alerting
+
+- Delivery rate, latency, and failure rate per channel, per tenant, per notification type.
+- Real-time alerting: if failure rate > 5% for any channel in a 5-minute window, trigger alert.
+- Audit log: all notification sends, template changes, and preference updates.
+
+### Multi-Tenancy
+
+- Isolation by tenant: separate API keys, templates, quotas, and delivery rate limits.
+- Shared infrastructure with resource quotas: max 10K notifications/second per tenant.
+- Billing integration: per-notification charges based on channel and provider.
+
+## Non-Functional Requirements
+
+**Reliability**
+- No message loss: all notifications persisted before acknowledgment (exactly-once delivery semantics).
+- Delivery confirmation: provider-level receipt tracking for push, SMS, and email.
+- Dead-letter queue for undeliverable messages with replay capability.
+
+**Availability**
+- 99.95% uptime target (22 min/month downtime).
+- API available during failover with eventual consistency (notifications queued during leader transition).
+- Active-active multi-region deployment with regional API entry points.
+
+**Consistency**
+- Strong consistency for notification state mutations (create, update preferences).
+- Eventual consistency for read replicas and analytics dashboards.
+- Leader election via etcd Raft for notification dispatch coordination.
+
+**Performance**
+- API latency: p99 < 10ms for single send, p99 < 100ms for batch send (10K recipients).
+- End-to-end delivery latency: push < 3s, email < 30s, SMS < 10s, in-app < 1s.
+- Throughput: 1M notifications/second peak (global scale).
+
+**Scalability**
+- Horizontally scalable dispatchers: add instances to handle increased notification volume.
+- Support 100M+ active users and 10B+ notifications/month.
+- Notification inbox storage: 1B+ rows, queryable within 500ms.
+
+**Security & Compliance**
+- TLS 1.3 for all API and provider communication.
+- PII data encryption at rest (AES-256) for user preferences and notification content.
+- GDPR compliance: right to be forgotten (delete user data and all associated notifications).
+- SMS/Email compliance: TCPA, CAN-SPAM opt-out requirements enforced.
+
+## Scale Assumptions
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Active users | 100M+ | Large consumer platform (e.g., WhatsApp, Instagram scale) |
+| Notifications/month | 10B+ | ~330M/day ≈ 3,800/sec average, 1M/sec peak |
+| Peak throughput | 1M notifications/sec | Flash sales, emergency alerts, viral events |
+| Concurrent API callers | 50K | Internal services, CI/CD, partner integrations |
+| Push notification size | 1KB avg | Title, body, data payload, targeting criteria |
+| Email notification size | 50KB avg | HTML body, images, attachments |
+| SMS notification size | 160 chars avg | Plain text |
+| Storage (inbox) | 500GB+ | 1B notifications × 500 bytes each, 2-year retention |
+| Multi-region | 3 regions, 9 AZs | Global user base, low-latency delivery |
+
+**Workload Profile**
+- 40% Push notifications (transactional: order updates, alerts)
+- 30% In-app notifications (social: likes, comments, follows)
+- 15% Email (receipts, daily digest, marketing campaigns)
+- 10% SMS (OTP, critical alerts, account verification)
+- 5% Webhook (integrations, partner callbacks)
+
+## Workload Profile
+
+### Notification Types
+
+| Type | Volume Share | Latency SLA | Urgency |
+|------|-------------|-------------|---------|
+| Real-time social | 30% | < 1s (in-app), < 3s (push) | Low (quiet hours OK) |
+| Transactional | 35% | < 3s (push), < 30s (email) | Medium (bypass quiet hours) |
+| OTP/Verification | 5% | < 5s (SMS) | High (bypass all limits) |
+| Alerts & Warnings | 10% | < 3s (all channels) | High/Critical |
+| Marketing/Digest | 20% | 5 min - 24h | Low (digest mode) |
+| Webhook callbacks | 5% | < 1s | Medium |
+
+### Temporal Patterns
+
+- **Daily pattern**: Peak at 9 AM and 12 PM (business hours); trough at 3 AM UTC.
+- **Event-driven spikes**: 100x traffic surge during flash sales, product launches, or security incidents.
+- **Seasonal**: 2x traffic during holiday seasons for e-commerce (shipping notifications, promos).

@@ -1,0 +1,178 @@
+---
+title: Tweet Deduplication
+description: Deep dive into handling retweet deduplication in Twitter timelines.
+---
+
+## The Retweet Problem
+
+### The Retweet Data Model
+
+Retweets are not copies — they are references.
+
+```
+Tweet {
+  id: long
+  author_id: long
+  text: string
+  retweet_of_tweet_id: long  // NULL = original, NOT NULL = retweet
+  retweet_count: int
+  ...
+}
+```
+
+When User B retweets User A's tweet:
+1. A new Tweet record is created with `retweet_of_tweet_id = A's_tweet_id`.
+2. The retweet's `author_id` is User B (the person who shared it).
+3. The text is either empty or includes B's "quoted text" (quote tweet).
+
+**Problem:** When User C follows both User A and User B, and B retweeted A's tweet, User C might see the same original tweet twice — once from B's retweet, once from A's direct post.
+
+### The Core Challenge
+
+In a push-based fan-out, when B retweets A's tweet:
+1. The retweet generates its own fan-out event.
+2. The original tweet already generated fan-out events.
+3. User C's timeline may contain both the retweet AND the original tweet — visually redundant.
+
+**We need deduplication without sacrificing correctness.**
+
+---
+
+## Timeline Deduplication
+
+### Strategy: Deduplicate by Original Tweet ID
+
+Store both the retweet ID and the original tweet ID in the timeline:
+
+```
+// Timeline entry structure (Redis list element)
+timelineEntry {
+    tweetId: long            // The ID of this timeline entry
+    originalTweetId: long    // If retweet, the original tweet ID
+    authorId: long           // Author of the post (retweeter or original)
+    timestamp: timestamp
+    type: enum \{TWEET, RETWEET\}
+}
+```
+
+When User C views their timeline:
+1. Fetch the timeline list from Redis (tweet IDs).
+2. Group by `originalTweetId`.
+3. For each group of duplicate original tweets, show only the most relevant one:
+   - **Original tweet** is preferred over retweets (shows A's version).
+   - Among multiple retweets, show the one from the closest followed user (social relevance).
+   - Among same-timeliness retweets, show B's retweet (the one the user's follow posted).
+
+### Dedup Logic
+
+```
+function deduplicateTimeline(entries):
+    // Group by originalTweetId
+    groups = {}
+    for entry in entries:
+        origId = entry.originalTweetId
+        if origId not in groups:
+            groups[origId] = []
+        groups[origId].push(entry)
+
+    result = []
+    for (origId, group) in groups:
+        // Prefer original tweet over retweets
+        original = group.filter(e => e.type == 'TWEET').first()
+        if original:
+            result.push(original)
+        else:
+            // Among retweets, prefer the one from the most recent post
+            // or the one from the user with highest engagement
+            retweet = group.sortBy(e => e.author.followers).last()
+            result.push(retweet)
+
+    return result
+```
+
+### When to Deduplicate: Push vs Pull
+
+**In push mode (Redis):**
+- Deduplication should be done at write time to prevent timeline bloat.
+- Maintain a `seen_original_tweet_ids` set per user (TTL = 7 days).
+- Before pushing a retweet, check if the originalTweetId is in the set.
+- If already seen, skip the push (the original tweet is already in the timeline).
+
+**In pull mode (super-nodes):**
+- Deduplication is done at read time (merge phase).
+- The merge step groups by originalTweetId and picks the best representation.
+
+---
+
+## Dedup Data Structures
+
+### Redis Set for Seen Tweet IDs
+
+```
+// Key: "seen_original:\{userId\}"
+// Value: SET of originalTweetIds (last 7 days)
+// TTL: 7 days
+// Size: Average 2000 entries × 20 bytes = 40KB per user
+```
+
+```
+// Check before pushing retweet
+seen_set = "seen_original:" + follower_id
+if redis.sismember(seen_set, originalTweetId):
+    SKIP  // Already in timeline
+
+// After pushing
+redis.sadd(seen_set, originalTweetId)
+redis.expire(seen_set, 604800)  // 7 days
+```
+
+**Memory cost:**
+- 50M active users × 40KB = 2TB total
+- This is significant. Consider:
+  - Only maintain for retweets (not all tweets).
+  - Reduce TTL to 3 days (most retweets happen within 48 hours).
+  - Use probabilistic data structures (Bloom filter) for space efficiency.
+
+### Bloom Filter for Seen Tweet IDs
+
+For memory efficiency, use a Bloom filter per user:
+
+```
+// Key: "seen_bloom:\{userId\}"
+// Capacity: 10000 items, false positive rate: 1%
+// Size: ~15KB per user (vs 40KB for sets)
+```
+
+**Trade-off:** 1% false positive means ~1% of legitimate retweets are missed (not shown). This is acceptable for UX — users won't notice if 1% of retweets are hidden.
+
+**Memory savings:**
+- Sets: 50M × 40KB = 2TB
+- Bloom: 50M × 15KB = 750GB
+- **Savings: 1.25TB**
+
+### Bloom Filter Limitations
+
+Bloom filters are **one-way**: you can check membership but cannot remove items. This is a problem for:
+- Users who delete tweets (their Bloom filter still contains the ID).
+- Users who switch from push to pull mode.
+
+**Solution:** Periodically regenerate the Bloom filter (e.g., every 24 hours) by re-scanning the user's timeline entries.
+
+---
+
+## Beyond Retweets: Other Dedup Cases
+
+### Quote Tweets
+Quote tweets are separate tweets (not retweets). They reference another tweet but appear as independent entries. No deduplication needed — they are unique content.
+
+### Duplicate Original Tweets (Accidental)
+Some users post the same content twice by accident. This is harder to detect:
+- **Simple approach:** No dedup (let users manage).
+- **Advanced:** Content fingerprinting (hash the tweet text, compare with recent tweets from same author).
+- **Recommendation:** Skip for v1. Add content hash dedup if reported as a user problem.
+
+### Spam Deduplication
+Spam bots post identical tweets. This is handled by:
+- Spam detection ML pipeline (outside scope).
+- Rate limiting per user.
+- Shadow-banning (tweet is visible to the spammer but not to their followers).

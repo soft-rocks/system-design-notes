@@ -1,0 +1,236 @@
+---
+title: Data Flow
+description: Sequence diagrams and data flow design for paste creation, paste retrieval, content moderation, and expiration cleanup.
+---
+
+### 1. Paste Creation Flow (Write Path)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant APIGateway
+    participant RateLimiter
+    participant ContentValidator
+    participant PasteStore
+    participant Database
+    participant Redis
+    participant ModerationQueue
+
+    Client->>APIGateway: POST /api/v1/pastes (content, title, language, expires_in)
+    APIGateway->>RateLimiter: Check rate limit
+    RateLimiter-->>APIGateway: Allow/Deny
+
+    alt Rate limit exceeded
+        APIGateway-->>Client: 429 Too Many Requests
+    else Allowed
+        APIGateway->>ContentValidator: Validate content size, format, encoding
+        ContentValidator-->>APIGateway: Valid/Invalid
+
+        alt Invalid content
+            APIGateway-->>Client: 400 Bad Request
+        else Valid
+            APIGateway->>PasteStore: Generate unique key & persist
+            PasteStore->>Database: INSERT pastes (paste_key, content, metadata)
+            Database-->>PasteStore: Success / Conflict
+
+            alt Collision (extremely rare)
+                PasteStore->>PasteStore: Retry generation (max 3 attempts)
+                alt Max retries
+                    PasteStore-->>APIGateway: Service error
+                    APIGateway-->>Client: 500 Internal Server Error
+                else Success
+                    PasteStore->>Redis: SET paste:<key> \{metadata_json\} EX <TTL>
+                    Redis-->>PasteStore: OK
+                    APIGateway-->>Client: 201 Created \{key, url, expires_at\}
+                end
+            else Success
+                PasteStore->>Redis: SET paste:<key> \{metadata_json\} EX <TTL>
+                Redis-->>PasteStore: OK
+                PasteStore->>ModerationQueue: Async scan content (queue message)
+                ModerationQueue-->>PasteStore: Accepted
+                APIGateway-->>Client: 201 Created \{key, url, expires_at\}
+            end
+        end
+    end
+```
+
+### 2. Paste Retrieval Flow (Read Path)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant APIGateway
+    participant Redis
+    participant Database
+    participant CDN
+
+    Client->>CDN: GET /paste/\{key\}
+    CDN->>CDN: Check edge cache (TTL-based)
+
+    alt Edge cache hit
+        CDN-->>Client: 200 OK (paste HTML page)
+    else Edge cache miss
+        CDN->>APIGateway: GET /api/v1/pastes/\{key\}
+        APIGateway->>Redis: GET paste:<key>
+
+        alt Redis hit
+            Redis-->>APIGateway: \{metadata_json, content_hash\}
+            APIGateway->>Database: GET paste content by key
+
+            alt Found
+                Database-->>APIGateway: \{content, expires_at, language\}
+                alt Expired
+                    APIGateway-->>Client: 410 Gone
+                else Active
+                    APIGateway->>Redis: Increment view_count
+                    APIGateway-->>Client: 200 OK (paste page with syntax highlight)
+                end
+            else Not found
+                APIGateway-->>Client: 404 Not Found
+            end
+        else Redis miss
+            Redis-->>APIGateway: Not found
+            APIGateway->>Database: GET paste by key
+
+            alt Found
+                Database-->>APIGateway: \{content, expires_at, language, metadata\}
+                APIGateway->>Redis: SET paste:<key> \{metadata_json\} EX <TTL>
+                Redis-->>APIGateway: OK
+                alt Expired
+                    APIGateway-->>Client: 410 Gone
+                else Active
+                    APIGateway->>Redis: Increment view_count
+                    APIGateway-->>Client: 200 OK (paste page with syntax highlight)
+                end
+            else Not found
+                APIGateway-->>Client: 404 Not Found
+            end
+        end
+    end
+```
+
+### 3. Content Moderation Flow
+
+```mermaid
+sequenceDiagram
+    participant PasteStore
+    participant ModerationQueue
+    participant ContentScanner
+    participant ModerationDB
+    participant AdminConsole
+
+    PasteStore->>ModerationQueue: Enqueue paste_key + content (async)
+    ModerationQueue->>ContentScanner: Consume for scanning
+    ContentScanner->>ContentScanner: Check for malware links (URL extraction + blacklist match)
+    ContentScanner->>ContentScanner: Check for phishing patterns (heuristic scan)
+    ContentScanner->>ContentScanner: Check for size abuse (> 64KB edge case)
+
+    alt High severity detected
+        ContentScanner->>ModerationDB: INSERT moderation_record (severity: critical)
+        ContentScanner->>PasteStore: Mark paste as deleted
+        PasteStore->>Redis: DEL paste:<key>
+        Note over PasteStore,Redis: Paste immediately inaccessible
+    else Medium severity detected
+        ContentScanner->>ModerationDB: INSERT moderation_record (severity: medium)
+        Note over ModerationDB: Awaiting manual review
+    else Clean
+        ContentScanner->>ModerationDB: INSERT moderation_record (reviewed: true)
+        Note over ModerationDB: Audit trail kept
+    end
+```
+
+### 4. Expiration Cleanup Flow
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant CleanupService
+    participant Redis
+    participant Database
+    participant ObjectStorage
+
+    Scheduler->>CleanupService: Every 15 minutes (cron)
+    CleanupService->>Database: SELECT paste_key, expires_at FROM pastes WHERE expires_at < NOW() AND status = active LIMIT 1000
+    Database-->>CleanupService: List of expired pastes
+
+    loop For each batch
+        CleanupService->>Redis: DEL paste:<key> for each key
+        CleanupService->>Database: UPDATE pastes SET status = deleted WHERE paste_key IN (...)
+    end
+
+    Scheduler->>CleanupService: Daily cron (deep cleanup)
+    CleanupService->>Database: SELECT paste_key FROM pastes WHERE status = deleted AND created_at < (NOW() - INTERVAL '24 hours')
+    Database-->>CleanupService: List of stale pastes
+
+    loop For each batch
+        CleanupService->>ObjectStorage: Archive content (if compliance required)
+        CleanupService->>Database: DELETE pastes WHERE paste_key IN (...) AND status = deleted
+    end
+
+    Scheduler-->>CleanupService: Next run confirmed
+```
+
+### Key Design Principles
+
+1. **Write Path**：Paste 建立是同步的，moderation 是異步的 — 使用者能立即收到回應
+2. **Read Path**：兩層快取（Redis + CDN edge），在讀取時檢查 lazy expiration
+3. **Eventual Consistency**：View count 是 eventually consistent 的 — 暫態的 counter 是可以接受的
+4. **Caching Hierarchy**：CDN edge（ms）→ Redis（sub-ms）→ Database（5–10ms）
+5. **Decoupling**：內容 moderation 透過 queue 異步執行 — 不會阻塞 critical path
+6. **Idempotency**：Paste 建立接受 `Idempotency-Key` header
+7. **Observability**：每個 critical path 都有 metrics、tracing 和 structured logging
+8. **Fail-Safe**：元件故障時預設為安全狀態（404）
+9. **Lazy Expiration**：過期的 pastes 在讀取時檢查 — 不需要昂貴的 background scans 來處理常規過期
+10. **Zero Trust**：所有輸入在存取儲存前都經過驗證（大小、編碼、內容）
+
+### Data Flow Performance Targets
+
+- **Paste Creation**：P95 < 200ms（end-to-end，包含 moderation enqueue）
+- **Paste Read**：P95 < 100ms（end-to-end，cache hit path）
+- **Cache Hit Rate**：> 80%（Redis + CDN edge 合計）
+- **Moderation Queue**：> 100 messages/sec 持續吞吐量
+- **Database Write**：P95 < 10ms（single-shard indexed insert）
+- **Database Read**：P95 < 5ms（single-shard indexed lookup）
+
+### Failure Scenarios
+
+1. **Redis Failure**：回退到直接 database reads（延遲增加但服務仍可存取）
+2. **CDN Failure**：所有流量直接到達 origin（DB 負載增加但仍有功能）
+3. **Database Failure**：提供 Redis 中的 stale cache entries（如果有），拒絕新寫入，返回 503
+4. **Moderation Queue Backlog**：Queue 累積 — scanners 提高吞吐量；新的 pastes 仍然可以建立（moderation 是 async 的）
+5. **Moderation Service Unavailable**：Pastes 未經掃描通過 — 恢復時重試掃描；嚴重的 pastes 由自動化 URL 掃描標記
+6. **Cleanup Service Failure**：過期的 pastes 仍可存取直到重試 — 可以接受，因為讀取時也會檢查 TTL
+7. **Rate Limiter Redis Failure**：回退到 per-instance in-memory counters（近似值，可能允許稍微超過限制）
+
+### Data Consistency Model
+
+- **Strong Consistency**：Paste 內容（paste_key → content）— single-shard writes，`paste_key` 有唯一約束
+- **Eventual Consistency**：View count — 透過 Redis counter 接受暫態偏差
+- **Cache Coherence**：Paste 刪除時 invalidation Redis；CDN TTL-based invalidation
+- **Moderation Queue**：At-least-once delivery（async scan 可能重試）
+
+### Scaling Strategy
+
+- **Read Scaling**：Load balancer 後無狀態 API Gateway；Redis Cluster 提供 paste metadata；CDN 提供 rendered pages 的 edge caching
+- **Write Scaling**：水平 row-level sharding — N 個 database shards 按 `paste_key` hash partition
+- **Moderation Scaling**：Partitioned queue with parallel scanners；根據 queue depth auto-scale
+- **Expiry Scaling**：讀取時 lazy expiration（主要）+ 定期 background cleanup（次要）
+- **Cache**：Multi-tier — CDN edge（minutes）→ Redis（TTL-based）→ per-instance LRU（sub-ms, 5m TTL）
+
+### Observability Implementation
+
+1. **Metrics**（Prometheus）：Paste creation success/error rates、read P95 latency、cache hit/miss rates（CDN + Redis）、moderation queue depth、view count sync rate
+2. **Tracing**（Jaeger）：End-to-end request flow，按元件分割 latency（CDN → Redis → DB）
+3. **Logging**（ELK）：Structured JSON，包含 request ID、client IP（截斷）、paste_key、component name
+4. **Alerting**（PagerDuty）：Error rate > 1%、latency > 200ms P95、cache hit rate < 70%、moderation queue backlog > 10K、database connection failures
+
+### Integration Points
+
+1. **Redis Cluster**：Paste metadata cache、view count increment、rate limiting
+2. **Content Moderation Queue**：Async paste 掃描（Kafka 或 RabbitMQ）
+3. **CDN**：Rendered paste HTML pages 的 edge caching（TTL 基於 `expires_at`）
+4. **Database**：Primary paste storage（按 `paste_key` sharding）
+5. **Object Storage**：Deleted pastes 的 compliance archive（選配，取決於 retention policy）
+6. **Prometheus/Grafana**：Monitoring 和 alerting
+7. **Jaeger**：Distributed tracing
+8. **ELK Stack**：Log aggregation 和 search

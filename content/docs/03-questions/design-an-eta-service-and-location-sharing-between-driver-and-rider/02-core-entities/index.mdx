@@ -1,0 +1,128 @@
+---
+title: Core Entities
+description: Entity definitions and relationships for the ETA and location sharing service.
+---
+
+## Entity Definitions
+
+### Trip
+Represents a single ride between a rider and a driver.
+
+| Field | Type | Description |
+|---|---|---|
+| `trip_id` | UUID | Primary key |
+| `rider_id` | FK → User | Requesting rider |
+| `driver_id` | FK → User | Assigned driver |
+| `status` | enum \{REQUESTED, MATCHED, DRIVER_ARRIVING, IN_PROGRESS, COMPLETED, CANCELLED\} | Trip state |
+| `pickup_lat`, `pickup_lng` | float | Pickup coordinates |
+| `dropoff_lat`, `dropoff_lng` | float | Dropoff coordinates |
+| `driver_current_lat`, `driver_current_lng` | float | Last known driver position (live) |
+| `eta_minutes` | int | Computed ETA to pickup |
+| `created_at`, `matched_at`, `started_at`, `completed_at`, `cancelled_at` | timestamp | Lifecycle |
+| `route_version` | int | Increments on route recalculation |
+| `pool_group_id` | UUID, nullable | Shared pooling group |
+
+**Why driver_current_lat/lng are on Trip**: The rider's map shows the driver's live position. Storing it on the Trip record (in a real-time store) allows O(1) reads without joining tables.
+
+### DriverLocation
+Ephemeral GPS ping from a driver. Short-lived, high-write, low-read.
+
+| Field | Type | Description |
+|---|---|---|
+| `location_id` | UUID | Primary key |
+| `trip_id` | FK → Trip | Associated trip |
+| `driver_id` | FK → User | Driver identifier |
+| `lat`, `lng` | float | Coordinates (6 decimal places) |
+| `heading` | int | Degrees from north (0-359) |
+| `speed_kmh` | float | Current speed |
+| `accuracy_m` | float | GPS accuracy radius |
+| `sampled_at` | timestamp | When GPS reading was taken |
+| `received_at` | timestamp | When server received the ping |
+| `expires_at` | timestamp | TTL for cleanup (5 min after sampled_at) |
+
+**Why not just use Trip.driver_current_lat**: LocationHistory needs every ping for analytics, route reconstruction, and dispute resolution. Trip only needs the latest. We store the latest in the real-time store and all pings in the time-series store.
+
+### LocationHistory
+Time-series store of all driver GPS pings during a trip.
+
+| Field | Type | Description |
+|---|---|---|
+| `record_id` | UUID | Primary key |
+| `trip_id` | FK → Trip | Associated trip |
+| `lat`, `lng` | float | Coordinates |
+| `heading`, `speed_kmh`, `accuracy_m` | optional | Telemetry data |
+| `sampled_at` | timestamp | **Partition key** for time-series queries |
+| `sequence_num` | int | Monotonic counter for ordering |
+
+**Storage choice**: Time-series database (TimescaleDB on PostgreSQL or Cassandra) because:
+- Write volume is enormous (~250M records/day)
+- Query pattern is range scans by trip_id + time
+- Data is aged out after 30 days
+- Needs compression (columnar storage helps)
+
+### Route
+Pre-computed driving route between two points.
+
+| Field | Type | Description |
+|---|---|---|
+| `route_id` | UUID | Primary key |
+| `trip_id` | FK → Trip | Associated trip |
+| `origin_lat`, `origin_lng` | float | Start coordinates |
+| `destination_lat`, `destination_lng` | float | End coordinates |
+| `polyline` | string | Google Encoded Polyline format |
+| `distance_m` | int | Total distance |
+| `duration_sec` | int | Estimated duration |
+| `traffic_duration_sec` | int | Duration with current traffic |
+| `route_type` | enum \{FASTEST, SHORTEST, AVOID_TOLLS\} | Route option |
+| `fetched_at`, `valid_until` | timestamp | Cache lifetime (5-10 min TTL) |
+| `road_segments` | array | \{segment_id, speed_kmh, delay_sec\} |
+
+**Why polyline encoding**: The full path can have 100-500 waypoints. Google Encoded Polyline compresses this to ~500 bytes vs ~10KB in raw JSON — critical because the polyline is sent to the rider's app on every ETA update.
+
+### ETARecord
+Cache entry for computed ETA. Short-lived, high-write, high-read.
+
+| Field | Type | Description |
+|---|---|---|
+| `eta_id` | UUID | Primary key |
+| `trip_id` | FK → Trip | Associated trip |
+| `driver_lat`, `driver_lng` | float | Position at computation time |
+| `eta_minutes` | int | To pickup or to dropoff |
+| `eta_type` | enum \{TO_PICKUP, TO_DROPOFF\} | ETA target |
+| `computed_at` | timestamp | When computed |
+| `expires_at` | timestamp | TTL: 30 seconds |
+| `route_version` | int | Route version this ETA is based on |
+
+**Why separate from Route**: ETA is computed from Route data + real-time traffic. It's a different access pattern (read by rider app) vs Route (read by navigation). Storing ETA separately avoids recomputing from the route every time.
+
+### User
+A registered user of the platform (rider, driver, or both).
+
+| Field | Type | Description |
+|---|---|---|
+| `user_id` | UUID | Primary key |
+| `role` | enum \{RIDER, DRIVER, BOTH\} | User role |
+| `name`, `photo_url` | string | Profile data |
+| `rating` | float | Rider or driver rating |
+| `phone_number` | string | Masked for privacy |
+| `created_at`, `blocked_at` | timestamp | Lifecycle |
+| `settings` | JSON | Location sharing preferences, notifications |
+
+## Relationships
+
+### Trip → DriverLocation (1:N)
+A trip has many location history records (one per GPS ping, ~25 per 25-minute trip). The latest DriverLocation is reflected on the Trip record for fast reads.
+
+**Why the duplication**: Trip.driver_current_lat is in the real-time store (Redis). DriverLocation is in the time-series store. They serve different query patterns: Trip for O(1) latest read, DriverLocation for historical replay.
+
+### Trip → Route (1:1)
+A trip has one active Route. When the route is recalculated (due to traffic), the old route is archived and a new Route record is created.
+
+### Trip → ETARecord (1:N)
+A trip has many ETA records over its lifetime (one every 30 seconds during IN_PROGRESS, more frequently during MATCHED state). Only the latest is active.
+
+### User → Trip (1:N)
+A user is the rider on many Trip records and/or the driver on many Trip records. The role enum determines which foreign key is relevant.
+
+### DriverLocation → LocationHistory (implicit)
+DriverLocation records are a subset of LocationHistory — specifically, the most recent record per trip. All LocationHistory records include location data from the real-time store for the past 5 minutes.

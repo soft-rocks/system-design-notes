@@ -1,0 +1,166 @@
+---
+title: Data Flow
+description: Write path, read path, and cross-region replication flows for the Netflix screen-limit system.
+---
+
+## Write Path
+
+### Stream Registration Write Path
+```
+1. Client (App) → POST /v2/stream/authenticate \{account_id, device_id, video_id, region\}
+2. Stream Limit Service (edge region) →
+   a. Check local PlanCache for account's stream_limit (TTL: 60s)
+   b. If miss → read plan:\{account_id\} from Redis (local cluster's primary Redis) → cache in LRU
+   c. Check Redis stream:count:\{account_id\} (INCRBY 1, atomic)
+   d. If count > limit → return 409 with active_streams list
+   e. If count &lt;= limit → create session:
+      - Generate UUID for session_id
+      - SET stream:count:\{account_id\} = count (already incremented)
+      - HMSET stream:session:\{session_id\} \{account_id, device_id, video_id, region, started_at, last_heartbeat_at\}
+      - EXPIRE stream:session:\{session_id\} 600 (10 min, extended per heartbeat)
+      - SADD stream:account:\{account_id\}:sessions session_id
+      - Publish StreamStarted event to Kafka
+   f. Return 200 with session_id
+```
+
+**Key design decisions**:
+- The INCRBY and session creation are not in a single Redis transaction because the session metadata (HMSET) is separate from the counter. In the unlikely case where INCRBY succeeds but HMSET fails, the counter is incremented but no session is enumerable. The TTL cleanup will eventually reclaim the slot. A more rigorous approach uses MULTI/EXEC but adds latency.
+- Kafka publish is fire-and-forget on the hot path to keep p99 latency low. Event delivery is best-effort; if the event is lost, analytics and device registration are slightly stale but the stream continues.
+
+### Stream Stop Write Path
+```
+1. Client → POST /v2/stream/\{session_id\}/stop \{account_id, device_id, stopped_at\}
+2. Stream Limit Service →
+   a. Verify session exists in Redis (HGETALL stream:session:\{session_id\})
+   b. Verify account_id matches (security check)
+   c. DECR stream:count:\{account_id\} (atomic, ensure it doesn't go below 0)
+   d. DEL stream:session:\{session_id\}
+   e. SREM stream:account:\{account_id\}:sessions session_id
+   f. Publish StreamEnded event to Kafka with reason=user_stopped
+```
+
+**Edge case: DECR below zero**. This can happen if a stop is sent for a session that already expired via TTL. We handle it gracefully — a background task will fix the counter if it goes negative. This is acceptable because the error is bounded by crashed sessions, which is tiny relative to total streams.
+
+### Device Deactivation Write Path
+```
+1. Client → POST /v2/devices/\{device_id\}/deactivate
+2. Stream Limit Service →
+   a. Update DeviceProfile in RDS: UPDATE device_profiles SET is_active = false WHERE device_id = ?
+   b. Delete device:\{device_id\} from Redis cache (TTL: 24h — now it will be re-read from RDS on next access)
+   c. Optionally: stop all active streams for that device → DECR count for each associated session
+   d. Publish DeviceDeactivated event to Kafka
+```
+
+### Plan Change Write Path (Event-Driven)
+```
+1. Billing Service processes plan change → writes to Billing DB
+2. Billing Service publishes PlanChanged event to Kafka
+3. Stream Limit Service consumes PlanChanged event →
+   a. Invalidate local PlanCache for account_id (remove the key)
+   b. On next limit check, re-fetch plan:\{account_id\} from config store (etcd or Redis)
+```
+
+**Why event-driven, not synchronous**: If the Billing service is down, the plan change has already been committed to its DB. Kafka guarantees at-least-once delivery. A poll-based fallback (re-fetch plan every 60s) serves as a safety net.
+
+## Read Path
+
+### Limit Check Read Path (Most Critical — Hot Path)
+```
+1. Client calls POST /v2/stream/authenticate
+2. Stream Limit Service →
+   a. LRU PlanCache lookup: plan:\{account_id\}
+      - HIT (p99 < 50μs): proceed with cached stream_limit
+      - MISS: Redis GET plan:\{account_id\} → populate LRU → proceed
+        (p99 < 1ms for Redis round-trip within same region)
+   b. Redis GET stream:count:\{account_id\}
+      - p99 < 1ms (Redis cluster, local region)
+      - If account has no record yet: count = 0
+   c. Compare count < stream_limit
+```
+
+**Total p99 latency budget**:
+
+| Step | Latency |
+|---|---|
+| LRU PlanCache hit | < 50μs |
+| Redis plan lookup (miss only) | < 1ms |
+| Redis stream:count lookup | < 1ms |
+| Comparison + response serialization | < 100μs |
+| **Total (plan cache hit)** | **< 0.2ms** |
+| **Total (plan cache miss)** | **< 2.2ms** |
+
+This leaves significant headroom under the 5ms p99 target. Plan cache misses are rare (60s TTL, each account accessed many times per hour).
+
+### Device List Read Path
+```
+1. Client → GET /v2/devices?account_id=uuid
+2. Stream Limit Service →
+   a. Query RDS: SELECT * FROM device_profiles WHERE account_id = ? AND is_active = true
+   b. Result is typically small (< 10 rows) — fast query
+   c. Populate device:\{device_id\} entries in Redis cache (TTL: 24h)
+   d. Return devices array
+```
+
+**Why RDS not Redis for device listing**: Device profiles change infrequently (< 1 add/remove per user per year). RDS is the source of truth. The result set is tiny (< 10 rows), so RDS handles this load easily.
+
+## Sync/Replication Flow
+
+### Redis Cross-Region Replication
+```
+Primary region (US-East):
+  - Redis Cluster (multi-shard, active-active within region)
+  - All writes (INCR, DECR, HMSET, SADD, SREM, DEL) go here
+
+Secondary regions (EU-West, APAC-South):
+  - Read replicas of the primary Redis (asynchronous replication, lag: < 50ms)
+  - Each region has a local Stream Limit Service instance
+  - Each region has a local LRU PlanCache
+
+How reads work across regions:
+  - EU-West service reads plan:\{account_id\} from EU-West Redis replica → < 1ms
+  - EU-West service reads stream:count:\{account_id\} from EU-West Redis replica → < 1ms
+  - If replica lag > 500ms, fall back to primary Redis (US-East, ~200ms RTT)
+
+How writes work across regions:
+  - All writes go to PRIMARY region's Redis (US-East)
+  - Local service in EU-West writes to US-East Redis, then reads back from EU-West replica (~3ms total)
+  - Stream count changes visible in EU-West within < 50ms (replication lag) + ~1ms (read)
+```
+
+**Why primary-region writes**: Multi-region Redis active-active with conflict resolution is unnecessary. The counter operations are atomic — the worst case is allowing 1 extra stream during a failover, which aligns with the fail-open policy.
+
+### RDS Cross-Region Replication
+```
+Primary (US-East RDS, MySQL/PostgreSQL):
+  - DeviceProfile, PlanVersion, DownloadQuota tables: all writes
+
+Read Replicas (EU-West, APAC-South):
+  - Async replication (lag: < 1s typical, < 5s under load)
+  - Serve read queries (device listing, plan lookups as fallback)
+
+CDC (Change Data Capture):
+  - Debezium on RDS primary → Kafka
+  - Streams device/profile changes consumed by Stream Limit Service to update Redis cache
+```
+
+### Kafka Event Replication
+```
+Kafka (multi-region):
+  - Primary cluster in US-East
+  - MirrorMaker 2 replicates topics to EU-West and APAC-South
+  - Replication lag: < 1s
+
+Stream Limit Service consumes events from local Kafka cluster:
+  - StreamLimitEvents topic (replicated via MirrorMaker)
+  - PlanChanged events: consumed for cache invalidation
+  - StreamEnded events: consumed for analytics pipeline
+```
+
+### Eventual Consistency Guarantees
+
+| Data Type | Consistency Model | Replication Latency | Impact of Delay |
+|---|---|---|---|
+| Stream count | Eventual (Redis cross-region) | < 50ms | May allow 1 extra stream during failover |
+| Plan tier | Eventual (LRU cache + event invalidation) | < 1s (event) or 60s (TTL) | User might not see new limit for up to 60s |
+| Device profile | Eventual (RDS cross-region) | < 1-5s | Device list might show stale devices |
+| Active session metadata | Eventual (Redis cross-region) | < 50ms | Session enumeration slightly stale |

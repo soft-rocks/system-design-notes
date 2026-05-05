@@ -1,0 +1,95 @@
+---
+title: "DNS and Domain Routing"
+description: "Routing HTTP requests for multiple short domains"
+---
+
+### DNS & Domain Routing
+
+#### Challenge
+
+Routing HTTP requests for multiple short domains (primary + enterprise custom domains) with correct SSL/TLS and DNS resolution.
+
+#### Solution: Multi-Domain DNS with CNAME Flattening
+
+1. **DNS Setup**:
+
+```
+short.ly.          A    203.0.113.1     (primary domain apex)
+*.short.ly.        CNAME short.ly.      (wildcard subdomain)
+```
+
+**Critical limitation: Wildcard certificates do NOT cover apex domains.**
+
+- A wildcard certificate for `*.short.ly` covers `go.short.ly`, `brand.short.ly`, etc.
+- It does NOT cover `short.ly` (the bare apex domain). You need a separate certificate for the apex.
+- For the primary domain, you can use a multi-domain SAN cert that covers both `short.ly` and `*.short.ly`.
+
+**Why CNAME at apex doesn't work (RFC 1034):**
+
+The DNS RFCs prohibit CNAME records at the apex (root) of a zone. If `short.ly` has a CNAME record, it conflicts with the zone's SOA and NS records, and most resolvers will reject the configuration. This is why you cannot do:
+
+```
+short.ly.  CNAME  lb-short.ly.awselb.us-east-1.amazonaws.com  ← INVALID
+```
+
+**Solutions for apex routing:**
+
+| Method | How It Works | Provider | Limitation |
+| --- | --- | --- | --- |
+| **A record** | Point apex directly to a static IP | Any DNS provider | Static IP — no auto-scaling without a proxy |
+| **CNAME flattening** | DNS provider resolves CNAME to IPs and returns A records | Cloudflare, Route 53 Alias, Dyn/Fastly | Provider-specific; IP changes require DNS updates |
+| **ALIAS record** | Route 53 proprietary extension that behaves like CNAME at apex | AWS Route 53 | Only works within Route 53 |
+| **ANAME record** | Open standard (same idea as ALIAS) | DNSimple, Gandi | Limited provider support |
+
+**For this system:** Use Cloudflare's CNAME flattening for the primary domain. For enterprise custom domains, customers use their own DNS provider — they must either use an A record, CNAME flattening, or point their apex to a Cloudflare proxy.
+
+2. **Multi-Tenant Domain Routing**:
+
+The domain is part of the short code lookup key:
+
+```sql
+-- short_code is unique per domain
+ALTER TABLE url_mappings ADD COLUMN domain VARCHAR(255) NOT NULL DEFAULT 't.ly';
+ALTER TABLE url_mappings ADD CONSTRAINT unique_short_code_per_domain
+    UNIQUE (domain, short_code);
+```
+
+- `t.ly/abc123` and `go.brand.com/abc123` are different URLs even if the short codes match
+- Cache key includes domain: `url:go.brand.com:abc123`
+- Shard router computes the shard using `hash(domain + short_code)` to keep domain+code mappings on the same shard
+
+3. **SSL Certificate Management**:
+
+```
+Primary domain:
+  - Certificate: t.ly + *.t.ly (multi-domain SAN cert from Let's Encrypt)
+  - Renewal: Automated via cert-manager (ACME protocol)
+
+Enterprise custom domains:
+  - Certificate: provisioned per domain via Let's Encrypt API
+  - Renewal: Automated via cert-manager (DNS-01 challenge)
+```
+
+**Why DNS-01 challenge for custom domains:**
+- HTTP-01 challenge requires the server to respond on port 80 for a verification path. Custom domains may not route to our infrastructure yet during setup.
+- DNS-01 challenge proves domain ownership by having the customer add a TXT record. This works even if the A/CNAME isn't pointed yet.
+- DNS-01 supports wildcard certificates (one cert covers `*.go.brand.com`), but HTTP-01 does not.
+
+**Certificate volume:** If 10,000 enterprise customers each have a unique domain, we issue and renew 10,000 certificates. This requires:
+- Let's Encrypt account with sufficient rate limits (apply for higher limits)
+- Automated DNS-01 challenge via API (Cloudflare, Route 53, or DNSimple API)
+- Storage for 10,000 certificates (each ~2KB) — trivial
+
+4. **Domain-Level Rate Limiting**:
+
+Different domains may have different rate limits based on SLA:
+- `t.ly` (public): 100 requests/min per IP for shorten operations
+- `go.brand.com` (enterprise): 10,000 requests/min per API key
+
+The domain is determined by the `Host` header in the HTTP request. The API layer routes to the appropriate rate limit policy before processing.
+
+5. **DNS TTL and Failover**:
+
+- Primary domain `t.ly` TTL: 300 seconds (5 minutes). This is a balance between propagation speed and DNS query volume.
+- Enterprise custom domains: TTL controlled by the customer's DNS provider. Our system cannot influence this.
+- During regional failover, DNS TTL of 5 minutes means up to 5 minutes of stale routing for some clients. This is addressed by the HA failover system (Section 10).

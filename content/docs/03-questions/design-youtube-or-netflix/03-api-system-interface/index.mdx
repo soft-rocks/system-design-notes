@@ -1,0 +1,73 @@
+---
+title: API / System Interface
+description: API and system interfaces for YouTube/Netflix streaming platform design
+---
+
+## REST Endpoints (Metadata)
+
+All metadata APIs use HTTPS with JWT-based authentication.
+
+### Authentication
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/auth/register` | Create new user account |
+| POST | `/auth/login` | Get JWT access + refresh tokens |
+| POST | `/auth/refresh` | Refresh expired access token |
+
+### Video Metadata
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/videos/upload/init` | Initiate upload, get presigned storage URL |
+| POST | `/api/videos/upload/complete` | Signal upload done, start transcoding |
+| GET | `/api/videos/\{videoId\}` | Get video metadata and variant list |
+| GET | `/api/videos/\{videoId\}/manifest` | Get HLS/DASH manifest URL (redirect to CDN) |
+| GET | `/api/videos/\{videoId\}/stats` | View count, like/dislike count, comment count |
+| DELETE | `/api/videos/\{videoId\}` | Soft-delete video |
+
+### Feed & Search
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/videos/feed` | Personalized recommendations (`?page=&limit=`) |
+| GET | `/api/videos/search` | Full-text search (`?q=&sort=&filters=`) |
+| GET | `/api/channels/\{channelId\}/videos` | List videos by channel |
+
+### Social
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/users/\{userId\}/subscribe` | Subscribe to channel |
+| DELETE | `/api/users/\{userId\}/subscribe` | Unsubscribe |
+| POST | `/api/videos/\{videoId\}/comments` | Add comment |
+| GET | `/api/videos/\{videoId\}/comments` | List comments (paginated) |
+| POST | `/api/videos/\{videoId\}/like` | Toggle like/dislike |
+
+### Analytics
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/analytics/events` | Batch-write viewer events |
+| GET | `/api/channels/\{channelId\}/analytics` | Creator analytics dashboard |
+
+## Streaming Protocol (CDN)
+
+Video chunks are served directly from CDN edge nodes — no application servers in the path.
+
+- **HLS** (HTTP Live Streaming): `.m3u8` manifest lists `.ts` segment URLs
+- **DASH** (Dynamic Adaptive Streaming): `.mpd` manifest with `.mp4` segments
+- CDN serves static manifest and segment files from edge cache with signed URLs for auth/DRM
+- Adaptive quality switching is client-side, polling manifest every 6-10 seconds
+
+## Async Interfaces (Internal)
+
+| Interface | Protocol | Description |
+|-----------|----------|-------------|
+| Client → Object Storage | Presigned URL (direct upload) | Bypasses application servers for uploads |
+| Object Storage → Job Queue | S3 Event Notification → Kafka | Triggers transcoding pipeline |
+| Job Queue → Transcoders | Kafka → Worker Poll | Distributes transcoding tasks |
+| Transcoder → Object Storage | SDK (direct write) | Stores transcoded variants |
+| Service → Service | gRPC | Internal microservice communication |
+| Client → Analytics | HTTP batch (async) | Client batches events, sends on idle intervals |
+| Analytics → Storage | Kafka → Flink → BigQuery | Real-time stream + batch sink |

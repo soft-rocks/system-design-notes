@@ -1,0 +1,76 @@
+---
+title: "ETA Computation at Scale"
+description: "Algorithms, caching strategies, and traffic layer integration for real-time ETA"
+---
+
+## Caching Strategy
+
+ETA computation involves a graph search on a 200M edge road network — this is expensive (50-100ms even on optimized graphs). The caching strategy ensures the p99 latency stays under 100ms.
+
+**Multi-level cache hierarchy:**
+
+```
+L1: Process-local cache (in-memory, per-request) — LRU, 10K entries, ~1ms hit
+L2: Redis per-trip cache (shared across replicas) — TTL 30s, ~1ms hit
+L3: Pre-computed route cache (route_id based) — TTL 5-10 min, ~1ms hit
+L4: Graph search (on cache miss) — 50-100ms
+```
+
+**L1: Process-local cache** — The first request for a trip_id is cached in the service instance's memory. Subsequent requests on the same instance (e.g., load balancer sent the same request to a different pod) hit this cache. Using an LRU with 10K entries means a busy instance (handling ~5K trips) covers >90% of requests on L1.
+
+**L2: Redis per-trip cache** — After L1 miss, check Redis for a previously computed ETA. Key: `eta:{trip_id}`, TTL 30s. This handles the common case where the rider polls before the ETA has expired. Hit rate: ~85-90%.
+
+**L3: Pre-computed route cache** — The route itself (polyline, segments) is cached with a longer TTL (5-10 min) because routes don't change as frequently as ETAs. When the route is found, the ETA can be recomputed quickly (seconds, not 100ms) from the cached road segments.
+
+**Cache invalidation**: When a new GPS ping is received and the driver is >500m from the route centerline, invalidate the route cache (`DEL route:{trip_id}`). This triggers a route recalculation on the next ETA request. ETA cache is automatically expired by TTL.
+
+## Graph Search Algorithm Choice
+
+For a road network with 50M nodes and 200M edges, the graph search algorithm must balance correctness with speed.
+
+**A* (A-star) with landmark-based lower bound (ALT)**
+
+A* is preferred over Dijkstra because the heuristic function (estimated remaining distance) prunes the search space dramatically. The key innovation is the lower-bound heuristic — it must be admissible (never overestimate) to guarantee shortest paths.
+
+**ALT (Alias, Landmarks, Triangle inequality)**: Pre-select a small set of landmarks (e.g., 20 major intersections). For each landmark, pre-compute the distance from every road node to the landmark (offline, runs during deployment). At runtime, the lower bound from current node to destination is:
+
+```
+lower_bound = max(landmark_distance[current][landmark] - landmark_distance[dest][landmark])
+              for all landmarks
+```
+
+This is computed in O(L) where L is the number of landmarks (20). The lower bound is typically within 5-10% of the true distance, which prunes ~95% of the search space compared to Dijkstra.
+
+**Why not Dijkstra**: Dijkstra explores nodes in all directions, visiting O(V) nodes in the worst case. On a dense urban road network, this means exploring thousands of nodes per search. A* with ALT explores only O(k) nodes where k is typically 10-50.
+
+**Why not Contraction Hierarchies**: CH offers faster queries (O(log V) on average) but requires expensive preprocessing (15-30 minutes for a continental graph) and is hard to update incrementally. For a system where traffic patterns change daily (construction, new roads), A* with ALT offers a better tradeoff.
+
+## Real-Time Traffic Integration
+
+The ETA model must account for current traffic conditions, not just the static road speed limits.
+
+**Traffic layer**: Real-time traffic data comes from a separate service (e.g., Google Maps Traffic API, TomTom, or proprietary crowdsourced speed data). It provides a `current_speed_multiplier` per road segment, updated every 30 seconds.
+
+**ETA formula**:
+
+```
+segment_delay = base_travel_time * (1 + (1 - current_speed_multiplier) * traffic_penalty_factor)
+total_eta = sum(segment_delay) for all segments in route
+```
+
+Where:
+- `base_travel_time` = segment_length / posted_speed_limit (from the static road graph)
+- `current_speed_multiplier` = 1.0 (free flow) to 0.3 (heavy congestion)
+- `traffic_penalty_factor` = 2.0 (a cap to prevent unrealistic delays)
+
+**Time-of-day adjustment**: Historical data shows different travel times for the same road segment at 8AM vs 2PM. A per-segment, per-time-of-day factor (24 buckets × 7 days) adjusts the base travel time:
+
+```
+adjusted_base = base_travel_time * tod_factor
+```
+
+**Model**: `tod_factor` ranges from 0.6 (early morning, no traffic) to 2.5 (rush hour, heavy congestion). Learned from historical GPS ping data aggregated per segment per bucket.
+
+**Fallback**: If real-time traffic data is unavailable (e.g., the traffic service is degraded), fall back to `tod_factor` only. This is acceptable — a 20% ETA error is better than no ETA.
+
+**Why not machine learning**: ML models (e.g., gradient-boosted trees on features like time_of_day, weather, day_of_week, recent_speed_trend) can outperform the simple formula in steady state. However, they add latency (5-10ms for model inference) and are harder to debug when ETAs are wrong. The simple formula is transparent, fast, and sufficient for the 99th percentile case. ML can be added as an optimization layer on top.

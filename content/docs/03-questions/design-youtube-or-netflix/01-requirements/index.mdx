@@ -1,0 +1,38 @@
+---
+title: Requirements
+description: Requirements for YouTube/Netflix streaming platform design
+---
+
+## Functional Requirements
+
+- **Video Upload and Playback** — Users can upload videos (producers) or browse and watch videos (viewers)
+- **Adaptive Bitrate Streaming** — Videos are transcoded into multiple resolutions and formats (360p, 480p, 720p, 1080p, 4K) using HLS or DASH, allowing dynamic quality switching based on network conditions
+- **Search and Discovery** — Full-text search across video titles, tags, and descriptions; personalized recommendations based on watch history, preferences, and similar user behavior
+- **User Engagement** — User accounts with sign up/login, subscriptions, playlists, watch history, likes/dislikes, and comments
+- **Live Streaming** — Real-time streaming support with low-latency delivery and live viewer counts
+- **Content Moderation** — Automated detection (hash matching, ML-based content analysis) combined with manual review for flagged content
+- **Monetization** — Ad insertion (pre-roll, mid-roll, display banners), subscription tiers (Netflix-style), or revenue sharing with creators (YouTube-style)
+
+## Non-Functional Requirements
+
+- **Availability** — 99.9%+ uptime; video playback must not fail during a session
+- **Latency** — Video playback begins within 2 seconds; upload acknowledgment within seconds; search results in under 200ms
+- **Scalability** — Support 10 million concurrent streams globally with ability to handle 3x peak traffic during evening hours
+- **Storage** — Efficiently manage 100M+ videos with multiple transcoded versions and replicas across regions
+- **Security** — DRM for premium content, JWT-based authentication, DDoS protection, rate limiting on APIs
+- **Global Reach** — Sub-100ms latency to end users via CDN edge locations in every major region
+
+## Scale Assumptions
+
+| Metric | Value |
+|--------|-------|
+| Monthly active users | 2 billion |
+| Video upload rate | 500 hours/minute |
+| Daily watch time | 1 billion hours |
+| Concurrent streams | 10 million |
+| Average video size | 500 MB (1080p, 1 hour) |
+| Average session length | 40 minutes |
+| Raw storage | ~50 PB |
+| Total storage (with replicas + transcodes) | ~200 PB |
+| Read-to-write ratio | 100,000:1 |
+| Peak traffic multiplier | 3x average |

@@ -1,0 +1,117 @@
+---
+title: Storage Design
+description: Deep dive into storage design for the metrics system
+---
+
+## Why Cassandra over Alternatives
+
+| Requirement | Cassandra | ClickHouse | TimescaleDB |
+|---|---|---|---|
+| Write throughput (10M metrics/sec) | Scales linearly, single-node ~50K writes/sec | Single-node ~1M writes/sec, but limited parallelism per table | PostgreSQL-based, limited to ~100K writes/sec per instance |
+| Multi-region replication | Native (snitch-based) | Requires external replication | Streaming replication (async, single replica) |
+| Operations complexity | High (partitioning, compaction tuning) | Medium | Low (PostgreSQL tooling) |
+| TTL support | Native per-table TTL | Requires manual partition pruning | Extensions available |
+| Query flexibility | Limited (key-value + range scans) | Excellent (OLAP-style SQL) | Good (SQL) |
+
+**Why Cassandra wins**: The key differentiator is **native multi-region replication** at 10M writes/sec. ClickHouse would be faster for queries but would require building custom replication. TimescaleDB cannot handle the write volume at multi-region. Cassandra trades query flexibility for write scalability and replication simplicity — exactly the right trade for a metrics system where reads are aggregated and not real-time OLAP.
+
+## Table Schema Design
+
+### Raw Metrics Table (1-minute granularity, 24h retention)
+
+```sql
+CREATE TABLE metrics_raw (
+    metric_id TEXT,
+    label_hash TEXT,          -- grouped label set (e.g., "host=web-1,region=us-east")
+    timestamp BIGINT,         -- millisecond epoch, clustered within partition
+    value DOUBLE,
+    PRIMARY KEY ((metric_id, label_hash), timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC)
+   AND compaction = {
+     'class': 'TimeWindowCompactionStrategy',
+     'compaction_window_unit': 'HOURS'
+   }
+   AND default_time_to_live = 86400;  -- 24h auto-expiry
+```
+
+- **Partition key**: `(metric_id, label_hash)` — each unique (metric, label set) is a partition.
+- **Clustering key**: `timestamp` — ordered within partition for efficient time-range scans.
+- **TTL**: 24h auto-expiry via Cassandra's built-in TTL.
+
+With 10K servers × 1K metrics × ~10 label combos = ~100M unique partitions. Each partition has ~60 rows/sec × 3600 sec = ~216K rows per day (before compaction to 1-min resolution).
+
+### Rollup Tables (HOUR and DAY granularity)
+
+```sql
+CREATE TABLE metrics_rollup_hour (
+    metric_id TEXT,
+    label_hash TEXT,
+    window_start BIGINT,
+    min_value DOUBLE,
+    max_value DOUBLE,
+    avg_value DOUBLE,
+    sum_value DOUBLE,
+    sample_count BIGINT,
+    p50 DOUBLE,
+    p95 DOUBLE,
+    p99 DOUBLE,
+    PRIMARY KEY ((metric_id, label_hash), window_start)
+) WITH CLUSTERING ORDER BY (window_start DESC)
+   AND default_time_to_live = 7776000;  -- 90 days
+
+CREATE TABLE metrics_rollup_day (
+    metric_id TEXT,
+    label_hash TEXT,
+    day_date DATE,
+    min_value DOUBLE,
+    max_value DOUBLE,
+    avg_value DOUBLE,
+    sum_value DOUBLE,
+    sample_count BIGINT,
+    p50 DOUBLE,
+    p95 DOUBLE,
+    p99 DOUBLE,
+    PRIMARY KEY ((metric_id, label_hash), day_date)
+) WITH CLUSTERING ORDER BY (day_date DESC)
+   AND default_time_to_live = 31536000;  -- 1 year
+```
+
+## Retention and Compaction
+
+Cassandra's **TimeWindowCompactionStrategy (TWCS)** automatically creates new commit log segments for each time window:
+
+```
+Hour 1:   ┃ raw data (60 rows) ┃ ────→ compacts to 1 row at end of hour ────→ rolled up
+Hour 2:   ┃ raw data (60 rows) ┃ ────→ same process
+...
+Hour 24:  ┃ raw data (60 rows) ┃ ────→ TTL expires, entire partition purged
+```
+
+The compaction flow:
+1. Within each hour, raw data accumulates in the commitlog + SSTables.
+2. At the end of the hour, TWCS marks the old segment as expired.
+3. The Aggregation Service reads the minute rollups for that hour and writes a single HOUR rollup row.
+4. After 24h, the raw table's TTL purges the data.
+
+For the rollup tables, TWCS keeps data for 90 days (hourly) and 1 year (daily), with compaction happening in real-time as rollups are written.
+
+## Write Path Optimization
+
+### Batching
+
+The Aggregation Service writes minute rollups in **batches of 1,000 rows** per CQL statement:
+```sql
+BEGIN BATCH
+  INSERT INTO metrics_rollup_minute ...
+  INSERT INTO metrics_rollup_minute ...
+  INSERT INTO metrics_rollup_minute ...
+APPLY BATCH;
+```
+
+This reduces the number of round-trips from 1,000 to 1. Cassandra can handle ~5,000 batches/sec per node with < 1ms p99 latency.
+
+### Parallelism
+
+The Kafka partition key = `metric_id` means that samples for the same metric always land in the same partition. This ensures the Aggregation Service processes them in order, avoiding the need for distributed coordination.
+
+Across different metrics, each Kafka partition maps to a separate aggregation goroutine, enabling full parallelism. With 10M metrics/sec ÷ 200 bytes/sample = 50,000 Kafka partitions needed. In practice, the system uses ~200 Kafka partitions, and the Aggregation Service uses ~200 goroutines (1 per partition).

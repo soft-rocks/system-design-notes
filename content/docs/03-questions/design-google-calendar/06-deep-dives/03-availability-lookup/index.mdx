@@ -1,0 +1,49 @@
+---
+title: Availability Lookup
+description: Free/busy data model, single-user and multi-user availability computation, caching, and edge cases.
+---
+
+## Free/Busy Data Model
+
+Free/busy status is derived from events, not stored separately.
+
+| Event Status | Attendee Response | Free/Busy Output |
+|-------------|-------------------|------------------|
+| confirmed | accepted | busy |
+| confirmed | tentative | tentative |
+| cancelled | — | not shown |
+| — | needs_action | not shown |
+
+Granularity: 30-minute blocks (configurable 15/30/60). Working hours: per-user config; outside working hours treated as free.
+
+## Single-User Availability
+
+Computation: fetch events in time window → expand recurrences → extract busy intervals → merge overlapping intervals → subtract working hours.
+
+**Complexity:** O(n log n) where n = number of events in window.
+
+## Multi-User Availability
+
+**Algorithm:**
+1. Fetch free/busy for all attendees (parallel Redis cache lookups)
+2. Normalize all busy intervals to UTC
+3. Build composite busy timeline: union of all attendee busy intervals
+4. Intersect with all attendees' working hours
+5. Find gaps in composite timeline ≥ requested duration
+6. Rank slots: prefer times matching all attendees' working hours, penalize edge-of-window
+
+**Complexity:** O(A × E + G × log G) where A = attendees, E = events per attendee, G = gap count.
+
+## Availability Cache
+
+- **Key:** `avail:\{sha256(sortedAttendees))\}:\{timeMin\}:\{timeMax\}:\{duration\}`
+- **TTL:** 5 minutes (short because events change frequently)
+- **Invalidation:** on any attendee's event create/update/delete affecting the time window
+
+## Edge Cases
+
+- **Tentative attendees:** show as "maybe busy" — slots not excluded but flagged
+- **Declined attendees:** excluded from computation
+- **Timezone mixing:** all comparisons in UTC; display in organizer's timezone
+- **Recurrence explosion:** pre-expand during event creation for attendees with 1000+ occurrences
+- **All-day events:** treated as busy for entire day regardless of time

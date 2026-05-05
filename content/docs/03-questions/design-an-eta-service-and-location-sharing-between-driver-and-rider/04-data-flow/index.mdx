@@ -1,0 +1,158 @@
+---
+title: Data Flow
+description: Data flow for the ETA and location sharing service — write path, read path, and replication.
+---
+
+## Write Path (Location Updates)
+
+### Driver App → API Gateway → Location Ingestion Service
+
+```
+┌──────────────┐     HTTPS POST      ┌─────────────────┐    Validate     ┌──────────────────┐     Batch Write    ┌─────────────────┐
+│  Driver App  │ ──────────────────► │ API Gateway     │ ───────────────► │ Location Service   │ ──────────────────► │ Real-Time Store │
+│ (GPS @ 5-10s)│                     │ Auth + Rate Limit │                 │ (in-process)       │                     │  (Redis Cluster)│
+└──────────────┘                     └─────────────────┘                 └──────────────────┘                     └─────────────────┘
+                                                                           │                                                    │
+                                                                           │ Push to subscribers    ┌─────────────────┐       │                  │
+                                                                           │                    │ Redis Pub/Sub    │◄──────┘                  │
+                                                                           │                    │ (trip channels)│                             │
+                                                                           │                    └─────────────────┘                             │
+                                                                           ▼                                                    │
+                                                                    ┌──────────────────┐     Async Write       ┌─────────────────┐    TTL Expire
+                                                                    │ Stream Processor │ ───────────────────► │ Time-Series DB  │ ◄── Redis key expiry
+                                                                    │ (Kinesis/Kafka)  │                      │ (Cassandra/    │
+                                                                    └──────────────────┘                      │ TimescaleDB)   │
+                                                                                                            └─────────────────┘
+```
+
+1. Driver app samples GPS at 5-10 second intervals (adaptive: faster when slow, slower on highways).
+2. Posts to `POST /v2/location/ping` through API Gateway (JWT auth, rate limited).
+3. Location Service validates the trip state (is trip IN_PROGRESS?), validates coordinates (bounds check), filters GPS anomalies (teleportation detection: >1km in &lt;5s → discard).
+4. **Hot path**: Write to Redis (the real-time store) — `SET driver:location:\{trip_id\} '\{"lat":...,"lng":...,"h":...\}' EX 300`. This is an atomic write with 300s TTL (expires 5 minutes after last update). Redis cluster is partitioned by `trip_id` hash — O(1) write, &lt;2ms latency. **On trip completion/cancellation**, the key is explicitly deleted via `DEL driver:location:\{trip_id\}` rather than waiting for TTL expiry.
+5. **Parallel path**: Publish event to Kinesis stream `location-pings` with partition key = `trip_id`. This enables downstream consumers.
+6. Return immediately (fire-and-forget). Stream processor writes to Cassandra/TimescaleDB asynchronously (eventual consistency, typically &lt;1s lag).
+
+**Why fire-and-forget**: The driver app is already sending every 5-10 seconds. A slow ACK would waste battery and data. The Kinesis stream provides durability — if Redis fails, the stream processor can rebuild from recent events.
+
+### GPS Drift Detection Pipeline
+
+```
+Location Service ──► Kinesis ──► Flink Stream Processor ──► Alerts (CloudWatch)
+         │                   │
+         │                   └─► Anomaly Filter ──► Only valid pings forwarded
+         │
+         └─► If speed > 200km/h in 2s → flag as GPS glitch → discard
+```
+
+- Flink job checks consecutive pings: if distance / delta_time > reasonable vehicle speed (200 km/h urban, 350 km/h highway), flag as glitch.
+- Urban canyon multipath errors are detected by GPS accuracy_m field — if accuracy > 50m, mark as low-quality and reduce weight in map matching.
+- Stationary detection: if speed < 5 km/h for 30s, throttle sampling rate via application-level protocol (Location Service sends back `throttle: true`).
+
+### ETA & Route Computation Write Path
+
+#### When ETA is Computed
+
+1. **Matching phase**: When a driver accepts a ride, compute initial ETA from driver current location to pickup. This is the first ETA the rider sees.
+2. **IN_PROGRESS phase**: Every 30 seconds (or whenever route_version changes).
+3. **Event-triggered**: Significant traffic change on the route (detected by traffic monitoring service), driver takes a wrong turn (navigation SDK), or driver explicitly requests recalculation.
+
+#### ETA Computation Pipeline
+
+```
+ETA Request ──► Cache Check (Redis) ──► HIT → Return cached ETA (&lt;1ms)
+                                      │
+                                      └─► MISS ──► Route Service ──► Fetch road segments ──►
+                                                              │
+                                                              ▼
+                                                       Graph Search (Dijkstra/A*)
+                                                              │
+                                                              ▼
+                                                       + Real-time traffic layer
+                                                              │
+                                                              ▼
+                                                       + Historical travel time model
+                                                              │
+                                                              ▼
+                                                       Compute ETA → Write to Redis (TTL 30s)
+                                                              │
+                                                              ▼
+                                                       Return to requester
+```
+
+- **Cache layer**: Redis stores the latest ETA per trip. TTL 30s. If a cached value is available and &lt;30s old, return immediately — this handles 90%+ of reads.
+- **Route lookup**: Given trip's pickup and dropoff, fetch pre-computed route segments (road graph) from the Route Service. Routes are cached with 5-10 min TTL — recalculated only when traffic conditions change significantly or the driver deviates >500m from the planned route.
+- **ETA model**: Uses a learned model on road segments. Each road segment has: base_travel_time (from historical data), current_delay_multiplier (from real-time traffic), time_of_day_factor (rush hour penalty). ETA = sum(segment_delay * delay_multiplier * tod_factor) for all segments.
+- **Write to Redis**: `SET eta:\{trip_id\} '\{"pickup":4,"dropoff":18\}' EX 30`. Atomic write, &lt;1ms.
+
+## Read Path (Rider Queries)
+
+### Polling Model (Primary)
+
+```
+Rider App ──GET /v2/trip/\{id\}/driver-location──► API Gateway ──► Location Service ──► Get from Redis ──► Latest location + cached ETA
+                                                                                                  │
+                                                                                                  └─► MISS → Last-known position from Trip state store (fallback)
+```
+
+1. Rider app polls `GET /v2/trip/\{trip_id\}/driver-location` every 5-10 seconds.
+2. API Gateway forwards to the Location Service instance that owns this trip (consistent hashing on trip_id, or connection to the same Redis shard).
+3. Location Service reads `driver:location:\{trip_id\}` from Redis. If present, returns location + the latest cached ETA from `eta:\{trip_id\}`.
+4. **If Redis miss** (e.g., service restart, key expired): Fall back to Trip state in the database (last-known position from the Trip record). This is the fail-open behavior.
+
+### WebSocket Stream (Optional / Premium)
+
+```
+Rider App ◄── WebSocket ───► Load Balancer ──► Connection Manager ──► Redis Pub/Sub subscriber
+                                                                                       │
+                                                                                       └──► For each event on trip channel:
+                                                                                              \{lat, lng, heading, eta\} ──► Push to connected rider(s)
+```
+
+- Rider connects to `wss://eta-service/trip/\{id\}/stream`.
+- Connection Manager subscribes to Redis Pub/Sub channel `trip:\{trip_id\}:updates`.
+- Whenever a location ping is received and written to Redis, a Pub/Sub message is published with the updated position.
+- All riders on the same trip receive the update simultaneously (no polling overhead).
+- WebSocket connections are managed by a stateful Connection Manager service. Each connection holds the trip_id. A Redis-backed session store maps connection_id → trip_id for routing.
+- If the WebSocket drops, the rider falls back to polling automatically.
+
+**Why polling is primary**:
+- No stateful connections to manage at scale (1M concurrent WebSocket connections is expensive: memory, SSL termination, NAT table entries).
+- Works behind aggressive mobile firewalls and carrier-grade NAT.
+- 5-10 second polling is smooth enough for map rendering (effectively 6-20 FPS for marker position).
+- Easier to load-balance: each request is independent, can hit any replica.
+
+**When WebSocket is useful**:
+- Premium/ride-share tiers where map smoothness matters more than cost.
+- Battery savings on the rider's device (no network stack wakeups for HTTP polling).
+- Trip cancellation notifications (push, no polling needed).
+
+## Sync/Replication Flow
+
+### Multi-Region Replication Strategy
+
+```
+┌─────────────────┐         Cross-Region Sync        ┌─────────────────┐
+│  US-East Region  │ ◄──────────────────────────────► │  EU-West Region  │
+│  (Primary for    │   Kinesis Replication Stream    │  (Replica,       │
+│   NA trips)      │                                  │   primary for    │
+│   EU trips)      │                                  │   EU trips)      │
+└─────────────────┘                                  └─────────────────┘
+```
+
+- **Active-active per region**: Each geographic region handles its own trips independently. A trip in NA is served by US-East, a trip in EU by EU-West. Cross-region trips are &lt;1% of volume.
+- **Regional Redis clusters**: Each region has its own Redis cluster. No cross-region Redis replication (RTT too high for sub-10ms reads).
+- **Cross-region state**: Trip metadata (not location) replicates via Kinesis/DMS to a regional DynamoDB/Cassandra replica. This is for analytics and dispute resolution, not for live read/write.
+- **Failure mode**: If a region goes down, new trips are routed to the nearest healthy region. In-progress trips in the failed region become read-only (last-known position). Riders can still see the driver but location updates may be delayed until recovery.
+
+### Location History Archival Flow
+
+```
+Kinesis Stream ──► Flink Aggregation ──► Parquet files on S3 ──► Athena / Presto (analytics)
+       │
+       ▼
+Cassandra / TimescaleDB (hot: last 7 days) ──► TTL cleanup (30 days) ──► Archive to S3 (cold)
+```
+
+- Live location history: Stored in Cassandra/TimescaleDB with 30-day TTL. Queries for trip reconstruction, dispute resolution.
+- After 7 days: Migrated to cold storage (S3 via Cassandra SSTable export). Queryable via Athena for analytics but not for real-time lookups.
+- GDPR deletion: When a user requests data deletion, a background job finds all their LocationHistory records and issues DELETE (soft delete first, then hard purge after 90 days).

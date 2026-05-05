@@ -1,0 +1,84 @@
+---
+title: Log Compaction
+description: Key-based retention and segment compaction algorithm
+---
+
+## Key-Based Retention
+
+Log compaction is a retention policy that retains only the latest value per key in a topic. Unlike time-based retention (delete after N days), compaction guarantees that every key has at least one visible record at any time.
+
+**How it works:**
+
+When a key is produced with a null value (tombstone), it signals deletion. The compactor tracks the highest offset for each key. Offsets below that point are safe to delete because a later record with the same key supersedes them.
+
+```
+Log:  [key=A, val=1, offset=0]
+       [key=B, val=hello, offset=1]
+       [key=A, val=2, offset=2]   ← supersedes offset 0
+       [key=A, val=null, offset=3] ← tombstone for key A
+       [key=C, val=world, offset=4]
+
+After compaction:
+       [key=B, val=hello, offset=1]   ← retained (latest for B is at offset 1)
+       [key=C, val=world, offset=4]   ← retained (latest for C is at offset 4)
+       (offsets 0 and 3 are deleted: A's latest is null at offset 3, B's latest is at 1)
+```
+
+**Why key-based instead of value-based?**
+
+Compaction requires a key because without it, there's no way to determine which record is "latest" for any given entity. Keyed topics are the right model for stateful systems (databases, caches) where each entity has a single current state.
+
+**When compaction alone is insufficient:**
+
+If a key is never updated after its initial write, the compactor has nothing to do — the original record is both the first and latest. For keys that become stale over time, compaction must be combined with time-based retention. Most production systems use both: `cleanup.policy=compact,delete` — compact until a key is last written before the retention window, then delete.
+
+## Compaction Algorithm
+
+Log compaction runs as a background process on each broker, processing one partition at a time. It operates on log segments (typically 1GB each).
+
+**The compaction pipeline:**
+
+```
+Step 1: Identify candidate segments (all segments except the active one)
+Step 2: For each segment, build a key-to-offset map from all messages
+Step 3: Walk the map from first to last offset — for each key, keep only the last offset
+Step 4: Write a new compacted segment containing only the retained messages
+Step 5: Rename the compacted segment to replace the old segment
+Step 6: Remove the old segment file
+```
+
+**Key optimization: skip already-compacted segments.**
+
+The compactor tracks the `base_offset` of the lowest offset for each key. If a new message for that key arrives at a higher offset, the compactor knows all offsets below the new one can be deleted. This means compaction can be incremental — it doesn't need to scan the entire log, only segments since the last compaction point.
+
+```
+Last compaction left key=users:123 at offset=5000
+New write: key=users:123 at offset=6000
+Result: all records for key=users:123 before offset=6000 can be deleted
+Next compaction starts scanning from offset=5001 (not offset=0)
+```
+
+**Why compaction doesn't block reads or writes:**
+
+Compaction writes to a new segment file and atomically renames it. Readers using offset-based seeks are unaffected because they read specific offsets, not filenames. Writers append to the active segment, which is separate from the compaction process. The old segment is only deleted after all active readers have moved past it.
+
+## Compaction vs Retention
+
+| Aspect | Compaction | Time-based Retention | Size-based Retention |
+|---|---|---|---|
+| Deletion criterion | Last offset per key | Age of oldest message | Total log size |
+| Guarantees | Latest value per key always exists | Messages deleted after N days/hours | Total storage bounded |
+| Use case | State stores, changelogs | Logs, audit trails, metrics | Disk space limited |
+| Storage behavior | Can grow indefinitely | Bounded by retention x throughput | Hard cap |
+| Read pattern | Key lookup (latest value) | Time-based scan (range) | Time-based scan |
+
+**Why a topic can't be both compacted and size-bounded:**
+
+These constraints conflict. Compaction reduces size by deleting old records, which might keep the log small indefinitely — making a size cap redundant. But if compaction can't delete anything (all keys are unique and frequently updated), the log grows without bound, potentially exceeding the size limit. Kafka resolves this by allowing `cleanup.policy=compact,delete` (both compaction and time-based), but not explicit size caps.
+
+**Production recommendation:**
+
+For stream processing state stores (the most common compaction use case), use `cleanup.policy=compact,delete` with a retention.ms of 1 week to 30 days. This ensures:
+1. All keys are compacted to their latest value (eliminating redundant intermediate states).
+2. Keys that haven't been updated in the retention window are deleted (preventing unbounded growth from zombie keys).
+3. State stores can always rebuild from the beginning of the log, trusting compaction has removed obsolete states.

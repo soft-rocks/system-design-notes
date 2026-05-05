@@ -1,0 +1,104 @@
+---
+title: Core Entities
+description: Event, Session, User, Property, View, Goal, Dimension/Metric, and Segment entities for Google Analytics.
+---
+
+## Event
+
+Fundamental unit of user interaction; always belongs to a session.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event_name` | string | "page_view", "click", "purchase", custom |
+| `timestamp` | UTC | Event occurrence time |
+| `parameters` | key-value (≤25) | event_type, category, label, value, page_location, page_title, transaction_id |
+| `user_id` | string | Authenticated user (optional) |
+| `user_pseudo_id` | string | Anonymous (client-generated) |
+| `session_id` | UUID | Session grouping |
+| `client_id` | string | Browser cookie / mobile device ID |
+| `app_info` | object | app_id, app_version |
+| `device_info` | object | category, model, brand, operating_system |
+| `geo_info` | object | city, country, region, lat/lng |
+| `traffic_source` | object | medium, source, campaign |
+
+## Session
+
+Grouping of events by user within a time window.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | UUID | Unique session identifier |
+| `start_timestamp` | UTC | First event in session |
+| `end_timestamp` | UTC | Last event in session |
+| `session_duration` | sec | end - start |
+| `traffic_source` | object | Campaign attribution |
+| `landing_page` | string | First page viewed |
+| `pages_viewed` | int | Total page views |
+| `engagements` | int | Engaged sessions |
+| `engagement_time_msec` | ms | Total engaged time |
+
+**Timeout:** 30 min inactivity; midnight crossover; campaign re-attribution.
+
+**Derived states:** bounce (single page, engagement_time=0), engaged session (duration>10s or conversion or ≥2 page views).
+
+## User
+
+Unique end user across devices/sessions.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user_id` | string | Authenticated (optional) |
+| `user_pseudo_id` | string | Anonymous identifier |
+| `first_user_timestamp` | UTC | First seen |
+| `last_user_timestamp` | UTC | Last seen |
+| `user_ltv` | object | Lifetime value metrics |
+| `user_engagement_time` | ms | Total engaged time |
+
+**Identification:** client_id (cookie), user_id (login), device_id (ADID/IDFA).
+
+## Property (Web App)
+
+Analytics configuration for a single website or app.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `property_id` | string | GA identifier |
+| `account_id` | string | Parent account |
+| `industry_category` | string | Vertical classification |
+| `reporting_timezone` | string | IANA timezone |
+| `currency_code` | string | ISO 4217 |
+| `filters` | array | IP excludes, query param filters, bot filtering |
+
+## Goal / Conversion
+
+GA4: conversions are events marked as "conversion events."
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `conversion_name` | string | Human-readable name |
+| `conversion_event_name` | string | Event name triggering conversion |
+| `conversion_value` | float | Revenue or arbitrary value |
+| `attribution_model` | string | last_click, linear, time_decay, position_based, data-driven |
+
+## Dimension & Metric
+
+| Type | Examples |
+|------|----------|
+| **Dimension** | page_path, country, device_category, source, medium, campaign, user_id, session_id |
+| **Metric** | users, sessions, pageviews, event_count, bounce_rate, avg_session_duration, conversions, revenue |
+
+**Compound metrics:** bounce_rate = 1 - engaged_sessions/sessions; revenue_per_user = total_revenue/users.
+
+## Segment
+
+Subset of users/sessions/events sharing a common condition.
+
+| Type | Scope |
+|------|-------|
+| User segment | All events from users matching condition |
+| Session segment | All events from sessions matching condition |
+| Event segment | Only matching events |
+
+Conditions: `dimension = value`, `dimension > threshold`, `event_name = X`, `user_property contains Y`.
+
+Applied as WHERE clauses at query time (no pre-computation).

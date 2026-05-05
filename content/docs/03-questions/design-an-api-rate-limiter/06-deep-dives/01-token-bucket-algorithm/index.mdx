@@ -1,0 +1,72 @@
+---
+title: Token Bucket Algorithm
+description: Deep dive into token bucket algorithm for rate limiting
+---
+
+## Why Token Bucket over Fixed Window
+
+Fixed-window algorithms (e.g., "allow 100 requests per minute") are simple but suffer from a **boundary problem**: if a client sends 100 requests at second 55–60 of one window, then another 100 at second 0–5 of the next window, they've sent 200 requests in 10 seconds — double the intended rate. A sliding window mitigates this but requires more complex storage.
+
+Token buckets avoid the boundary problem entirely because they're **continuous**: tokens refill at a constant rate regardless of wall-clock boundaries. A burst at any time simply drains the bucket; the refill rate is independent of when the request occurs.
+
+## Why Token Bucket over Sliding Window Log
+
+Sliding Window Log maintains a log of every request timestamp per client. This is accurate but:
+- **Memory-heavy**: at 100 req/min per client with 1M clients, that's 10M timestamps stored continuously.
+- **Write-heavy**: every request requires a log append and a periodic compaction of expired entries.
+
+Token buckets store only two fields per window (`tokens`, `lastRefill`) — 16 bytes per bucket. With 4 windows per client and 1M clients, that's 64MB in Redis, not gigabytes.
+
+The trade-off: token buckets are slightly less precise at the burst boundary (they assume a uniform refill rate between check times). For rate limiting, this imprecision is an acceptable trade-off for the massive reduction in storage and write overhead.
+
+## Implementation Details
+
+### The Core Equation
+
+Each bucket tracks `tokens` and `lastRefill`. On every request:
+
+```
+elapsed = now_ms - lastRefill_ms
+refill = elapsed_ms * (rate_tokens_per_sec / 1000)
+tokens = min(burst_capacity, tokens + refill)
+```
+
+If `tokens &gt;= cost`: allow the request, `tokens -= cost`.
+If `tokens < cost`: deny the request with 429.
+
+### The Lua Script
+
+The entire check-and-consume logic runs as a single atomic Lua script on the Redis server. This is essential because:
+
+1. **No race between read and write**: A GET followed by a SET in two separate commands allows two concurrent requests to read the same token count. Lua executes atomically — only one script runs at a time.
+2. **No round-trip latency**: The refill math happens on the Redis server, eliminating one network round-trip (~0.1–0.2ms saved per request).
+3. **Deterministic**: The same inputs always produce the same outputs, regardless of how many clients are running.
+
+### Multiple Window Buckets
+
+Each client has **4 independent buckets**: second, minute, hour, day. All four must allow a request. This enforces both burst and sustained rate limits:
+
+```
+Client sends request → Check all 4 buckets:
+  ├─ second bucket: tokens &gt;= 1?     (burst protection)
+  ├─ minute bucket: tokens &gt;= 1?     (short-term rate)
+  ├─ hour bucket:   tokens &gt;= 1?     (medium-term rate)
+  └─ day bucket:    tokens &gt;= 1?     (long-term quota)
+
+If ALL pass → allow, deduct 1 from each bucket
+If ANY fails → deny (the most restrictive bucket determines the limit)
+```
+
+The most restrictive bucket is typically the one with the lowest `rate/burst` ratio for the given time scale. For a client with 50/sec burst and 100,000/day limit, the day bucket is the constraint during sustained usage, while the second bucket is the constraint during bursts.
+
+## Algorithm Comparison Summary
+
+| Algorithm | Accuracy | Memory | Complexity | Handles Burst |
+|---|---|---|---|---|
+| **Token Bucket** | Near-exact | O(1) per window | Low | Yes (configurable bucket size) |
+| Fixed Window | Approximate (boundary issue) | O(1) per window | Very Low | No (can burst at boundary crossing) |
+| Sliding Window Log | Exact | O(N) where N = requests in window | Medium | Yes (implicit) |
+| Sliding Window Counter | Approximate | O(2) per window | Medium | Partial (weighted average of two windows) |
+| Leaky Bucket | Exact | O(1) | Medium | No (smooths all traffic) |
+
+Token Bucket is the best choice for API rate limiting because it matches how developers think about rate limits: "you can burst to X, but sustain at Y."

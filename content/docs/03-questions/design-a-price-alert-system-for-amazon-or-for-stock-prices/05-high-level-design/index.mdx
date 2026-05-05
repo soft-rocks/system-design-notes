@@ -1,0 +1,201 @@
+---
+title: High Level Design
+description: High-level architecture and service decomposition for the price alert system.
+---
+
+## Architecture Overview
+
+### Design Philosophy
+
+This system has two distinct phases that drive the architecture:
+
+1. **Price Ingestion** — slow, expensive, shared. External APIs are rate-limited and metered. The key optimization is polling once per target and fanning out internally.
+2. **Alert Evaluation** — fast, cheap, per-alert. Evaluating a price against a threshold is trivially cheap, but must happen for millions of alerts every cycle. The key optimization is in-memory sorted set lookups.
+
+### System Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        A[Web App]
+        B[Mobile SDK]
+        C[Browser Widget]
+    end
+
+    subgraph "Edge & API Layer"
+        GW[API Gateway<br/>JWT Auth, Rate Limiting]
+        CDN[CDN / WAF]
+    end
+
+    subgraph "Service Layer"
+        AS[Alert Service<br/>CRUD for alerts]
+        PS[Price Ingest Service<br/>Polls external sources]
+        ES[Evaluation Service<br/>Threshold matching]
+        NS[Notification Service<br/>Email / Push / SMS]
+        US[User Service<br/>Auth & profiles]
+        SS[Search Service<br/>Product discovery]
+    end
+
+    subgraph "Streaming Layer"
+        K1[Kafka<br/>price-updates-ingestion]
+        K2[Kafka<br/>alert-triggers]
+        K3[Kafka<br/>prices-cdc]
+    end
+
+    subgraph "Data Layer"
+        PG[(PostgreSQL<br/>Alerts, Users, Alerts)]
+        RD[(Redis<br/>Sorted Sets<br/>Evaluation Cache)]
+        CH[(ClickHouse<br/>Price History<br/>Analytics)]
+        S3[S3<br/>Raw Price Archive]
+    end
+
+    A --> CDN
+    B --> CDN
+    C --> CDN
+    CDN --> GW
+    GW --> AS
+    GW --> PS
+    GW --> US
+    GW --> SS
+
+    AS --> PG
+    PS --> K1
+    PS --> PG
+
+    K1 --> ES
+    ES --> RD
+    ES --> K2
+    K2 --> NS
+
+    NS --> SES[SES / FCM / Twilio]
+
+    K3 --> CH
+    PS --> S3
+
+    style GW fill:#f9f,stroke:#333
+    style K1 fill:#ff9,stroke:#333
+    style K2 fill:#ff9,stroke:#333
+    style K3 fill:#ff9,stroke:#333
+    style PG fill:#9cf,stroke:#333
+    style RD fill:#f99,stroke:#333
+    style CH fill:#9fc,stroke:#333
+```
+
+### Key Design Decisions
+
+1. **Poll Once, Evaluate Everywhere** — Instead of each evaluation instance independently polling external APIs, a single Price Ingest Service polls each target and broadcasts via Kafka. This reduces external API calls by ~90% compared to naive per-alert polling.
+
+2. **In-Memory Evaluation with Redis Sorted Sets** — Rather than querying PostgreSQL for alerts per target (N+1 queries), active alerts are cached as Redis sorted sets keyed by target_id, scored by threshold_value. Evaluation becomes O(log N) binary search.
+
+3. **Event-Driven Notification** — Alert triggers are published as events to Kafka, decoupling evaluation from notification. This allows the notification service to scale independently and provides durable buffering during spikes.
+
+## Component Diagram
+
+```mermaid
+graph TB
+    subgraph "Clients"
+        WEB[Web App]
+        MOB[Mobile App]
+        WDG[Browser Widget]
+    end
+
+    subgraph "Edge"
+        CDN[CDN/WAF]
+        GW[API Gateway]
+    end
+
+    subgraph "Microservices"
+        AS[Alert Service<br/>Create/Read/Update/Delete alerts]
+        US[User Service<br/>Authentication & profiles]
+        PS[Price Ingest Service<br/>Poll external APIs<br/>Single-poll dedup]
+        ES[Evaluation Service<br/>Per-partition worker<br/>Redis sorted set lookup]
+        NS[Notification Service<br/>Multi-channel delivery]
+        SS[Search Service<br/>Product catalog lookup]
+        RS[Reconciliation Service<br/>Backfill & drift detection]
+    end
+
+    subgraph "Kafka Cluster"
+        K1[(price-updates-ingestion)]
+        K2[(alert-triggers)]
+        K3[(prices-cdc)]
+    end
+
+    subgraph "Data Stores"
+        PG[(PostgreSQL<br/>Alerts + Users)]
+        RD[(Redis Cluster<br/>Sorted Sets)]
+        CH[(ClickHouse<br/>Price History)]
+        S3[S3 Glacier<br/>Raw Archive]
+    end
+
+    subgraph "External APIs"
+        AMAZON[Amazon Product API]
+        SHOP[Shopify/Scraper]
+        MKT[Market Data APIs]
+    end
+
+    subgraph "Notification Channels"
+        SES[Amazon SES]
+        FCM[FCM Push]
+        SMS[Twilio SMS]
+    end
+
+    WEB --> CDN --> GW
+    MOB --> CDN
+    WDG --> CDN
+
+    GW --> AS
+    GW --> US
+    GW --> SS
+
+    AS <--> PG
+    US <--> PG
+
+    PS --> AMAZON
+    PS --> SHOP
+    PS --> MKT
+    PS --> K1
+
+    K1 --> ES
+    ES --> RD
+    ES --> K2
+
+    K2 --> NS
+    NS --> SES
+    NS --> FCM
+    NS --> SMS
+
+    K3 --> CH
+
+    PS --> S3
+
+    RS --> PG
+    RS --> K1
+```
+
+Each component has a single responsibility:
+- **Alert Service**: Manages alert lifecycle (create, read, update, delete, pause/resume). Writes alert definitions to PostgreSQL and publishes new/updated alert keys to Kafka for the evaluation cache to pick up.
+- **Price Ingest Service**: The shared polling worker. One partition per target product/market. Fetches from external APIs once, writes the raw price event to PostgreSQL and publishes to Kafka for downstream consumers.
+- **Evaluation Service**: Consumes `price-updates-ingestion` per partition. Loads active alerts for that target from Redis sorted set, performs O(log N) binary search to find all alerts whose thresholds the current price has crossed. Emits alert-trigger events to Kafka.
+- **Notification Service**: Consumes `alert-triggers` with retry logic and per-user rate limiting. Routes to the appropriate channel (email via SES, push via FCM, SMS via Twilio) based on user preferences.
+- **Reconciliation Service**: Periodic backfill job that compares PostgreSQL price events with ClickHouse aggregations. Detects data drift and triggers resync when gaps are found.
+
+## Technology Choices
+
+### Data Stores
+
+| Technology | Use Case | Why | Alternative | Rejected Because |
+|------------|----------|-----|-------------|-----------------|
+| PostgreSQL | Alert state, User data, PriceEvents | ACID compliance for alert state (strong consistency required), partitioning for price history | DynamoDB | Need complex queries (range scans on price history, joins for user-alert correlation) |
+| Redis | Alert evaluation cache | Sorted sets enable O(log N) threshold binary search | Memcached + application sort | Need sorted set data structure for efficient evaluation |
+| Kafka | Event streaming between services | Decouples ingestion from evaluation, durable buffering for notification dispatch | RabbitMQ | Need ordered per-key partitioning and multi-consumer groups |
+| ClickHouse | Price history analytics | Columnar storage for fast aggregation over billions of price records | Elasticsearch | Need true OLAP aggregation (min/max/avg over time ranges) |
+| S3 | Raw price data archive | Cheap long-term storage, feeds analytics pipelines | PostgreSQL partition | Cost at scale (years of data) |
+
+### Infrastructure
+
+| Technology | Use Case | Why | Alternative | Rejected Because |
+|------------|----------|-----|-------------|-----------------|
+| AWS ECS/Fargate | Service deployment | No server management, scales to zero, per-service autoscaling | Kubernetes | Overhead for current scale (10M alerts → ~10 services) |
+| AWS SES | Email delivery | Cost-effective ($0.10/1000), high deliverability, CloudWatch integration | SendGrid | Cost at volume (30K+ notifications/day) |
+| Firebase FCM | Push notifications | Free, reliable, supports both Android and iOS | OneSignal | FCM is the platform-native default, no vendor lock-in cost |
+| Twilio | SMS delivery | Global coverage, reliable delivery, simple API | Plivo | Twilio's documentation and SDK maturity advantage |

@@ -1,0 +1,212 @@
+---
+title: "Data Flow"
+description: "Data flow for the most shared articles tracking system — write path, read path, and counter management"
+---
+
+## Write Path
+
+The write path is the event ingestion and aggregation pipeline. It must handle millions of share events per second with minimal latency.
+
+```
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌─────────────┐
+│ Client SDK  │    │  Social APIs │    │  Email GW    │    │  Direct     │
+│ (web/mobile)│    │  (webhooks)  │    │  (tracking)  │    │  Link Clicks│
+└──────┬──────┘    └──────┬───────┘    └──────┬───────┘    └──────┬──────┘
+       │                   │                   │                   │
+       └───────────────────┴───────────────────┴───────────────────┘
+                                           │
+                                           ▼
+                              ┌──────────────────────────┐
+                              │   Ingestion Gateway       │
+                              │   (Rate limit, validate)  │
+                              └────────────┬─────────────┘
+                                           │
+                                           │ POST /shares, idempotent
+                                           ▼
+                              ┌──────────────────────────┐
+                              │   Kafka: share-events     │
+                              │   partitions by article_id│
+                              │   replication=3, durable  │
+                              └────────────┬─────────────┘
+                                           │
+                                           │ consume (parallel consumers)
+                                           ▼
+                    ┌──────────────────────┴──────────────────────┐
+                    │                                             │
+           ┌────────────────┐                         ┌────────────────┐
+           │ Stream Proc-   │                         │ Stream Proc-   │
+           │ sor (5min gran)│                         │  (1hr gran)    │
+           │ 10s buckets    │                         │ 1min buckets   │
+           └───────┬────────┘                         └───────┬────────┘
+                   │                                           │
+                   │ Redis: SET counter:5m:10s:art_123 = N     │
+                   │ TTL: 25min (buffer for sliding window)    │
+                   │                                           │
+                   │ Redis: SET counter:1h:1m:art_123 = N      │
+                   │ TTL: 90min                                  │
+                   │                                           │
+                   ▼                                           ▼
+           ┌────────────────────────────────────────────────────┐
+           │               Redis Cluster (Tair)                  │
+           │   Sharded by granularity + bucket_key              │
+           │   Each key: (article_id, bucket_key) → count       │
+           └────────────────────────────────────────────────────┘
+```
+
+### Key Design Decisions
+
+**1. Kafka for durability and audit**
+
+Every share event is written to Kafka before aggregation. This provides:
+- **Durability**: events survive Redis failures
+- **Backfill capability**: if aggregation fails, replay from Kafka
+- **Audit trail**: exact share history for any article
+- **Partitioning by article_id**: ensures all events for the same article go to the same consumer, preventing race conditions
+
+**2. Three parallel aggregation streams**
+
+Instead of one aggregator with multiple windows, we run **three parallel stream processors** on the same Kafka topic:
+- The **5-minute processor** aggregates into 10-second buckets
+- The **1-hour processor** aggregates into 1-minute buckets
+- The **24-hour processor** aggregates into 10-minute buckets
+
+Each stream writes to the same Redis cluster but uses different key prefixes. This avoids a single bottleneck and allows independent scaling.
+
+**3. Redis atomic INCR**
+
+Counters use `Redis INCRBY` which is atomic — no locks needed. This is critical at 500K events/sec.
+
+**4. Out-of-order event handling**
+
+Events may arrive up to 5 seconds out of order. The stream processor uses the event's `timestamp` (not ingestion time) for bucket assignment. Late events (> 1 bucket) are counted in their correct time bucket, not the current one. Events older than the oldest surviving bucket are discarded (already accounted for).
+
+## Read Path
+
+The read path serves top-K queries with < 100ms p99 latency.
+
+```
+┌─────────────┐
+│  Client App │
+└──────┬──────┘
+       │
+       │ GET /api/v1/trending/top-k?window=5m&k=10
+       ▼
+┌──────────────────────────┐
+│   Ingestion Gateway      │
+│   (Response cache, 5s TTL)│  ← Cache hit: return immediately
+└────────────┬─────────────┘
+             │
+             │ Route to TopKService
+             ▼
+┌──────────────────────────┐
+│   TopKService             │
+│                          │
+│ 1. Resolve bucket keys    │
+│    for 5min window        │
+│    (current time → 30     │
+│     x 10s buckets)        │
+│                          │
+│ 2. MGET all counters      │
+│    Redis pipeline (30    │
+│    keys, 1 round-trip)   │
+│                          │
+│ 3. Min-heap of size K     │
+│    Scan all counters,     │
+│    keep top K articles    │
+│                          │
+│ 4. Deduplicate if same    │
+│    article spans multiple │
+│    buckets (SUM counts)  │
+└────────────┬─────────────┘
+             │
+             │ article_ids to enrich
+             ▼
+┌──────────────────────────┐
+│   ArticleEnricher         │
+│   (Redis cache layer)     │  ← Cache hit: use stored metadata
+│   LRU cache, 100K entries │
+└────────────┬─────────────┘
+             │
+             │ cache miss → ArticleService
+             ▼
+┌──────────────────────────┐
+│   ArticleService          │
+│   (gRPC call, timeout    │
+│    10ms)                  │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│   Client gets response    │
+│   [\{rank, article, count\} │
+│    × K]                   │
+└──────────────────────────┘
+```
+
+### Key Design Decisions
+
+**1. Min-heap for top-K**
+
+Instead of sorting all counters (O(n log n)), we use a **min-heap of size K** which is O(n log K). With K=100 and ~100K active articles, this is extremely efficient.
+
+**2. Pipeline MGET**
+
+All counter reads for a window are done in a single Redis pipeline call (MGET). For a 5-minute window with 30 buckets, that's 30 keys fetched in one round-trip.
+
+**3. Article metadata caching**
+
+We never query the ArticleService synchronously for every query. A Redis-backed cache (LRU, 100K entries) covers ~95% of article lookups since only ~100K articles are active at any time.
+
+**4. Response caching**
+
+Identical queries are cached for 5 seconds. This handles bursty read traffic and reduces TopKService load significantly.
+
+**5. Handling article collisions**
+
+The same article appears across multiple time buckets within the same window. Before ranking, we **sum the counts** for each article_id across all buckets in the window.
+
+## Counter Lifecycle
+
+Counter buckets have a TTL-based lifecycle with background compaction.
+
+```
+  Time →
+  ┌───────────────────────────────────────────────────────┐
+  │                                                       │
+  │  10s buckets: ─┐  TTL=25min (5min window + 20min buf) │
+  │                └─────────────────────────────────────┘
+  │
+  │  1min buckets: ┐ TTL=90min (1hr window + 30min buf)  │
+  │                └──────────────────────────────────────┘
+  │
+  │  10min buckets: TTL=26hr (24hr window + 2hr buf)      │
+  │                  └────────────────────────────────────┘
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
+
+  Background Compaction (runs every 5min):
+  1. Identify 10s buckets that have been stable for 3 TTLs
+  2. Merge into a single summary counter: total count + unique article count
+  3. Free individual bucket memory
+  4. Reduces Redis memory usage by ~60% over time
+```
+
+### TTL Strategy
+
+| Granularity | Bucket Size | Counters Needed | TTL     | Redis Key Size Est. |
+| ----------- | ----------- | --------------- | ------- | ------------------- |
+| 5min window | 10 seconds  | 30              | 25 min  | ~100MB              |
+| 1hr window  | 1 minute    | 60              | 90 min  | ~150MB              |
+| 24hr window | 10 minutes  | 144             | 26 hours| ~350MB              |
+
+Total Redis memory for counters: ~600MB (excluding payloads and overhead → ~2GB with cluster replication).
+
+### TTL Key Format
+
+```
+counter:5m:10s:<timestamp_floor_10s>:<article_id>
+counter:1h:1m:<timestamp_floor_1m>:<article_id>
+counter:24h:10m:<timestamp_floor_10m>:<article_id>
+```
+
+Example: `counter:5m:10s:1714672200:art_12345` → value: `4823`

@@ -1,0 +1,128 @@
+---
+title: High Level Design
+description: Architecture overview, component diagram, and technology choices for the A/B testing system.
+---
+
+## Architecture Overview
+
+The system has four main zones:
+
+1. **Client Zone**: SDKs embedded in web, iOS, Android, and server-side apps. The SDK is lightweight (< 50KB gzipped), caches variant assignments locally, and reports events asynchronously.
+
+2. **Decision Zone**: The low-latency path for assignment and flag evaluation. Consists of the Assignment Service (hash-based deterministic routing) and Feature Flag Service. Both read from an in-memory Redis-backed cache and fall back to a local config if upstream is unavailable.
+
+3. **Data Zone**: Event ingestion, stream processing, and aggregation. Events flow from SDK → Ingestion API → Kafka → Flink stream processor → ClickHouse (aggregated metrics).
+
+4. **Control Zone**: Admin dashboard and REST APIs for experiment management. Creates/updates experiments in PostgreSQL, publishes config changes to Kafka, which propagates to Redis and edge caches.
+
+**Key design decision — decouple decision from analytics:** The assignment path (read) and event path (write) are completely independent services. A failure in the analytics pipeline never impacts the user's experience — they still get a variant assigned (from local cache or default control).
+
+**Key design decision — hash-based assignment (not server lookup):** Instead of querying a database to determine which bucket a user belongs to, we use a deterministic hash function `hash(userId, experimentId) % 10000` mapped to traffic segments. This makes assignment O(1), stateless, and globally consistent without any server-side state needed per user.
+
+## Component Diagram
+
+```
+                           ┌─────────────────────────────────────────────────────────────┐
+                           │                         Control Zone                         │
+                           │                                                                │
+┌──────────────┐   REST API │  ┌──────────┐   Kafka      ┌─────────────────┐               │
+│  Admin       │ ─────────→ │  │ PostgreSQL│ ──────────→ │  Config Prop.   │               │
+│  Dashboard   │            │  │ (primary │             │  (consumer)     │               │
+│              │            │  │  DB)     │             └────────┬────────┘               │
+└──────────────┘            │  └──────────┘                    │                           │
+                           │                                 │ Redis write               │
+                           │  ┌──────────┐                   ▼                           │
+                           │  │  Users   │            ┌──────────────┐                    │
+                           │  │  Roles   │            │   Redis      │                    │
+                           │  └──────────┘            │   Cluster    │←────────────────────┤
+                           └─────────────────────────→│              │                    │
+                           │                           └──────┬───────┘                    │
+                           │                                  │                             │
+                           │                           ┌──────┴───────┐     ┌──────────────┐ │
+                           │                           │  CloudFront  │────→│  Edge Cache  │ │
+                           │                           │  (CDN)       │     └──────────────┘ │
+                           └─────────────────────────────────────────────────────────────┘
+                                                                                           │
+                          ┌────────────────────────────────────────────────────────────────┤
+                          │                            Decision Zone                       │
+                          │                                                                 │
+                   ┌─────┴──────────────────────┐    ┌────────────────────────────────────┐   │
+                   │  Assignment Service        │    │  Feature Flag Service              │   │
+                   │  (Decision Engine)         │    │  (On/Off toggles)                  │   │
+                   │                             │    │                                   │   │
+                   │  1. Hash-based assignment   │←───┤  Config (shared from Redis/Edge)  │   │
+                   │  2. Local memory cache      │    │                                   │   │
+                   │  3. Fallback: local config  │    │                                   │   │
+                   └──────┬─────────────────────┘    └────────────────────────────────────┘   │
+                          │                                                                 │
+                          └────────────────────────────────────────────────────────────────┤
+                          │                            Client Zone                         │
+                          │                                                                 │
+                   ┌──────┴──────┐ ┌──────┴──────┐ ┌──────┴──────┐ ┌──────┴──────┐         │
+                   │ Web SDK     │ │ iOS SDK     │ │ Android SDK │ │ Server SDK│         │
+                   │             │ │             │ │             │ │           │         │
+                   │ variation() │ │ variation() │ │ variation() │ │ variation │         │
+                   │ track()     │ │ track()     │ │ track()     │ │ track()   │         │
+                   │ isFlagOn()  │ │ isFlagOn()  │ │ isFlagOn()  │ │ isFlagOn│         │
+                   └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘         │
+                          │               │               │               │                 │
+                          └───────────────┴───────────────┴───────────────┘                 │
+                          │ HTTP (events, batched)                                          │
+                          ▼                                                                 │
+┌─────────────────────────────────────────────────────────────────────────────────────────┤
+│                            Data Zone                                                    │
+│                                                                                         │
+                ┌─────────────────┐     Kafka      ┌──────────────────┐                    │
+                │  Event Ingestion│ ──────────────→│  Stream Proc.    │                    │
+                │  API            │                │  (Flink/Spark)   │                    │
+                │                 │                │                  │                    │
+                │  • Validate     │                │  • Real-time     │                    │
+                │  • Batch write  │                │    aggregation   │                    │
+                │  • Server time  │                │  • Dedup         │                    │
+                └─────────────────┘                └────────┬─────────┘                    │
+                                                                │ ClickHouse writes          │
+                                                                ▼                          │
+                                                        ┌─────────────────┐    SQL query   ┌──────────┐│
+                                                        │  ClickHouse     │ ←─────────────│ Reporting││
+                                                        │  (Results DB)   │             │  API     ││
+                                                        │                 │             └──────────┘│
+                                                        └─────────────────┘                   │    │
+                                                                                              │    │
+                                                        ┌─────────────────┐                   │    │
+                                                        │  Statistical    │───────────────────┘    │
+                                                        │  Engine         │   (p-values, CI)     │
+                                                        │  (per experiment) │                   │
+                                                        └─────────────────┘                    │
+                                                                                                │
+                                                        ┌────────────────────────────────────────┘
+                                                        │
+                                                       ┌──────┴──────┐
+                                                       │  Dashboard  │
+                                                       │  (React)    │
+                                                       └─────────────┘
+```
+
+## Technology Choices
+
+| Component | Choice | Rationale |
+|---|---|---|
+| **Assignment Service** | Go | High throughput, low GC pause, excellent for O(1) hash-based routing |
+| **Feature Flag Service** | Go (same binary) | Can share the Assignment Service codebase; same latency requirements |
+| **Event Ingestion API** | Rust | Extreme throughput for high-cardinality write paths with zero-copy parsing |
+| **Kafka** | Apache Kafka (or Redpanda) | Battle-tested, strong durability guarantees, partition-level parallelism |
+| **Stream Processor** | Apache Flink | Exactly-once semantics, stateful aggregations, windowing support |
+| **Config Store** | Redis Cluster | O(1) reads, pub/sub for config change notifications, built-in TTL |
+| **Edge Cache** | CloudFront | Global distribution, cache invalidation API, low-latency SDK config delivery |
+| **Results Store** | ClickHouse | Columnar OLAP, fast aggregations, native time-series support, ~100x faster than MySQL for analytical queries |
+| **Primary DB** | PostgreSQL | ACID transactions for experiment metadata, user management, audit logs |
+| **Statistical Engine** | Python (scipy/statsmodels) | Rich statistical library support; runs as a stateless service on top of ClickHouse queries |
+| **Client SDK** | Multi-language (JS, Swift, Kotlin, Go, Python) | Native SDKs per platform for best performance; minimal overhead |
+| **Frontend Dashboard** | React + TypeScript | Rich interactive charts, real-time WebSocket updates for live results |
+
+### Why not alternatives?
+
+- **MongoDB for results:** Not ideal for analytical queries with group-by + aggregations. ClickHouse is purpose-built for this workload.
+- **Memcached instead of Redis:** No pub/sub for config change notifications; Redis gives us both caching and event propagation.
+- **Spark Streaming instead of Flink:** Spark has higher latency (~1s vs ~100ms) and weaker exactly-once guarantees. Flink's stateful processing is better for real-time experiment monitoring.
+- **DynamoDB instead of Redis:** Higher latency for single-key lookups, no native pub/sub. Redis is the better fit for the < 10ms p99 SLO.
+- **GraphQL instead of REST:** REST is simpler for the high-volume assignment path (100K+ QPS). GraphQL overhead is unnecessary for this use case. Admin APIs can support both REST and GraphQL.

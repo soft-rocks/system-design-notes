@@ -1,0 +1,93 @@
+---
+title: "Requirements"
+description: "Functional and non-functional requirements for a system to collect performance metrics from thousands of servers"
+---
+
+## Functional Requirements
+
+### Metrics Collection
+
+The system must collect performance metrics from servers via a lightweight agent (e.g., StatsD client, Prometheus node_exporter, or OpenTelemetry collector) deployed on each host. Metrics include:
+
+- **System metrics**: CPU usage, memory utilization, disk I/O (read/write bytes, IOPS), network I/O (bytes in/out, packet loss, connection count), load average
+- **Application metrics**: Request rate, error rate, response latency (p50/p95/p99), connection pool size, GC pause time
+- **Custom metrics**: Application-defined counters, gauges, and histograms
+
+### Metric Types
+
+- **Counter**: Monotonically increasing value (e.g., total requests served, total errors)
+- **Gauge**: Value that can go up or down (e.g., CPU usage %, memory available)
+- **Histogram**: Value distribution across buckets (e.g., response time buckets: 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s, 10s, +inf)
+- **Summary**: Pre-computed quantiles over a time window (computed by agent, not server)
+
+### Multi-dimensional Labeling
+
+Every metric is tagged with key-value labels:
+- `host`: server hostname or IP
+- `service`: application/service name
+- `region`: datacenter region (us-east-1, eu-west-1, etc.)
+- `instance`: unique instance identifier
+- `version`: deployed version tag
+
+Queries filter and aggregate by any combination of labels.
+
+### Aggregation & Downsampling
+
+- **Raw data**: 10-second granularity, retained for 24 hours
+- **5-minute rollups**: pre-aggregated at ingestion time
+- **1-hour rollups**: retained for 90 days
+- **24-hour rollups**: retained for 1 year
+
+Rollups are computed using: avg, min, max, sum, count, rate-of-change, p50/p95/p99 (for histograms).
+
+### Query Engine
+
+Ad-hoc queries over any metric with:
+- Time range filter (last 5 minutes, last hour, last 7 days, etc.)
+- Label filter (service=api, region=us-east-1)
+- Aggregation function (avg, max, rate)
+- Downsampling level (auto-select granularity based on time range)
+
+Query language: PromQL-like DSL (simple, well-understood).
+
+### Alerting
+
+- Users define alert rules: `metric > threshold for duration` (e.g., `cpu_usage > 90 for 5m`)
+- System evaluates rules on a schedule (every 30 seconds)
+- Firing alerts trigger notifications via webhook, PagerDuty, email, Slack
+- Alert deduplication and suppression (maintenance windows, flapping)
+
+### Dashboard
+
+- Pre-built dashboards: per-host, per-service, per-region, top-N by metric
+- Custom dashboards with multi-metric panels
+- Auto-refresh on a configurable interval (5s, 15s, 30s)
+
+## Non-Functional Requirements
+
+| Requirement | Target |
+| --- | --- |
+| Ingestion throughput | 500K metrics/sec aggregate |
+| Ingestion latency | Agent sends → system acknowledges in < 1s |
+| Query latency | p99 < 500ms for 1h lookback; < 2s for 24h lookback |
+| Data durability | Zero data loss; at-least-once ingestion with dedup |
+| Availability | > 99.9% for query path; alerting must not miss critical thresholds |
+| Agent overhead | < 50MB RAM, < 5% CPU per agent process on each server |
+| Horizontal scaling | Add ingestion and query nodes independently |
+| Multi-region | Active-passive replication; RPO < 10s, RTO < 1min |
+
+## Scale Assumptions
+
+| Metric | Value |
+| --- | --- |
+| Servers monitored | 10,000 |
+| Metrics per server | 200 (system + app) |
+| Total unique metrics | 2M |
+| Ingest interval | 10 seconds |
+| Peak ingestion rate | 500K metrics/sec |
+| Concurrent dashboard users | 500 |
+| Concurrent queries | ~50 QPS |
+| Raw data retention | 24h (10s granularity) |
+| Aggregated data retention | 90 days (5-min granularity) |
+| Daily rollup retention | 1 year |
+| Daily data volume | ~500 GB raw, ~15 GB aggregated |

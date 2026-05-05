@@ -1,0 +1,72 @@
+---
+title: Top-K Partial Sort
+description: Why partial sort, max-heap algorithm, distributed top-K, and K-th element problem.
+---
+
+## Why Partial Sort
+
+When the user only needs the top-K or bottom-K elements (or K-th largest), full sort is wasteful. A full sort on 10B records is O(N log N), but partial sort reduces this to O(N log K).
+
+**Examples:**
+- Top 100 most expensive purchases
+- Top 1000 users by revenue
+- Bottom 50 rows for pagination
+- 90th percentile value
+
+## Max-Heap Algorithm (Single-Machine)
+
+**Top-K (largest first):**
+1. Maintain a min-heap of size K
+2. For each incoming record:
+   - If heap has < K elements: insert
+   - Else if record.key > heap.min: replace heap.min with record, re-heapify
+3. After processing all records: heap contains top-K elements
+
+**Bottom-K (smallest first):**
+- Same algorithm with max-heap
+
+**Complexity:** O(N log K) — for K much less than N, this is much faster than O(N log N).
+
+**Memory:** O(K) — for K = 10M, heap fits in ~1 GB (10M records × 100 bytes key + 1 KB overhead).
+
+## Distributed Top-K
+
+Two-phase algorithm:
+
+```
+Phase 1 (Local): Each worker computes local top-K on its assigned split
+Phase 2 (Global): Coordinator merges all local top-K to find global top-K
+```
+
+**Phase 1:** Each worker runs single-machine top-K on its split (no shuffle, no spill merge).
+
+**Phase 2:** Coordinator receives N × K records (N = workers), merges them with local top-K algorithm.
+
+**Complexity:** O(N × (N/K) log K) = O(N&sup2;/K × log K). For K &lt;&lt; N, this is dominated by N&sup2; reduction to N × K.
+
+**Optimization — Pruning:**
+- Each worker computes local K-th largest value (threshold T_i)
+- Workers send only (threshold, count_above) to coordinator
+- Coordinator picks the global K-th threshold (T_global = max of local K-th values)
+- Workers above T_global send their records to coordinator
+- This avoids transferring all N × K records if many records are far below the threshold
+
+## K-th Element Problem
+
+Finding the K-th largest element (not the top-K) is even cheaper: O(N) expected time.
+
+**Selection algorithm (quickselect):**
+1. Pick a pivot (randomized for average case)
+2. Partition: elements < pivot go left, elements > pivot go right
+3. If pivot rank = K: return pivot
+4. If pivot rank < K: recurse on right partition
+5. If pivot rank > K: recurse on left partition
+
+**Distributed quickselect:**
+1. Sample pivot from all workers (one sample per worker)
+2. Coordinator picks median-of-samples as global pivot
+3. Each worker partitions locally, sends partition sizes to coordinator
+4. Coordinator determines which partition contains K-th element
+5. Iterate with reduced dataset until single element found
+
+**Communication cost:** O(N) per iteration (just partition sizes). Typically 2-3 iterations converge.

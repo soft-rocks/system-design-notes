@@ -1,0 +1,94 @@
+---
+title: Core Entities
+description: App, Signal, RankingScore, Category, and RankingEntry.
+---
+
+## App
+
+A listed application in the store.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `app_id` | string | Unique app identifier |
+| `package_name` | string | Bundle ID (com.example.app) |
+| `name` | string | App name |
+| `developer` | string | Developer / publisher name |
+| `categories[]` | string[] | One or more category assignments |
+| `platform` | iOS/Android/Web | App platform |
+| `release_date` | date | Initial release date |
+| `last_update` | date | Last version update |
+| `price` | float | App price ($0 for free) |
+| `region` | string | Default region (fallback) |
+
+## Signal
+
+A raw metric event contributing to ranking score.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `signal_id` | string | Unique event identifier |
+| `app_id` | string | Target app |
+| `signal_type` | enum | download, rating, review, crash, retention, revenue, install |
+| `value` | float | Numeric signal value |
+| `timestamp` | UTC | Event occurrence time |
+| `region` | string | User region |
+| `metadata` | object | Signal-specific context (rating stars, crash stack trace, etc.) |
+
+**Signal types and weights:**
+
+| Signal | Source | Raw Range |
+|--------|--------|-----------|
+| Downloads | App store logs | 0 – ∞ (daily count) |
+| Ratings | User reviews | 1.0 – 5.0 |
+| Review sentiment | NLP analysis | -1.0 – 1.0 |
+| Crash-free rate | Crash reports | 0.0 – 1.0 |
+| Retention (D1/D7/D30) | User activity | 0.0 – 1.0 |
+| Revenue | Payment processor | 0.0 – ∞ |
+
+## RankingScore
+
+The computed composite score for an app in a specific category-region-time window.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `app_id` | string | Target app |
+| `category` | string | Category scope |
+| `region` | string | Region scope |
+| `window` | timestamp | Time window for signals (15-min) |
+| `total_score` | float | Composite score (0–100) |
+| `component_scores` | object | Per-signal contributions (downloads, ratings, etc.) |
+| `rank` | int | Position in sorted list (1-based) |
+| `decay_weight` | float | Cumulative decay factor for the window |
+
+**Score formula:** `total_score = Σ (signal_type_weight × normalized_signal_value × time_decay)`
+
+## Category
+
+App store category.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `category_id` | string | Unique category identifier |
+| `name` | string | Category name |
+| `parent_category` | string | Parent (for sub-categories) |
+| `app_count` | int | Number of apps in category |
+| `is_active` | boolean | Whether category is visible |
+
+**Hierarchy:** Top-level (Games, Productivity, Health) → sub-categories (Action, Puzzle / Finance, Education).
+
+## RankingEntry
+
+A single entry in a Top-K ranking list.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `app_id` | string | App identifier |
+| `app_name` | string | App name (denormalized) |
+| `rank` | int | Position in list (1-based) |
+| `score` | float | Composite score |
+| `score_delta` | float | Score change since last update (trend indicator) |
+| `previous_rank` | int | Previous position (for rank change display) |
+| `category` | string | Category scope |
+| `region` | string | Region scope |
+| `updated_at` | UTC | Last ranking computation time |
+| `diversity_filtered` | boolean | Whether this entry was excluded by diversity rules |

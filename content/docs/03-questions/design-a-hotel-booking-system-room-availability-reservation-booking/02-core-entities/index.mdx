@@ -1,0 +1,284 @@
+---
+title: Core Entities
+description: Core entities for hotel booking system
+---
+
+## Hotel & Property
+
+### Hotel
+Top-level business entity in the chain.
+- `hotel_id`: UUID, PK
+- `name`: string
+- `brand`: `enum {OWNED, FRANCHISE, AFFILIATE}`
+- `chain_id`: FK → Chain
+- `country_code`, `city_code`: strings
+- `address`: string
+- `coordinates`: lat/lng
+- `star_rating`: int (1-5)
+- `status`: `enum {ACTIVE, SUSPENDED}`
+
+### Property
+A physical location within a hotel chain (e.g., "Marriott Downtown").
+- `property_id`: UUID, PK
+- `hotel_id`: FK → Hotel
+- `name`: string
+- `code`: string (e.g., "MNY001")
+- `check_in_time`, `check_out_time`: time
+- `total_rooms`: int
+- `status`: `enum {OPERATIONAL, MAINTENANCE, CLOSED}`
+
+### Chain
+Collection of hotels under one brand (e.g., "Marriott International").
+- `chain_id`: UUID, PK
+- `name`: string
+- `brand_tier`: `enum {BUDGET, MID_SCALE, PREMIUM, LUXURY}`
+
+## Room Type
+
+### RoomType
+A category of rooms within a property. All rooms in a type are interchangeable for booking purposes.
+- `room_type_id`: UUID, PK
+- `property_id`: FK → Property
+- `name`: string (e.g., "Deluxe King")
+- `code`: string
+- `bed_type`: `enum {KING, QUEEN, TWIN, DOUBLE}`
+- `occupancy_max`: int
+- `occupancy_adults`: int
+- `occupancy_children`: int
+- `size_sqm`: float
+- `amenities`: JSON array
+- `view_type`: string (ocean/city/pool)
+- `accessibility_features`: JSON array
+- `status`: `enum {ACTIVE, INACTIVE}`
+
+### RoomTypeGroup
+A group of interchangeable room types for upgrade/downgrade purposes.
+- `group_id`: UUID, PK
+- `name`: string
+- `room_type_ids`: UUID[]
+- `default_room_type_id`: FK → RoomType
+
+## Room Instance
+
+### Room
+An individual bookable unit within a property.
+- `room_id`: UUID, PK
+- `property_id`: FK → Property
+- `room_type_id`: FK → RoomType
+- `room_number`: string (e.g., "507")
+- `floor`: int
+- `physical_state`: `enum {AVAILABLE, CLEAN, DIRTY, UNDER_MAINTENANCE, OUT_OF_ORDER, INSPECTED}`
+- `is_accessible`: boolean
+
+**Physical state machine**: AVAILABLE → INSPECTED → CLEAN → DIRTY (on checkout) → CLEAN (after housekeeping) → AVAILABLE. UNDER_MAINTENANCE and OUT_OF_ORDER are blocking states that remove the room from availability.
+
+## Reservation
+
+### Reservation
+A booking confirmed for a guest.
+- `reservation_id`: UUID, PK
+- `hotel_id`: FK → Hotel
+- `property_id`: FK → Property
+- `status`: `enum {PENDING, CONFIRMED, CANCELLED, CHECKED_IN, CHECKED_OUT, COMPLETED, NO_SHOW}`
+- `check_in_date`, `check_out_date`: date
+- `guest_id`: FK → Guest
+- `room_type_id`: FK → RoomType
+- `room_ids`: UUID[] (exact room assignment, nullable for room-type-level bookings)
+- `rate_plan_id`: FK → RatePlan
+- `total_price`: decimal
+- `currency`: string
+- `payment_status`: `enum {UNPAID, AUTHORIZED, CAPTURED, REFUNDED, PARTIALLY_REFUNDED}`
+- `special_requests`: text
+- `loyalty_points_earned`, `loyalty_points_redeemed`: int
+
+### ReservationItem
+A single room in a multi-room reservation.
+- `item_id`: UUID, PK
+- `reservation_id`: FK → Reservation
+- `room_id`: FK → Room (nullable for room-type-level bookings)
+- `nightly_rate`: decimal
+- `taxes`: JSON
+- `fees`: JSON
+- `addons`: JSON
+
+### ReservationStatus Transitions
+```
+PENDING → CONFIRMED (payment authorized)
+CONFIRMED → CHECKED_IN
+CHECKED_IN → CHECKED_OUT
+CHECKED_OUT → COMPLETED
+
+From any pre-check-in state: → CANCELLED
+On check-in_date passage without check-in: → NO_SHOW
+NO_SHOW → REBOOKED (with loyalty bonus)
+```
+
+## Rate Plan & Pricing
+
+### RatePlan
+A pricing strategy for a room type.
+- `rate_plan_id`: UUID, PK
+- `hotel_id`: FK → Hotel
+- `name`: string (e.g., "Member Discount")
+- `code`: string
+- `pricing_model`: `enum {FIXED, DYNAMIC}`
+- `base_price`: decimal
+- `currency`: string
+- `cancellation_policy_id`: FK → CancellationPolicy
+- `min_advance_purchase_days`, `max_advance_purchase_days`: int
+- `is_prepay`: boolean
+- `min_stay_nights`, `max_stay_nights`: int
+
+### DailyRate
+The price for a specific room type on a specific date.
+- `daily_rate_id`: UUID, PK
+- `rate_plan_id`: FK → RatePlan
+- `room_type_id`: FK → RoomType
+- `date`: date (**partition key**)
+- `price`: decimal
+- `dynamic_adjustment`: float (multiplier or delta)
+- `demand_score`: float (0–1)
+
+### PriceBreakdown
+Per-booking calculation.
+- `breakdown_id`: UUID, PK
+- `reservation_id`: FK → Reservation
+- `nightly_rate`, `num_nights`: decimal, int
+- `subtotal`, `total`: decimal
+- `taxes`, `fees`, `addons`: JSON
+
+### Addon
+Optional extras (breakfast, parking, spa, transfer).
+
+## Availability Window
+
+### Availability
+The count of available rooms for a room type on a given date.
+- `availability_id`: UUID, PK
+- `room_type_id`: FK → RoomType
+- `date`: date
+- `total_rooms`, `booked_rooms`, `blocked_rooms`, `overbooked_rooms`: int
+- `available_rooms`: int (**computed**: total − booked − blocked + overbook_buffer)
+
+### Blockhold
+A temporary reservation hold during checkout flow.
+- `blockhold_id`: UUID, PK
+- `room_type_id`: FK → RoomType
+- `user_id`: FK → Guest
+- `expires_at`: timestamp
+- `status`: `enum {ACTIVE, EXPIRED, CONVERTED, CANCELLED}`
+
+### RoomBlock
+A period of blocked rooms (maintenance, VIP hold, group).
+- `block_id`: UUID, PK
+- `room_type_id`: FK → RoomType
+- `date`: date
+- `num_blocked`: int
+- `reason`: `enum {MAINTENANCE, VIP_HOLD, GROUP_BLOCK, OUT_OF_ORDER}`
+
+### GroupBlock
+A block of rooms for an event.
+- `group_block_id`: UUID, PK
+- `hotel_id`: FK → Hotel
+- `event_name`: string
+- `num_rooms`: int
+- `release_deadline`: timestamp
+- `status`: `enum {ACTIVE, EXPIRED, COMPLETED}`
+
+## Guest Profile
+
+### Guest
+A registered user.
+- `guest_id`: UUID, PK
+- `first_name`, `last_name`: string
+- `email`: string (unique)
+- `phone`: string
+- `status`: `enum {ACTIVE, SUSPENDED}`
+- `preferred_currency`, `preferred_language`: string
+
+### GuestProfile
+Extended preferences and loyalty data.
+- `profile_id`: UUID, PK
+- `guest_id`: FK → Guest
+- `loyalty_tier`: `enum {BRONZE, SILVER, GOLD, PLATINUM}`
+- `loyalty_points`: int
+- `preferences`: JSON `{room_floor, bed_type, view, accessibility, pillow_type}`
+- `tags`: JSON array `{VIP, FAMILY, BUSINESS}`
+
+### CorporateAccount
+B2B billing entity.
+- `account_id`: UUID, PK
+- `company_name`: string
+- `billing_address`: string
+- `payment_terms`: `enum {NET_30, NET_60}`
+- `negotiated_rate_plan_id`: FK → RatePlan
+
+## Cancellation Policy
+
+### CancellationPolicy
+Rules for cancelling a reservation.
+- `policy_id`: UUID, PK
+- `name`: string (e.g., "Flexible")
+- `code`: string (e.g., "FLEX")
+- `cancellation_deadline_hours`: int (hours before check-in)
+- `cancellation_fee_percentage`: float
+- `no_show_fee_percentage`: float
+- `modification_allowed`: boolean
+- `refundable`: boolean
+
+**Standard policies**: free_cancellation (18-24h), moderate (48h), strict (7d, 50% refund), non_refundable.
+
+## Payment & Transaction
+
+### PaymentMethod
+A guest's stored payment method.
+- `pm_id`: UUID, PK
+- `guest_id`: FK → Guest
+- `type`: `enum {CREDIT_CARD, DEBIT_CARD, BANK_TRANSFER, E_WALLET}`
+- `token_id`: string (encrypted card token from processor)
+- `last_four`: string
+- `status`: `enum {ACTIVE, REVOKED}`
+
+### PaymentTransaction
+A payment event tied to a reservation.
+- `txn_id`: UUID, PK
+- `reservation_id`: FK → Reservation
+- `type`: `enum {AUTHORIZATION, CAPTURE, REFUND, PARTIAL_REFUND}`
+- `amount`: decimal
+- `status`: `enum {PENDING, COMPLETED, FAILED}`
+
+### RateHold
+Temporary rate lock during checkout.
+- `rate_hold_id`: UUID, PK
+- `user_id`: FK → Guest
+- `room_type_id`: FK → RoomType
+- `locked_price`: decimal
+- `expires_at`: timestamp
+- `status`: `enum {ACTIVE, EXPIRED, CONSUMED, FAILED}`
+
+## Notification & Channel
+
+### Notification
+An outbound message.
+- `notification_id`: UUID, PK
+- `reservation_id`: FK → Reservation
+- `channel`: `enum {EMAIL, SMS, PUSH, WEBHOOK}`
+- `type`: `enum {CONFIRMATION, MODIFICATION, CANCELLATION, REMINDER, WALK, CHECKOUT}`
+- `status`: `enum {SENT, FAILED, DELIVERED}`
+
+### ChannelPartner
+An external booking channel.
+- `partner_id`: UUID, PK
+- `name`: string (e.g., "Expedia")
+- `type`: `enum {OTA, DIRECT, GDS, AFFILIATE}`
+- `rate_parity_enforced`: boolean
+
+### InventorySyncEvent
+A sync message between systems.
+- `sync_event_id`: UUID, PK
+- `channel_partner_id`: FK → ChannelPartner
+- `property_id`: FK → Property
+- `room_type_id`: FK → RoomType
+- `operation`: `enum {BOOK, RELEASE, PRICE_CHANGE}`
+- `date`: date
+- `status`: `enum {PROCESSED, FAILED, PENDING_RETRY}`

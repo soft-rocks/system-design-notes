@@ -1,0 +1,75 @@
+---
+title: Key Distribution & Partitioning
+description: Key skew problem, sampling strategy, adaptive partitioning, and load balancing.
+---
+
+## Key Skew Problem
+
+Key skew occurs when the distribution of sort key values is highly non-uniform. This causes:
+- **Uneven partition sizes:** One partition may contain 50% of all data
+- **Straggler nodes:** Workers handling the hot partition finish 5× later than others
+- **Wasted resources:** 90% of cluster idle while waiting for 1 node to finish
+
+**Example:** Sorting user IDs where 80% of records belong to 5% of the key space (popular users).
+
+**Impact on shuffle:** The partition with the most spill files needs the most data transferred, making shuffle the slowest phase.
+
+## Sampling Strategy
+
+To determine partition boundaries accurately, sample representative keys from spill files:
+
+| Method | Sample Rate | Accuracy | Overhead |
+|--------|------------|----------|----------|
+| **Uniform sampling** | 10K keys per spill file | Good for uniform distributions | O(N) scan |
+| **Reservoir sampling** | 10K keys per spill file | Good for streaming, no prior size knowledge | O(N) scan |
+| **Stratified sampling** | 5K from each decile | Best for known multi-modal distributions | O(N) scan |
+| **Sketch-based (t-Digest)** | ~1K centroids per spill file | Excellent for percentile estimation | O(N) scan + small memory |
+
+**t-Digest sketch:**
+- Compresses sorted keys into ~1K centroids with accuracy weighting
+- More accurate at extremes (tails) where partition boundaries live
+- Mergeable: combine sketches from all workers into one global sketch
+- Boundary selection: extract quantiles from merged sketch → partition boundaries
+
+**Sampling pipeline:**
+
+```
+All spill files → Sample 10K keys from each → Global key histogram → Merge sketches →
+Extract N/P, 2N/P, 3N/P quantiles → Partition boundaries
+```
+
+## Adaptive Partitioning
+
+When sampling reveals skew, dynamically adjust partition count:
+
+1. **Detect skew:** If any decile contains > 2× average records
+2. **Split hot partitions:** Subdivide the hot partition boundary into multiple boundaries
+3. **Merge cold partitions:** Combine adjacent cold partitions to reduce partition count
+4. **Reassign spills:** Re-route spill files based on new boundaries
+
+**Adaptive rules:**
+
+| Key density | Action |
+|------------|--------|
+| < 0.5× average | Merge with adjacent partition |
+| 0.5× – 1.5× average | Keep as-is |
+| 1.5× – 3× average | Split into 2 sub-partitions |
+| > 3× average | Split into 3 sub-partitions + redistribute boundary spills |
+
+**Cost of re-partitioning:** Reassigning spill files requires updating shuffle assignments. If shuffle already started, in-flight transfers continue to original targets; re-routed spills are pulled as separate transfers.
+
+## Load Balancing
+
+**During shuffle:** Monitor per-partition data transferred rate. If any partition lags > 2× median:
+
+1. **Dynamic spill redistribution:** Identify spill files in the hot partition that can be moved to a neighboring partition (spill files near partition boundary can go either way)
+2. **Worker migration:** Move workers handling cold partitions to help with hot partition merge
+3. **Partial output:** If a partition is stuck, split its spill files and merge locally on source workers instead of shuffling
+
+**Straggler detection:** Coordinator monitors worker completion timestamps. If any worker has been running > 2× average:
+
+- Trigger adaptive rebalancing (move boundary spills)
+- Spawn duplicate merge on a cold worker (duplicate-fetch strategy)
+- If still stuck after 60s: mark partition as failed, re-merge from spill files
+
+**Duplicate-fetch:** If a source worker serving shuffle data is slow, a secondary worker fetches the same spill file and serves it in parallel. The first copy to arrive is used.

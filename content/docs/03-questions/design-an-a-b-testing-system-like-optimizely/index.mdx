@@ -1,0 +1,27 @@
+---
+title: "A/B Testing System - Like Optimizely"
+description: "A complete system design for running experiments at scale: traffic allocation, deterministic assignment, real-time variant serving, statistical analysis, and experiment layering."
+---
+
+## Table of Contents
+
+| Section | Description |
+|---|---|
+| [Requirements](./01-requirements/) | Functional requirements, non-functional requirements, and scale assumptions |
+| [Core Entities](./02-core-entities/) | Domain model: Experiment, Variant, Audience, Event, Metric, Layer |
+| [API / System Interface](./03-api-system-interface/) | REST APIs, client SDK interface, webhooks, GraphQL |
+| [Data Flow](./04-data-flow/) | Write path (assignment), read path (metric aggregation), sync flow |
+| [High Level Design](./05-high-level-design/) | Architecture overview, component diagram, technology choices |
+| [Deep Dives](./06-deep-dives/) | Hash-based assignment, statistical analysis, experiment layering, real-time event processing |
+
+## Overview
+
+An A/B testing system for running experiments at scale: deterministic traffic allocation, consistent user-to-variant assignment, real-time feature variation, statistical analysis with multiple comparison correction, and experiment layering to run concurrent non-interfering experiments.
+
+**Key design decisions:**
+- **Deterministic hash-based assignment**: `hash(user_id, experiment_id) % bucket_size` ensures the same user always gets the same variant across all services and devices.
+- **Real-time variant serving**: Distributed caches close to the client for &lt;10ms p99 assignment decisions.
+- **Layer architecture**: Experiments are organized into layers to prevent interference between concurrent experiments.
+- **Sequential testing with alpha-spending**: Proper statistical correction for continuous monitoring without inflating false positive rate.
+
+**Scale:** 10B+ events/day, 50K+ experiments running concurrently, 100M+ users tested daily.

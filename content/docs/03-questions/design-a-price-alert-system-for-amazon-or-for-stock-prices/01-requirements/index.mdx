@@ -1,0 +1,166 @@
+---
+title: Requirements
+description: Functional and non-functional requirements for the price alert system.
+---
+
+## Functional Requirements
+
+### 1. Alert Creation & Management
+
+Users can create, update, and delete price alerts. Each alert specifies:
+- **Target**: Product (Amazon SKU or stock ticker)
+- **Condition**: Price below/above a threshold, or percentage change
+- **Direction**: `BELOW`, `ABOVE`, `PERCENT_DROP`, `PERCENT_GAIN`
+- **Notification Preferences**: Email, push notification, SMS
+- **Cooldown**: Minimum time between consecutive notifications for the same alert
+
+```
+PUT /alerts
+{
+  "target_type": "PRODUCT" | "STOCK",
+  "target_id": "ASIN:B08F3HTG7J" | "AAPL",
+  "condition": "ABOVE",
+  "threshold_value": 185.00,
+  "notification_channels": ["EMAIL", "PUSH"],
+  "cooldown_minutes": 60
+}
+```
+
+Operations: `create`, `list`, `get`, `update`, `pause`, `resume`, `delete`.
+Alert state machine: `ACTIVE` ↔ `PAUSED` → `DELETED`. `PAUSED` alerts must never trigger (strong consistency required).
+
+### 2. Price Ingestion
+
+The system ingests price data from multiple external sources:
+- **Amazon Product Advertising API**: Product price, availability, seller variants, condition (new/used)
+- **Stock Market APIs**: Alpha Vantage, IEX Cloud, Polygon.io — real-time and historical prices
+- **Direct Scraping** (fallback): For sources without official APIs, web scrapers poll product pages
+
+Each price update event is normalized into a canonical format:
+
+```
+{
+  "event_id": "uuid",
+  "source_type": "AMAZON" | "STOCK_API" | "SCRAPE",
+  "target_type": "PRODUCT" | "STOCK",
+  "target_id": "ASIN:B08F3HTG7J" | "AAPL",
+  "price": 182.50,
+  "currency": "USD",
+  "timestamp": "2026-05-04T10:30:00Z",
+  "metadata": { "condition": "new", "seller": "Amazon.com" }
+}
+```
+
+Polling is shared across alerts for the same target — if 500K alerts monitor AAPL, we poll once and evaluate all 500K alerts against the single price update.
+
+### 3. Threshold Evaluation
+
+For each incoming price update, the system evaluates all active alerts for that target. Evaluation supports:
+- **Absolute thresholds**: "Notify when AAPL goes above $185"
+- **Percentage-based**: "Notify when price drops 15% from current price"
+- **Multi-condition**: Combination of conditions within a single alert
+
+Percentage alerts are evaluated against the current reference price (the price at the time the alert was created, or the last trigger price for recurring alerts).
+
+### 4. Notification Dispatch
+
+When a threshold is crossed, the notification service:
+1. Formats the notification with context (product name, current price, percentage change, deep link)
+2. Routes to the user's preferred channels (email, push, SMS)
+3. Tracks delivery status (sent, delivered, failed)
+4. Applies cooldown to prevent duplicate notifications for the same alert within the configured window
+5. Retries failed deliveries with exponential backoff (1s, 5s, 25s, 125s, 625s)
+
+### 5. Price History & Backtesting
+
+The system stores historical price data:
+- **Stocks**: 2-year retention, ~50 data points/day per stock during market hours
+- **Products**: 6-month retention, ~4-8 data points/day per product (updated on each poll)
+
+Price history serves two purposes:
+1. **Trend visualization**: Line charts in the UI showing price over time with alert thresholds marked
+2. **Backtesting**: For stock alerts, users can view "what if" analysis — what the alert would have triggered historically
+
+### 6. Alert Deduplication & Cooldown
+
+To prevent notification spam, each alert has a cooldown period (default 60 minutes). After an alert triggers, no further notifications are sent for that alert until the cooldown expires. The cooldown is based on the alert's direction:
+- `ABOVE` alerts fire once when crossing above, then reset when price drops below and crosses again
+- `BELOW` alerts fire once when crossing below, then reset when price rises above and crosses again
+
+### 7. Multi-Variant Support (Amazon)
+
+Amazon product alerts support SKU-level granularity:
+- Multiple sellers for the same ASIN may have different prices
+- Condition variants (new vs used) may have separate prices
+- Alerts can be scoped to specific seller/condition combinations or set to "best price across all variants"
+
+### 8. Subscription Tiering
+
+| Feature | Free | Premium ($4.99/mo) |
+|---------|------|-------------------|
+| Max active alerts | 25 | 500 |
+| Evaluation frequency | 60 min | 15 min |
+| Notification channels | Email + Push | + SMS |
+| Price history retention | 3 months | 2 years |
+| Backtesting | N/A | ✓ |
+| Early access to new sources | ✗ | ✓ |
+
+### 9. Retry & Delivery Confirmation
+
+All notifications are durable — if the notification service is temporarily unable to deliver, the message is persisted and retried. Delivery confirmation is logged for each notification, allowing users to see "last delivered" timestamps in their alert dashboard.
+
+## Non-Functional Requirements
+
+### 1. Alert Latency
+- **Evaluation latency**: From price update ingestion to alert evaluation and notification dispatch: p99 < 30 seconds
+- **Notification delivery**: p99 email delivery within 10 seconds of trigger; p99 push within 5 seconds
+- **Alert latency is the critical SLO** — users set alerts specifically for price movements, and delays reduce the value of the feature
+
+### 2. Threshold Accuracy
+- **No missed triggers**: If a price crosses a threshold, the alert MUST fire. This is the most critical correctness property.
+- Missed triggers are a customer-facing failure (users will contact support if their alert didn't fire).
+- Solution: At-least-once evaluation with idempotent alert firing, plus periodic reconciliation jobs to detect and backfill missed evaluations.
+
+### 3. Notification Delivery
+- 99.9% notification delivery success rate within 10 minutes
+- Failed SMS/Email notifications are retried with exponential backoff
+- User dashboard shows delivery status for each alert trigger event
+
+### 4. Data Retention
+- Stock price history: 2 years (compliance with financial data best practices)
+- Product price history: 6 months (consumer products change faster, less long-term value)
+- Automatic TTL-based deletion via database/partition lifecycle policies
+
+### 5. Throughput
+- Support **10M+ active alerts** evaluated every 60 seconds
+- Ingest **10M+ price updates** per hour across all sources
+- Dispatch **~30K notifications/day** from triggers + ~100K retry/delivery events
+- Price history writes: ~2M price records/day (stocks + products)
+
+### 6. Availability
+- Alert evaluation service: **99.9% uptime** (alert failures are immediately visible to users)
+- Notification service: 99.5% (notifications are durable, can buffer briefly)
+- Price ingestion: 99.0% (external API dependencies, graceful degradation)
+
+### 7. Consistency
+- **Alert state must be strongly consistent**: A `PAUSED` alert must never fire. A `DELETED` alert must never trigger.
+- **Price data is eventually consistent**: A price update may take up to 30 seconds to propagate to all evaluation instances.
+- **Notification delivery is at-least-once**: A trigger may result in 2 notifications in rare edge cases (handled by deduplication).
+
+### 8. Cost Efficiency
+- External API polling is rate-limited and metered — share a single poll across all alerts monitoring the same target
+- Price updates are fanned out internally after the single shared poll
+- For Amazon: use the Product Advertising API cache where available to reduce API calls
+
+## Scale Assumptions
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Active alerts | 10M (growth from 1M) | 5M users x 2 avg alerts/user |
+| Monitored products/stocks | ~500K unique | ~200K products + ~300K stocks |
+| Price update volume | ~500K polls/cycle (stock) + ~150K (products) | Stocks: every 2-10 min; Products: every 15-60 min |
+| Alert trigger rate | ~0.1% per cycle | Industry benchmark for price alerts |
+| Notifications/day | ~30K trigger + ~100K retry | Low absolute volume vs alert count |
+| Storage | ~500GB | 500K targets x ~50 pts/day x retention period |
+| Read/write ratio | 80/20 (market hours) | Price history reads dominate; evaluation writes dominate market hours |
+| Peak evaluation window | Market open hours (9:30-16:00 ET) | Stocks evaluated 2-5x more frequently |

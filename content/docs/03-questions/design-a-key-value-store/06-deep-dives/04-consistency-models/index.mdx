@@ -1,0 +1,108 @@
+---
+title: Consistency Models - Strong vs Eventual
+description: Tradeoffs between linearizable and eventual consistency in a distributed key-value store
+---
+
+## The Consistency Spectrum
+
+Distributed systems offer a range of consistency guarantees. The choice depends on application requirements and the latency-performance tradeoff the system is willing to make.
+
+```
+Strongest                                           Weakest
+    |                                                   |
+    v                                                   v
+Linearizable    Read-your-writes    Monotonic reads    Eventual
+(all clients    (client sees its    (reads never       (replicas
+ see latest     own writes first)   regress in time)   converge eventually)
+ write)
+```
+
+## Strong (Linearizable) Reads
+
+A linearizable read returns the most recent committed write. This requires the leader to be involved in every read:
+
+```
+Client -> Get(key) \{consistency: 'linearizable'\}
+         |
+         v
+    Leader checks: has any new write committed since my last response to this client?
+         |
+         |-- No: return the value from memtable/SSTable
+         |
+         |-- Yes: read the latest value after the commit point
+         |
+         v
+    Return value to client
+```
+
+**Cost**: A linearizable read requires a round-trip to the leader. If the leader is in a different data center, this adds cross-DC latency (10-100ms). Without the flag, reads can be served by any replica locally (~1ms).
+
+**When to use linearizable reads:**
+
+- Financial balance checks (must see the latest deposit)
+- Session authentication (must see the latest login state)
+- Inventory updates (must not oversell)
+
+## Eventual Reads
+
+An eventual read can be served by any replica, not just the leader. This dramatically reduces latency but may return stale data:
+
+```
+Client -> Get(key) \{consistency: 'eventual'\}
+         |
+         v
+    Route to nearest replica (could be follower)
+         |
+         v
+    Return whatever that replica has (may be 100ms behind leader)
+```
+
+**Why not make eventual the default?**
+
+Most applications tolerate eventual consistency and benefit from lower latency. However, making it the default risks surprising users with stale data. The explicit flag pattern forces developers to make a conscious choice about consistency requirements.
+
+## Read-Your-Writes Consistency
+
+The simplest consistency guarantee: a client always sees its own writes. This is achieved with a per-client vector clock:
+
+```
+Client writes key="name", value="Alice" at time T1
+  -> Sets client vector clock: \{client_id: 5\}
+  -> Stores \{key: "name", value: "Alice", vector_clock: 5\}
+
+Client reads key="name" at time T2
+  -> Includes its last known vector clock: \{client_id: 5\}
+  -> Server returns the latest value with vector_clock &gt;= 5
+  -> If the replica hasn't seen vector_clock 5 yet, it fetches from leader
+```
+
+**Why this is always worth implementing:**
+
+Read-your-writes is a basic expectation — users are surprised when they write a value and immediately read a different one. The cost is minimal: one extra integer (vector clock) per client session, and a fallback fetch to the leader on mismatch.
+
+## Quorum Reads
+
+A middle ground between linearizable and eventual reads uses read quorums:
+
+```
+N = 3 (replication factor)
+R + W > N (quorum intersection ensures at least one overlapping node)
+
+Read quorums:
+  R=1: Fast (any replica), weak consistency
+  R=2: Moderate (majority), catches up-to-date reads
+  R=3: Slow (all replicas), linearizable
+
+Recommended: R=2 for most reads, R=3 for critical reads
+```
+
+**Why R=2 provides "mostly" linearizable reads:**
+
+If the last write reached 2 nodes (quorum), and the read also touches 2 nodes, at least one node in common is guaranteed to have the latest write. The read cannot be stale beyond the last write's commit point. However, it's not strictly linearizable because a write that failed to reach a quorum would not be seen by an R=2 read — the system does not guarantee seeing the absolute latest write, only the latest committed write.
+
+verification
+[] ## The Consistency Spectrum
+[] ## Strong (Linearizable) Reads
+[] ## Eventual Reads
+[] ## Read-Your-Writes Consistency
+[] ## Quorum Reads

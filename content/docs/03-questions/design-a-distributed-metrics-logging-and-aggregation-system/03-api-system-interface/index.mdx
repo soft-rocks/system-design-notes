@@ -1,0 +1,105 @@
+---
+title: API / System Interface
+description: Ingestion, query, admin, and replication interfaces for distributed metrics system
+---
+
+## Ingestion Interface (UDP / TCP)
+
+Metrics agents send data to ingestion nodes over a lightweight binary protocol (similar to StatsD or OpenTelemetry OTLP).
+
+### UDP Push (fire-and-forget, low overhead)
+```
+POST /ingest  (binary payload, UDP)
+```
+Payload format (OpenTelemetry Metrics Protocol):
+```
+┌──────────────┬──────────┬───────────┬───────────────┬────────┬──────────┐
+│ metricID     │ type     │ value     │ labels (K,V)  │ ts_ms  │ ingestID │
+│ (32 bytes)   │ (1 byte) │ (8 bytes) │ (variable)    │ (8 B)  │ (32 B)   │
+└──────────────┴──────────┴───────────┴───────────────┴────────┴──────────┘
+```
+
+### gRPC Batch (reliable, ordered)
+```protobuf
+rpc Ingest(MetricBatch) returns (IngestResponse);
+
+message MetricBatch {
+  repeated MetricPoint points = 1;
+  string    source_host     = 2;
+}
+
+message MetricPoint {
+  string   metric_id    = 1;
+  double   value        = 2;
+  int64    timestamp_ms = 3;
+  map&lt;string, string&gt; labels = 4;
+  string   metric_type  = 5;
+}
+
+message IngestResponse {
+  repeated string accepted_ids = 1;
+  repeated string rejected_ids = 2;
+}
+```
+
+## Query Interface (gRPC)
+
+```protobuf
+rpc Query(MetricQuery) returns (stream MetricResult);
+rpc AggregateQuery(MetricAggregateQuery) returns (MetricAggregateResult);
+
+message MetricQuery {
+  string   metric_id    = 1;
+  map&lt;string, string&gt; label_filter = 2;
+  int64    start_ms     = 3;
+  int64    end_ms       = 4;
+  int64    granularity_ms = 5;  // 60000 for 1min, 300000 for 5min
+  string   aggregation   = 6;    // AVG / SUM / MIN / MAX / RATE
+}
+
+message MetricResult {
+  int64    timestamp_ms = 1;
+  double   value        = 2;
+  map&lt;string, string&gt; labels = 3;
+}
+
+message MetricAggregateResult {
+  repeated AggregatedBucket buckets = 1;
+}
+
+message AggregatedBucket {
+  int64    window_start_ms = 1;
+  double   value           = 2;
+}
+```
+
+## Admin Interface (REST)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/v1/rules | List alert rules |
+| POST | /api/v1/rules | Create alert rule |
+| PUT | /api/v1/rules/\{ruleID\} | Update alert rule |
+| DELETE | /api/v1/rules/\{ruleID\} | Delete alert rule |
+| GET | /api/v1/metrics | List discovered metrics |
+| GET | /api/v1/metrics/\{metricID\} | Metric metadata |
+| DELETE | /api/v1/metrics/\{metricID\} | Deprecate a metric |
+| POST | /api/v1/query | Run a PromQL-style ad-hoc query |
+| GET | /api/v1/health | Cluster health and ingestion rate |
+
+## Internal Replication Interface
+
+Between primary and replica regions:
+```protobuf
+rpc Replicate(RowBatch) returns (ReplicationAck);
+
+message RowBatch {
+  oneof entry {
+    MetricSample sample     = 1;
+    MetricRollup rollup     = 2;
+    MetricDefinition definition = 3;
+  }
+  string  source_region   = 4;
+  int64   watermark_ms    = 5;  // deduplication window
+}
+```

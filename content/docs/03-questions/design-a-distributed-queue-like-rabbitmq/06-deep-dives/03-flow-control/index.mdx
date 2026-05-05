@@ -1,0 +1,68 @@
+---
+title: Flow Control
+description: Memory/disk thresholds, publisher throttling, consumer back-pressure, and queue-level limits.
+---
+
+## Memory-Based Flow Control
+
+`memory_high_watermark` (default: 0.4 × total RAM, configurable 0.2-0.8).
+
+**Memory accounting:**
+
+| Component | Size |
+|-----------|------|
+| Message headers | ~200 bytes per message |
+| Message body | Exact payload (in-memory snapshot) |
+| Index overhead | ~100 bytes per message |
+| Channel/connection state | ~1KB per channel |
+
+**GC triggers:** memory > watermark → background GC drops unreferenced index entries.
+
+**Blocked state:** if memory still > watermark after GC → all publishers blocked via TCP flow control.
+
+## Disk-Based Flow Control
+
+`disk_free_limit` (default: 50MB, configurable to absolute bytes or relative to RAM).
+
+Disk usage: message store file + WAL + Mnesia DB (metadata).
+
+When disk free < limit: enter `blocked` state (same as memory).
+
+Rationale: persistent messages require disk space; if disk fills, broker crashes → message loss.
+
+Exception: transient messages may be kept on disk when persistent messages are blocked.
+
+## Publisher Throttling
+
+- When blocked: all publishers receive TCP back-pressure
+  - TCP send buffer fills → OS pauses application sends
+  - Publisher sees write() block (100ms-1s depending on buffer)
+- When unblocked: `basic.flow(resume)` sent to all connections
+  - Order: lowest memory/disk usage first (avoid thundering herd)
+
+## Consumer Back-Pressure
+
+`basic.qos(prefetch_count)`: limits unacked messages per consumer.
+
+| Prefetch | Use Case |
+|----------|----------|
+| 0 (default, auto-ack) | Highest throughput, no reliability |
+| 100-1000 | High-throughput with ack |
+| 1 | Strict ordering, low concurrency |
+
+When at limit: broker stops delivering to that consumer.
+
+Multi-consumer queue: messages distributed round-robin across consumers respecting prefetch.
+
+## Queue-Level Back-Pressure
+
+- `x-max-length`: max message count → drop oldest ready message (FIFO)
+- `x-max-length-bytes`: max queue size in bytes → same behavior, size-based
+- Overflow behavior: `overflow: drop-head` (default) or `reject-publish` (406 NOT_ALLOWED)
+- Messages exceeding limits → DLQ if `x-dead-letter-exchange` configured
+
+## TCP Flow Control
+
+- RabbitMQ leverages OS-level TCP flow control for publisher back-pressure
+- No application-level pacing needed; TCP window handles rate limiting naturally
+- Heartbeat: 60s default; prevents dead connection accumulation

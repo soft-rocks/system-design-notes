@@ -1,0 +1,34 @@
+---
+title: Core Entities
+description: Domain entities, attributes, constraints, and relationships for the Pastebin service.
+---
+
+### Paste
+
+**Attributes**:
+
+- `paste_key` (string, 3–16 chars, unique): Access identifier. Server-generated or user-requested.
+- `title` (string, max 256 chars, nullable): Optional title.
+- `language` (string, nullable): Programming language for syntax highlighting.
+- `content_hash` (string, 64 chars, unique): SHA-256 hash of content — deduplication key and blob store address.
+- `content_size` (int): Size in bytes.
+- `created_at` (timestamp): Creation time (UTC).
+- `expires_at` (timestamp, nullable): Expiration time. `NULL` means never expire.
+- `access_mode` (enum: public, unlisted, private): Visibility. `private` also signals CDN bypass.
+- `status` (enum: active, deleted): Lifecycle state. There is no `expired` status — expiration is a derived condition checked via `expires_at < NOW()` at read time. A paste is either `active` (exists and not soft-deleted) or `deleted` (soft-deleted, recoverable for up to 24 hours).
+- `soft_deleted_at` (timestamp, nullable): Timestamp of soft-delete. If non-null and age > 24h, paste is permanently purged.
+
+**Constraints**:
+
+- `paste_key` is unique (primary key) — generated or user-requested.
+- `content_hash` has a unique index for deduplication — identical content returns existing key without storing duplicate blobs.
+
+### API Key
+
+**Attributes**:
+
+- `key_id` (string, UUID): Record identifier.
+- `key_hash` (string): Hashed API key.
+- `created_at` (timestamp): Creation time.
+- `expires_at` (timestamp, nullable): Expiration (90-day rotation).
+- `revoked_at` (timestamp, nullable): Revocation.

@@ -1,0 +1,58 @@
+---
+title: Redirect Strategy
+description: HTTP redirect status code selection (301 vs 302), response headers, cache control, and handling blocked/suspicious URLs
+---
+
+### Redirect Strategy
+
+#### Challenge
+
+Choosing the right HTTP status code and headers to balance browser caching, analytics accuracy, and SEO.
+
+#### Solution: Configurable Redirect Behavior
+
+1. **301 (Moved Permanently) vs 302 (Found)**:
+
+   | Factor          | 301                                                     | 302                          |
+   | --------------- | ------------------------------------------------------- | ---------------------------- |
+   | Browser caching | Cached by browser (immutable redirect)                  | Not cached                   |
+   | SEO             | Passes link equity                                      | No SEO impact                |
+   | Analytics       | Subsequent requests never reach server (bad for counting) | Every request reaches server |
+   | Flexibility     | Cannot change target without invalidating browser cache | Target can be updated        |
+   | Security        | Bypasses blacklist on cached hits                       | Always re-checked            |
+
+   **Recommendation**: Use **302 by default**. Every redirect passes through the API for analytics tracking, blacklist validation, and GeoIP enrichment. Browser never caches the redirect, so no TTL management needed.
+
+   **Why 301 is dangerous even with blacklist:** A 301 response is cached by the browser *permanently*. If an attacker submits a phishing URL that passes the initial blacklist check, then the URL is later added to the blacklist, the browser will **never re-check** — it serves the cached 301 redirect blindly. This creates a security bypass window.
+
+   **Enterprise 301 handling:** Do NOT expose `?type=301` as a client parameter. If an enterprise customer requires 301 for SEO reasons (e.g., brand-owned short domain), handle it via:
+   - **Domain-level configuration:** 302 for `t.ly`, 301 for `brand.co` (enterprise domain)
+   - **Manual approval process** with SLA review
+   - **Separate short domain** so 301 leaks don't affect the main product
+   - **Post-301 blacklist check:** If a URL is blacklisted after being served as 301, the only mitigation is to **change the short domain's redirect code** (expensive blast radius) or push a browser cache purge via CDN edge (still has TTL gap)
+
+2. **Response Headers**:
+
+   ```http
+   HTTP/1.1 302 Found
+   Location: https://original-target.com/page
+   X-Redirect-Code: 302
+   X-Short-Code: abc123
+   X-Cache: HIT | MISS
+   Cache-Control: no-cache, no-store, must-revalidate
+   Strict-Transport-Security: max-age=31536000; includeSubDomains
+   X-Content-Type-Options: nosniff
+   Referrer-Policy: strict-origin-when-cross-origin
+   ```
+
+   - `Referrer-Policy: strict-origin-when-cross-origin`: Prevents leaking the full referrer (including short code) to the destination server
+   - `Cache-Control`: Applied to the redirect response itself — prevents intermediate proxies from caching the redirect
+   - Removed `X-Frame-Options: DENY` from 302 response — redirect responses don't have a renderable body; this header belongs on the target page (which the target controls)
+
+3. **X-Cache Header**: Add `X-Cache: HIT | MISS` header for production monitoring. Track cache hit rate by tier (local vs Redis vs DB) to detect hot/cold set shifts.
+
+4. **Blocked / Suspicious URLs**: Return a **403 Forbidden** with a rendered page explaining why, rather than silently redirecting to a blocked URL. The 403 page should:
+   - Include a report button (misclassified URL appeal)
+   - Not reveal the blacklist rule that triggered (anti-reverse-engineering)
+   - Serve from the edge CDN to avoid API load
+

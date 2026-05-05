@@ -1,0 +1,65 @@
+---
+title: Likes & Comments at Scale
+description: Deep dive into atomic counters, like/comment table design, cursor-based pagination, and real-time update mechanisms.
+---
+
+## Atomic Counters
+
+Like and comment counts are read billions of times per day. Reading from the database on every request is infeasible.
+
+**Solution: Redis atomic counters per photo.**
+
+- Key: `photo:\{photo_id\}:like_count`
+- Operation: `INCR` (atomic, no race condition)
+- Default TTL: 7 days
+
+**Write path for a like:**
+1. Check `likes` table for duplicate (idempotency).
+2. If new: `INCR` Redis counter + write to Cassandra `likes` table.
+3. If duplicate: return existing count without incrementing.
+4. Publish `LikeCreated` event to Kafka.
+
+**Counter persistence:** A background flush job snapshots changed counters to Cassandra every 5 minutes. On disaster recovery, counts are reconstructed from the Cassandra `likes` table.
+
+## Like Table Design
+
+**Table: `likes` (Cassandra)**
+- Partition key: `photo_id`
+- Clustering key: `created_at DESC`
+- Column: `user_id`
+- TTL: 365 days
+
+```
+SELECT user_id FROM likes WHERE photo_id = ? LIMIT 50;
+```
+
+**Secondary index:** `likes_by_user` partitioned by `user_id` for "photos liked by user."
+
+**Write amplification:** ~116K write IOPS at peak (5B likes/day → 58K likes/sec × 2 writes per like: Redis + Cassandra).
+
+## Comment Storage & Pagination
+
+**Table: `comments` (Cassandra)**
+- Partition key: `photo_id`
+- Clustering key: `created_at ASC`
+- Columns: `user_id, body, parent_comment_id`
+
+**Cursor-based pagination:**
+```
+SELECT * FROM comments WHERE photo_id = ? AND created_at > ? LIMIT 20;
+```
+Cursor = `created_at` of the last row. Avoids expensive `OFFSET` on large comment sections.
+
+Threaded replies are fetched on-demand when the user expands a reply thread.
+
+**Rate limiting:** Max 50 comments per hour per photo per user. Tracked via sliding window counter in Redis: `user:\{user_id\}:comment_rate:\{photo_id\}` with 1-hour TTL.
+
+## Real-Time Updates
+
+Users with photos open receive live like/comment count updates via WebSocket/SSE:
+
+1. Client establishes persistent connection to the Notification Service.
+2. Notification Service subscribes to `like-events` Kafka topic.
+3. Like event flows through Kafka → Notification Service → WebSocket push → client updates counter.
+
+**Conflict resolution:** Unique constraint on `(photo_id, user_id)` in the `likes` table + idempotency check prevents duplicate counts from retries or glitches.

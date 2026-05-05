@@ -1,0 +1,91 @@
+---
+title: High Level Design
+description: Single-node and cluster architecture, component diagram, and technology choices.
+---
+
+## Architecture Overview
+
+### Single-Node Architecture
+
+- Erlang node with OTP processes for each queue, exchange, connection, and channel
+- Each queue: ETS-backed FUBAR (fast unsorted associative array rooted) data structure — in-memory B-tree with persistent store
+- Each connection: separate Erlang process; channels: light-weight processes within connection
+- Exchange routing: in-memory hash map lookup + binding filter
+
+### Cluster Architecture
+
+- Multiple Erlang nodes with shared queues via mirroring or quorum
+- Node types: disk node (persists metadata) or memory node (RAM-only)
+- Queue shards distributed across nodes; each queue belongs to one primary node (classic mirror) or Raft group (quorum)
+- Metadata (all exchanges, queues, bindings) replicated to all nodes via Erlang distribution
+
+### Key Design Decisions
+
+1. **Classic Mirror (RPC) vs Quorum (Raft):** classic is faster but manual failover; quorum is safer but higher latency
+2. **File-based message store vs embedded DB:** file-based is simpler; LevelDB/RocksDB chosen for alternative implementations
+3. **One-process-per-queue:** isolates failures; enables concurrent access; Erlang scheduler handles thousands of processes efficiently
+
+---
+
+## Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Clients                                    │
+│  Publishers                    Consumers                    Mgmt API│
+└────┬───────────────┬──────────────┴──────────┬──────────────┬──────┘
+     │ AMQP 0-9-1    │ AMQP 0-9-1             │ HTTP/JSON    │
+     ▼               ▼                        ▼              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Node 1 (Broker)                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │Queue A   │  │Queue B   │  │Exchange  │  │Publisher        │   │
+│  │(mirror)  │  │(quorum)  │  │(topic)   │  │Confirm/tx       │   │
+│  │          │  │          │  │          │  │                  │   │
+│  │Consumer 1│  │Consumer 2│  │Binding   │  │Management       │   │
+│  │Process   │  │Process   │  │Table     │  │API / Web UI     │   │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              Message Store (disk) + WAL                      │  │
+│  │              Flow Control (memory/disk thresholds)           │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────┬───────────────────────┬─────────────────────┘
+                       │ Erlang Distribution   │
+                       │ (TCP-based RPC)       │
+┌──────────────────────┴───────────────────────┴─────────────────────┐
+│                       Node 2 (Broker)                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │Mirror of │  │Mirror of │  │Metadata  │  │Publisher        │   │
+│  │Queue A   │  │Queue B   │  │Copy      │  │Confirm/tx       │   │
+│  │(slave)   │  │(follower)│  │          │  │                  │   │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘   │
+└──────────────────────┬───────────────────────┬─────────────────────┘
+                       │ Erlang Distribution   │
+                       │ (TCP-based RPC)       │
+┌──────────────────────┴───────────────────────┴─────────────────────┐
+│                       Node 3 (Broker)                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │Mirror of │  │Mirror of │  │Metadata  │  │Publisher        │   │
+│  │Queue A   │  │Queue B   │  │Copy      │  │Confirm/tx       │   │
+│  │(slave)   │  │(follower)│  │          │  │                  │   │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Monitoring (Prometheus / Grafana)                │
+│  Metrics: msg_rate_in/out, disk_free, memory_used, queue_depth     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Technology Choices
+
+| Component | Choice | Why | Alternative | Tradeoff |
+|-----------|--------|-----|-------------|----------|
+| Actor model | Erlang OTP processes | Lightweight, isolated, efficient scheduling; telecom-grade reliability | Akka (JVM), Go goroutines | Erlang has smaller ecosystem; Go has better tooling |
+| Queue data structure | FUBAR (ETS-backed B-tree) | In-memory, fast lookup, persistent index | SkipList, array | RabbitMQ-specific; SkipList is more generic |
+| Message store | File-based append log | Simple, reliable, fast sequential writes | LevelDB, RocksDB | Simpler but less feature-rich than embedded DB |
+| Replication (HA) | Classic mirror (RPC) + Quorum (Raft) | Choice per queue; classic for low latency, quorum for safety | Kafka-style partitioning | Raft adds latency; mirror adds sync complexity |
+| Coordination | Erlang distribution | Built-in, gossip-free auto-clustering (3.32+) | etcd, Consul | RabbitMQ-specific; etcd adds ops dependency |
+| Persistence | WAL + periodic fsync | Crash consistency; fsync on durable messages | memfd (zero-copy) | fsync adds latency but guarantees durability |

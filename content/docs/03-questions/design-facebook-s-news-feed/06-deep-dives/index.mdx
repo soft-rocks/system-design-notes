@@ -1,0 +1,76 @@
+---
+title: "Deep Dives"
+description: "Key deep dives for Facebook News Feed — ranking, fan-out, real-time, scaling, and diversity"
+---
+
+## Overview
+
+The Facebook News Feed system has five critical areas that require deep technical design:
+
+1. [Ranking Algorithm](01-ranking-algorithm/) — Two-Tower DNN with 100+ features
+2. [Fan-out Strategy](02-fan-out-strategy/) — Hybrid push-pull for the 50:1 read-write ratio
+3. [Real-time Updates](03-real-time-updates/) — SSE for live engagement broadcasting
+4. [Scaling and Performance](04-scaling-and-performance/) — Multi-layer caching, sharding, latency budgets
+5. [Diversity and Fairness](05-diversity-and-fairness/) — Anti-staleness, creator fairness, anti-gaming
+
+---
+
+## 1. Ranking Algorithm
+
+[Deep dive into ranking →](01-ranking-algorithm/)
+
+**Why it matters:** The ranking algorithm determines everything the user sees. It's the core of the product — more relevant content → more engagement → more time on platform → more ad revenue.
+
+**Key decisions:**
+- Two-Tower DNN over tree-based models (embeddings for user-author matching)
+- Two-stage pipeline: Candidate Generator (LR, &lt;1ms) → Scorer (DNN, ~15ms)
+- 100+ features across 9 categories, hybrid real-time/batch extraction
+- Training: Binary classification with engagement-weighted loss
+
+## 2. Fan-out Strategy
+
+[Deep dive into fan-out strategy →](02-fan-out-strategy/)
+
+**Why it matters:** The fan-out strategy determines how posts are distributed to followers' feeds. It's the bottleneck for the 50:1 read-write ratio.
+
+**Key decisions:**
+- Hybrid push-pull based on author follower count
+- Push for &lt;500 followers, pull for >50K, mixed in between
+- Per-user Redis sorted sets as candidate storage
+- Multi-tier storage (hot/warm/cold) to manage 100 TB Redis budget
+
+## 3. Real-time Updates
+
+[Deep dive into real-time updates →](03-real-time-updates/)
+
+**Why it matters:** Users expect new posts and engagement updates within seconds, not minutes. This drives the choice of SSE over polling.
+
+**Key decisions:**
+- SSE (not WebSocket) for simplicity and CDN compatibility
+- 500M concurrent connections → consistent hashing across 64 gateways
+- Batch reactions (500ms window) to reduce event volume
+- Staggered cache invalidation to prevent stampedes
+
+## 4. Scaling and Performance
+
+[Deep dive into scaling and performance →](04-scaling-and-performance/)
+
+**Why it matters:** Sub-second p99 latency for 10K feed renders/sec requires every microsecond to be optimized.
+
+**Key decisions:**
+- 4 caching layers (response, feature, graph, post) with staggered TTLs
+- Sharding by user_id (serving) and author_id (storage)
+- Concurrent fetching, batched Redis, model quantization
+- Same-AZ colocation of service layers
+
+## 5. Diversity and Fairness
+
+[Deep dive into diversity and fairness →](05-diversity-and-fairness/)
+
+**Why it matters:** Pure relevance creates a "rich get richer" feedback loop, boring feeds, and encourages clickbait. Diversity constraints and fairness mechanisms are essential for long-term platform health.
+
+**Key decisions:**
+- Post-ranking diversity constraints (per-author cap, per-type cap)
+- 10% explore budget for new authors
+- Engagement velocity normalization by follower count
+- Layered anti-gaming (bot detection, NLP, negative feedback weighting)

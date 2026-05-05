@@ -1,0 +1,185 @@
+---
+title: API / System Interface
+description: Event collection APIs (client-side and server-side), query API, real-time API, BigQuery export, and admin API.
+---
+
+## Event Collection API (Client-Side)
+
+### Measurement Protocol (HTTP)
+
+`POST https://www.google-analytics.com/collect?v=2&t=\{event_type\}&tid=\{G_ID\}&epn=\{event_name\}&ep=\{event_params\}&sid=\{session_id\}`
+
+| Parameter | Description |
+|-----------|-------------|
+| `t` | Hit type: page_view, event, screen_view, conversion, ecommerce |
+| `tid` | Tracking ID / G-ID |
+| `uid` | Authenticated user ID |
+| `sid` | Session ID |
+| `dl` | Document location (URL) |
+| `dt` | Document title |
+| `dh` | Domain hostname |
+| `dr` | Referrer |
+| `ul` | User language |
+| `ri` | Request ID (for dedup) |
+
+- Event parameters: `epn=\{name\}&ep.\{param\}=\{value\}` pairs
+- Payload: gzip compressed; max ~50KB per batch
+
+### Batch Endpoint
+
+`POST https://www.google-analytics.com/batch` — up to 20 events per request. Reduces HTTP overhead for mobile SDKs.
+
+### Debug Endpoint
+
+`POST https://www.google-analytics.com/debug/collect` — returns parsing results.
+
+### Signed Protocol
+
+HMAC-SHA256 signature for server-side measurement protocol to prevent spoofing.
+
+---
+
+## Event Collection API (Server-Side)
+
+### Measurement Protocol API v2
+
+`POST https://www.google-analytics.com/mp/collect?measurement_id=\{G_ID\}&api_secret=\{SECRET\}&client_id=\{CID\}&user_id=\{UID\}`
+
+**Body:**
+```json
+{
+  "events": [
+    {
+      "name": "page_view",
+      "params": \{"page_location": "https://example.com", "page_title": "Home"\},
+      "timestamp_micros": 1714712345000000
+    }
+  ]
+}
+```
+
+Supports server-to-server: enhanced privacy, server-side session injection, server-side client_id generation.
+
+### Google Tag Manager Webhook
+
+`POST https://tags.googleapis.com/v1beta/accounts/\{ACC\}/containers/\{CON\}:publish` — pushes container config.
+
+---
+
+## Query API (Data API)
+
+### Reports: batchGet
+
+`POST https://analyticsdata.googleapis.com/v1beta/\{property=properties/*\}:batchGet`
+
+**Body:**
+```json
+{
+  "reports": [{
+    "dateRanges": [\{ "startDate": "2026-04-01", "endDate": "2026-04-30" \}],
+    "dimensions": [\{ "name": "country" \}, \{ "name": "pagePath" \}],
+    "metrics": [\{ "name": "activeUsers" \}, \{ "name": "screenPageViews" \}],
+    "dimensionFilter": \{ "filter": { "fieldName": "country", "stringFilter": { "value": "US" \} } },
+    "orderBys": [\{ "dimension": { "dimensionName": "activeUsers" \}, "desc": true }],
+    "limit": 100,
+    "samplingThresholdSize": 100000
+  }]
+}
+```
+
+**Response:**
+```json
+{
+  "reports": [{
+    "dimensionHeaders": [\{ "name": "country" \}, \{ "name": "pagePath" \}],
+    "metricHeaders": [\{ "name": "activeUsers", "type": "TYPE_INTEGER" \}],
+    "rows": [{
+      "dimensionValues": [\{ "value": "US" \}, \{ "value": "/home" \}],
+      "metricValues": [\{ "value": "1234" \}]
+    }],
+    "totalRowCount": 50,
+    "metadata": {
+      "samplingSpaceSizes": \{ "shortRunSize": 1000000, "longRunSize": 5000000 \}
+    }
+  }]
+}
+```
+
+### Other Admin Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1beta/\{property\}` | GET | Get property config |
+| `/v1beta/\{property\}:getActiveUsers` | GET | Active user count (real-time) |
+| `/v1beta/\{property\}:runRealtimeReport` | POST | Real-time report |
+
+---
+
+## Real-Time API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `runRealtimeReport` | POST | Real-time report (≤ 30s latency) |
+| `getActiveUsers` | GET | Active users in last 30 min |
+
+**ActiveUsers response:** `\{ "salience": 0.85, "activeUserCount": "12847" \}`
+
+---
+
+## BigQuery Export API
+
+### Raw Event Data Export
+
+- Daily table partitioning: `events_*` tables partitioned by `_PARTITIONTIME`
+- Schema: nested repeated fields matching GA4 event model
+- Export schedule: 2-4 hours after UTC midnight for previous day
+- Query: `SELECT * FROM \`project.dataset.events_\` WHERE _PARTITIONTIME BETWEEN '2026-04-01' AND '2026-04-30'`
+
+### Export API
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /bigquery/v2/projects/\{project\}/queries` | Run ad-hoc queries |
+| `projects/\{project\}/exports/\{export_id\}` | Scheduled export to GCS |
+
+---
+
+## Admin API
+
+### Accounts/Properties/Streams
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/accounts` | POST | Create account |
+| `/v1/accounts/\{account\}/properties` | POST | Create property |
+| `/v1/properties/\{property\}/dataStreams` | GET | List data streams |
+| `/v1/properties/\{property\}` | PATCH | Update timezone, retention, filtering |
+
+### User Management
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `:addIamPolicyBinding` | POST | Grant access |
+| `:removeIamPolicyBinding` | DELETE | Revoke access |
+
+### Data Filters
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `dataFilters:effective` | POST | List effective filters |
+| `dataFilters/\{filter\}` | PATCH | Update filter |
+
+---
+
+## Internal Service Interfaces
+
+| Service | Methods | Responsibility |
+|---------|---------|----------------|
+| `EventIngestService` | `CollectBatch/Validate/Deduplicate` | Ingest and dedup events |
+| `Sessionizer` | `GroupIntoSessions/AssignSessionId/TimeoutSession` | Session management |
+| `AggregationService` | `ComputeMetrics/RollupDaily` | Pre-compute aggregates |
+| `ReportService` | `GenerateReport/SampleResult/UnsampledResult` | Query engine |
+| `RealtimeService` | `TrackActiveUsers/RecentEvents` | Real-time tracking |
+| `ExportService` | `ExportToBigQuery/ScheduleExport` | Data export |
+| `AlertService` | `EvaluateThreshold/Notify` | Threshold alerts |
+| `SegmentService` | `ApplySegment/ComputeSegmentMetrics` | Segment queries |

@@ -1,0 +1,139 @@
+---
+title: Requirements
+description: Functional requirements, non-functional requirements, and scale assumptions for a hotel booking system.
+---
+
+## Functional Requirements
+
+### Room Catalog Management
+- Multi-property hotel catalogs with hierarchical structure: Hotel → Property → Floor → Room Type → Room Instance.
+- Room types define attributes: bed type, occupancy limits, size, amenities, view, accessibility features.
+- Room instances are individual bookable units (e.g., Room 507) with physical state (clean, dirty, under maintenance).
+- Multiple rate plans per room type: standard, member discount, corporate, seasonal, flash sale.
+
+### Availability Management
+- Real-time availability lookup by date range, room type, occupancy (guests/children).
+- Availability = booked inventory − blocked rooms (maintenance, out-of-order) + overbooking buffer.
+- Support room-type-level availability (upgrades/downgrades within type group) and room-instance-level exact matches.
+- Hold windows: lock availability for X minutes during checkout flow.
+
+### Reservation Booking
+- Create reservations with guest info, check-in/out dates, room type, rate plan, special requests.
+- Multi-room bookings (same or different types) and multi-property stay packages.
+- Booking lifecycle: Pending → Confirmed → Checked-In → Checked-Out → Completed; with cancellable and no-show states.
+- Partial cancellations: cancel specific rooms or the entire booking.
+
+### Pricing & Rate Calculation
+- Total price = nightly rates × nights + taxes + fees (resort, occupancy, service) + addons (breakfast, parking).
+- Dynamic pricing: demand-based adjustments, advance purchase discounts, last-minute deals, length-of-stay discounts.
+- Rate hold: lock rate for 15 minutes during checkout to prevent race conditions.
+
+### Payment Processing
+- Pre-authorization at booking time (hold amount on guest card).
+- Capture at check-in or checkout depending on policy.
+- Split payments: multiple payment methods per reservation.
+- Partial/full refunds with policy enforcement.
+
+### Inventory Protection & Overbooking Control
+- Configurable overbooking buffer per room type based on no-show historical rates.
+- Walk policy: when overbooked, relocate guest to another property with compensation.
+- Blocked room management: maintenance, renovations, VIP holds, group blocks.
+
+### Group & Block Booking
+- Block bookings for events/conferences/weddings (20+ rooms).
+- Block release deadlines: rooms auto-release back to inventory if unconfirmed.
+- Group rate negotiation and custom contracts.
+
+### Cancellation & Modification
+- Flexible/moderate/strikethrough cancellation policies per rate plan.
+- Modification window: allow date/room changes without penalty within policy.
+- No-show handling: charge no-show fee and release inventory.
+
+### Guest & Loyalty Integration
+- Guest profiles with preferences, history, and loyalty tier.
+- Loyalty points accrual and redemption per stay.
+- Corporate account billing and direct billing for B2B partners.
+
+### Search & Discovery
+- Search by location (geospatial), dates, room type, price range, amenities, ratings.
+- Filters: free cancellation, breakfast included, pet-friendly, refundable deposit.
+- Ranking by relevance, price, rating, and commission rate.
+
+### Notification & Communication
+- Booking confirmation, modification, and cancellation via email/SMS/push.
+- Pre-arrival reminders (24h) and checkout receipts.
+- Overbooking/walk notifications to affected guests.
+
+### Reporting & Analytics
+- Occupancy rate, RevPAR (Revenue Per Available Room), ADR (Average Daily Rate).
+- Demand forecasting by date, room type, property.
+- Channel performance: direct vs. OTA (Online Travel Agency) breakdown.
+
+### Channel Manager Integration
+- Bidirectional inventory/rate sync across channels: own site, Expedia, Booking.com, Airbnb, GDS.
+- New bookings from any channel immediately reduce available inventory.
+- Rate parity enforcement across channels.
+
+### Check-In / Check-Out Management
+- Front-desk operations: ID verification, deposit collection, room assignment.
+- Early check-in / late check-out with availability-based approval and extra charges.
+- Digital check-in via mobile app with keyless entry integration.
+
+## Non-Functional Requirements
+
+### Availability & Latency
+- 99.99% availability during peak booking seasons.
+- Search query p95 latency < 200ms (including geospatial filtering).
+- Booking confirmation p95 latency < 500ms (end-to-end including payment auth).
+
+### Consistency
+- **Strong consistency for inventory**: double-booking must never occur under any condition.
+- Strong consistency for payment transactions (ACID).
+- Eventual consistency for reporting, analytics, and notifications.
+
+### Throughput
+- 50K booking search queries/sec during peak (500K during flash sales).
+- 5K booking creation transactions/sec peak (50K during flash sales).
+- 200K inventory sync messages/sec from channel managers and PMS.
+
+### Data Integrity & Durability
+- Zero double-bookings: the hardest constraint, enforced via single-partition writes per room type per date.
+- PCI-DSS compliance for payment data (encrypted at rest and in transit).
+- Audit log: all booking state transitions, rate changes, and cancellations retained for 7 years.
+
+### Scalability
+- Horizontal scaling for search and booking services independently.
+- 100K+ active room types globally with sub-millisecond availability checks.
+- Multi-region: active-active for search (read-heavy), active-passive for bookings (write-heavy, consistency-critical).
+
+### Extensibility
+- Plugin-based rate engine for new pricing strategies without code deployment.
+- PMS integration SDK in multiple languages.
+- Payment method abstraction for new methods (Apple Pay, WeChat Pay, crypto).
+
+### Operational
+- Real-time monitoring: booking success rate, inventory sync lag, payment failure rate.
+- Circuit breakers for downstream dependencies (payment gateway, channel managers).
+- 1-minute rollback window via idempotent reversal API.
+
+## Scale Assumptions
+
+### Market Scale
+- 50,000 partner hotels × 100 avg rooms = **5M total rooms**.
+- 100M monthly active users.
+- 50K peak search queries/sec; 5K booking transactions/sec peak.
+
+### Inventory & Storage
+- **Reservation records**: 5M rooms × 365 days × 2 years = 3.65B records → ~7.3TB (2KB/record).
+- **Search index**: 5M room types × 50K date windows = 250B entries → ~25TB.
+- **Daily growth**: ~50GB reservation records + ~10GB log events.
+
+### Traffic Mix
+- Search : Booking : Modification : Cancellation ≈ 50:1:0.2:0.3.
+- Mobile 70%, Web 20%, Partner APIs 10%.
+- Direct 60%, OTA 40%.
+
+### Geographic Distribution
+- NA 40%, Europe 30%, APAC 25%, Rest 5%.
+- Cross-region bookings: ~10%.
+- Data residency: GDPR (EU), CCPA (California).

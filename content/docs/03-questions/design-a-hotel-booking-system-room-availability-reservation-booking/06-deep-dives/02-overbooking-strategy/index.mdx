@@ -1,0 +1,90 @@
+---
+title: Overbooking Strategy
+description: How the system calculates overbooking buffers, handles walk events, and monitors overbooking ratios in real time.
+---
+
+## Why Overbook
+
+Hotels deliberately overbook just like airlines. The no-show rate for hotel bookings is 8-12% (higher for non-refundable rates, lower for refundable). Without overbooking, 8-12% of rooms sit empty on average — pure revenue loss.
+
+**The math**: A 200-room hotel at $150/night loses $2,400–3,600 per night from no-shows alone. Overbooking captures this lost revenue by selling the expected no-show rooms to other guests.
+
+## Overbooking Buffer Calculation
+
+The buffer is computed per room type per date based on historical no-show rates:
+
+```
+overbook_buffer(room_type_id, date) = floor(total_rooms × no_show_rate × confidence_factor)
+```
+
+| Parameter | Source | Notes |
+|---|---|---|
+| `no_show_rate` | 30-day rolling average of no-shows / total bookings for this (room_type, date) bucket | Updated nightly |
+| `confidence_factor` | 1.2 base, 1.5 for high-demand dates | High-demand dates: local events, holidays, conferences |
+| **Cap** | 15% of total_rooms | Prevents extreme overbooking in any single room type |
+
+**Example**: 50 Deluxe King rooms, 10% no-show rate → buffer = `floor(50 × 0.10 × 1.2)` = **6 rooms**. The system sells 56 Deluxe King rooms for a night with only 50 physical rooms.
+
+**Adapts dynamically**: A room type on a holiday might have a 3% no-show rate (buffer = 0), while the same room type on a Tuesday in January might have 15% (buffer = 9).
+
+**Weighted by booking type**: Non-refundable bookings have a 2% no-show rate; refundable bookings have 15%. The buffer is weighted by the mix of booking types currently in inventory.
+
+## Walk Policy
+
+When actual check-ins exceed available rooms, the guest must be "walked" — relocated to another property. This is the failure mode we design to minimize.
+
+### Priority: Who Gets Walked First?
+
+When a walk event is predicted, the system identifies which reservation to walk using this priority order:
+
+1. **Loyalty tier** (descending): Platinum and Gold members are least likely to be walked. They have first right of refusal.
+2. **Booking type**: Non-refundable bookings are walked before refundable (already paid, less likely to complain).
+3. **Check-in time**: Last to check-in is walked first (most flexible with arrival time).
+4. **Group blocks**: Never walked.
+
+### Walk Compensation
+
+The walk agent handles this automatically:
+
+1. **Find alternate property**: Query nearby hotels in the same chain or partner network with availability. Same room type preferred.
+2. **Transportation**: Free ground transport to the alternate hotel.
+3. **First night complimentary**: At the alternate property.
+4. **Loyalty bonus**: 2x points for the inconvenience.
+5. **Return guarantee**: If rooms become available at the original hotel, the guest is moved back on day 2 with no additional charge.
+
+**Cost model**: Walking a guest costs ~$200–500 (transport + first night + loyalty bonus + brand damage). The system compares this against the marginal revenue of overbooking one more room (~$150). If the historical walk probability exceeds 3%, the buffer is automatically reduced by one room.
+
+## Overbooking Detection & Alerting
+
+### Real-Time Monitoring
+
+```
+overbook_ratio = (total_booked - total_rooms) / total_rooms
+```
+
+| Ratio | Alert Level | Action |
+|---|---|---|
+| 0 < ratio ≤ 0.05 | **Warning** (Slack) | Notify revenue manager. No automated action. |
+| 0.05 < ratio ≤ 0.15 | **Warning + Email** | Notify revenue manager. Pause new bookings from low-value channels. |
+| ratio > 0.15 | **Critical (PagerDuty)** | On-call revenue manager paged. Emergency rate increase triggered. |
+
+### Automatic Mitigation
+
+When `overbook_ratio > 0` is detected:
+
+1. **Rate increase**: New bookings become more expensive, naturally discouraging further overbooking.
+2. **Channel pause**: The channel manager pauses inventory sync for the affected room type to prevent OTA bookings from compounding the problem.
+3. **Partner notification**: Channel partners are notified that the room type is "sold out" and should stop accepting new bookings.
+
+### Forecasting
+
+7 days, 3 days, 1 day, and 1 hour before check-in, the system forecasts actual arrivals vs. available rooms using:
+- Current booked count minus current cancelled count
+- Historical no-show rate for this (room_type, date) bucket
+- Current booking velocity (are bookings accelerating or slowing?)
+
+If the forecast shows a walk event with >50% probability, preemptive rate increases and channel pausing are triggered before the overbook ratio becomes critical.
+
+### Historical Tracking
+
+Every overbooking event is logged with the buffer parameters that caused it. Weekly reports compare forecasted vs. actual no-shows to continuously improve the no_show_rate estimate.

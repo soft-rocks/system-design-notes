@@ -1,0 +1,541 @@
+---
+title: "API System Interface"
+description: "API design for hotel booking system"
+---
+
+## Guest-Facing Endpoints
+
+### Search Availability
+
+```
+GET /v1/search
+Query params:
+  check_in: "2026-08-15"
+  check_out: "2026-08-18"
+  guests: 2
+  children: 0
+  room_types: ["DELUXE_KING", "STANDARD_TWINS"]
+  price_max: 300
+  sort: "price_asc"
+  page: 1
+  page_size: 20
+
+Response 200:
+{
+  "total": 142,
+  "rooms": [
+    {
+      "property_id": "prop_nyc_001",
+      "property_name": "Marriott Downtown NYC",
+      "room_type_id": "rt_deluxe_king",
+      "room_type_name": "Deluxe King",
+      "nightly_rate": 189.00,
+      "total_price": 567.00,
+      "currency": "USD",
+      "available_rooms": 5,
+      "amenities": [...],
+      "cancellation": "free_cancellation",
+      "rating": 4.5
+    }
+  ]
+}
+```
+
+Called by the search page. Returns available room types matching the filters. The query hits the search index (Elasticsearch) which is pre-computed from availability data. **Latency target**: p95 < 200ms.
+
+### Reserve Room
+
+```
+POST /v1/reservations
+Request body:
+{
+  "check_in_date": "2026-08-15",
+  "check_out_date": "2026-08-18",
+  "guest_id": "uuid",
+  "room_type_id": "rt_deluxe_king",
+  "property_id": "prop_nyc_001",
+  "rate_plan_id": "rp_standard",
+  "payment_method_id": "pm_xyz",
+  "addons": [{"addon_id": "addon_breakfast", "quantity": 2}],
+  "special_requests": "Late checkout if available"
+}
+Response 201:
+{
+  "reservation_id": "uuid",
+  "total_price": 612.45,
+  "payment_status": "authorized",
+  "cancellation_deadline": "2026-08-14T18:00:00Z"
+}
+Response 409: { "error": "ROOM_UNAVAILABLE", "message": "Room type no longer available at this price" }
+```
+
+This is the critical write path. The handler must:
+1. Validate the rate (re-check price with the Rate Engine, not trusting the client)
+2. Acquire a blockhold on the room type for the date range (atomic compare-and-set)
+3. Authorize payment (call Payment Gateway)
+4. Create the reservation record in the DB
+5. Release the blockhold
+6. Return the reservation
+
+**Race condition handling**: If two requests arrive simultaneously for the last room, the blockhold acquisition fails for the second request (optimistic lock). Return 409 with `ROOM_UNAVAILABLE`.
+
+### Get Reservation
+
+```
+GET /v1/reservations/{reservation_id}
+Response 200:
+{
+  "reservation_id": "uuid",
+  "status": "CONFIRMED",
+  "check_in_date": "2026-08-15",
+  "check_out_date": "2026-08-18",
+  "room_type": {
+    "name": "Deluxe King",
+    "property_name": "Marriott Downtown NYC"
+  },
+  "total_price": 612.45,
+  "payment_status": "AUTHORIZED",
+  "guest": { "name": "Jane D.", "email": "j***@example.com" },
+  "addons": [...],
+  "cancellation_deadline": "2026-08-14T18:00:00Z"
+}
+```
+
+### Modify Reservation
+
+```
+PATCH /v1/reservations/{reservation_id}
+Request body:
+{
+  "action": "MODIFY_DATES",
+  "new_check_in_date": "2026-08-16",
+  "new_check_out_date": "2026-08-19"
+}
+Response 200: {
+  "reservation_id": "uuid",
+  "status": "MODIFIED",
+  "price_difference": 45.00,
+  "payment_status": "AUTHORIZED_ADDITIONAL"
+}
+```
+
+Modifications are allowed within the policy window. The handler re-runs the full pricing calculation, checks availability for the new dates, and adjusts payment if the price changed.
+
+### Cancel Reservation
+
+```
+POST /v1/reservations/{reservation_id}/cancel
+Response 200: {
+  "reservation_id": "uuid",
+  "status": "CANCELLED",
+  "refund_amount": 567.00,
+  "refund_fee": 0.00,
+  "payment_status": "REFUNDED"
+}
+Response 400: { "error": "CANCELLATION_POLICY_VIOLATED", "refund_fee": 189.00 }
+```
+
+The handler must check the cancellation policy at cancel time (not at booking time — policies can change). If the cancellation deadline has passed and the policy is strict, a cancellation fee applies.
+
+### Check-In / Check-Out
+
+```
+POST /v1/reservations/{reservation_id}/check-in
+Response 200: { "status": "CHECKED_IN", "room_number": "507", "wifi_pin": "1234" }
+
+POST /v1/reservations/{reservation_id}/check-out
+Request body: { "addons_charges": 45.00 }
+Response 200: { "status": "CHECKED_OUT", "final_total": 657.45, "payment_status": "CAPTURED" }
+```
+
+Check-in assigns a specific room (room_type-level → room_instance-level booking). This is the point where the Room physical state transitions from CLEAN → OCCUPIED.
+
+## Internal Service Interfaces
+
+### InventoryService
+
+```
+interface InventoryService {
+  // Check availability for a room type on a date range
+  // Returns number of available rooms
+  CheckAvailability(roomTypeID string, checkIn, checkOut time.Time) (int, error)
+
+  // Create a blockhold — atomically reserves N rooms for X minutes
+  // Returns error if insufficient inventory
+  AcquireBlockhold(roomTypeID string, date time.Time, count int,
+    expiresAfter time.Duration) (blockholdID string, err error)
+
+  // Release a blockhold without converting to a reservation
+  ReleaseBlockhold(blockholdID string) error
+
+  // Convert a blockhold to a confirmed reservation
+  ConvertBlockhold(blockholdID string, reservationID string) error
+
+  // Block rooms for maintenance, VIP, or group bookings
+  BlockRooms(roomTypeID string, date time.Time, count int, reason string) error
+  UnblockRooms(blockID string) error
+}
+```
+
+**Why blockholds**: The checkout flow has a time gap (guest browses, enters payment info, confirms). Without a blockhold, another user could book the last room. The blockhold atomically decrements available inventory and expires after 15 minutes if not converted.
+
+**Implementation**: In PostgreSQL, `AcquireBlockhold` uses a `UPDATE availability SET available_rooms = available_rooms - 1 WHERE room_type_id = $1 AND date = $2 AND available_rooms > 0 RETURNING availability_id` with a separate blockholds table for the TTL. PostgreSQL's row-level locking ensures zero double-bookings.
+
+### RateEngine
+
+```
+interface RateEngine {
+  // Compute the total price for a reservation
+  ComputePrice(roomTypeID string, ratePlanID string, checkIn, checkOut time.Time,
+    addons []Addon) (*PriceCalculation, error)
+
+  // Lock a rate for a time window during checkout
+  LockRate(roomTypeID string, ratePlanID string, checkIn, checkOut time.Time,
+    lockDuration time.Duration) (rateHoldID string, lockedPrice float64, err error)
+
+  // Consume a locked rate
+  ConsumeRate(rateHoldID string) error
+
+  // Update daily rates (batch, from pricing engine)
+  UpdateDailyRates(rates []DailyRateUpdate) error
+}
+```
+
+**Why rate locking**: During the 15-minute checkout window, the guest's displayed price must not change. `LockRate` creates a RateHold record and the price calculation uses the locked price instead of querying DailyRate.
+
+### PricingEngine (background service)
+
+```
+interface PricingEngine {
+  // Compute daily rates based on demand signals
+  RecomputeRates(roomTypeID string, date time.Time) (*DailyRate, error)
+
+  // Batch update all room types for a property (cron job)
+  BatchUpdateRates(propertyID string, effectiveDate time.Time) error
+
+  // Apply demand signals (events, weather, competitor pricing)
+  ApplyDemandSignal(signal DemandSignal) error
+}
+```
+
+**Why separate**: Rate computation is a CPU-heavy, batch-oriented operation. It runs on a schedule (every 6 hours) and updates DailyRate records in bulk. It should not block the hot path (search/reservation).
+
+### ChannelManagerService
+
+```
+interface ChannelManagerService {
+  // Receive a booking from an external channel (Expedia, Booking.com, etc.)
+  IngestBooking(syncEvent InventorySyncEvent) error
+
+  // Push rate/availability changes to all channels
+  SyncRates(propertyID string, roomTypeID string) error
+
+  // Handle a cancellation from an external channel
+  IngestCancellation(channelPartnerID string, externalReservationID string) error
+}
+```
+
+**Why this is a separate service**: Channel integrations are fragile — APIs change, auth tokens expire, rate limits differ. Isolating them in a dedicated service with circuit breakers prevents a slow/expedia response from blocking internal booking flows.
+
+## Event/Message Interfaces
+
+### ReservationCreated (Kinesis / Kafka)
+```json
+{
+  "event_type": "RESERVATION_CREATED",
+  "reservation_id": "uuid",
+  "property_id": "prop_nyc_001",
+  "room_type_id": "rt_deluxe_king",
+  "check_in_date": "2026-08-15",
+  "check_out_date": "2026-08-18",
+  "guest_id": "uuid",
+  "total_price": 612.45,
+  "channel": "DIRECT"
+}
+```
+
+### InventoryUpdated (Kinesis / Kafka)
+```json
+{
+  "event_type": "INVENTORY_UPDATED",
+  "room_type_id": "rt_deluxe_king",
+  "date": "2026-08-15",
+  "available_before": 3,
+  "available_after": 2,
+  "change": -1,
+  "reason": "BOOKING"
+}
+```
+
+### RateChanged (Kinesis / Kafka)
+```json
+{
+  "event_type": "RATE_CHANGED",
+  "room_type_id": "rt_deluxe_king",
+  "date": "2026-08-15",
+  "price_before": 189.00,
+  "price_after": 210.00,
+  "adjustment_reason": "HIGH_DEMAND"
+}
+```
+
+### CheckInCompleted (Kinesis / Kafka)
+```json
+{
+  "event_type": "CHECK_IN_COMPLETED",
+  "reservation_id": "uuid",
+  "room_id": "room_507",
+  "room_physical_state_transition": "CLEAN → OCCUPIED"
+}
+```
+
+**Event-driven benefits**: Notifications, search index updates, loyalty points accrual, and channel sync are all consumers of these events. The reservation creation is the only blocking operation (must return 201 to the client). All downstream effects are async.
+
+## Pricing Engine
+
+### Calculate Price
+
+```
+POST /v1/pricing/calculate
+Request body:
+{
+  "room_type_id": "rt_deluxe_king",
+  "rate_plan_id": "rp_standard",
+  "check_in": "2026-08-15",
+  "check_out": "2026-08-18",
+  "guest_id": "uuid",
+  "addons": [{"addon_id": "addon_breakfast", "quantity": 2}]
+}
+Response 200:
+{
+  "nightly_rates": [189.00, 189.00, 189.00],
+  "subtotal": 567.00,
+  "taxes": 68.04,
+  "fees": {"resort_fee": 45.00},
+  "addons": 60.00,
+  "discounts": [],
+  "total": 740.04
+}
+```
+
+Stateful — writes a `PriceBreakdown` record for audit. Called during reservation creation and modification.
+
+### Get Dynamic Rates
+
+```
+GET /v1/pricing/dynamic?room_type_id=rt_deluxe_king&date_from=2026-08-15&date_to=2026-08-30
+```
+
+Returns predicted demand-based prices for a date range. Read-only, used for search display. Powered by the PricingEngine background service that re-rates every 6 hours based on demand signals.
+
+### Apply Promo Code
+
+```
+POST /v1/pricing/promo-apply
+Request body: {"promo_code": "SUMMER20", "reservation_id": "uuid"}
+Response 200: { "discount": 113.40, "updated_total": 626.64 }
+```
+
+## Payment Processing
+
+### Authorize Payment
+
+```
+POST /v1/payments/authorize
+Request body: { "reservation_id": "uuid", "payment_method_id": "pm_xyz", "amount": 740.04 }
+Response 200: { "txn_id": "uuid", "auth_token": "auth_xyz", "status": "COMPLETED" }
+```
+
+Pre-authorizes the guest card. The `auth_token` is stored with the reservation and used for later capture.
+
+### Capture Payment
+
+```
+POST /v1/payments/{txn_id}/capture
+Request body: { "amount": 740.04 }  // optional — captures full authorized amount if omitted
+```
+
+Partial capture supported (e.g., for modified reservations with lower total).
+
+### Refund Payment
+
+```
+POST /v1/payments/{txn_id}/refund
+Request body: { "amount": 567.00 }  // optional — full refund if omitted
+```
+
+Enforces cancellation policy before processing.
+
+## Guest & Loyalty API
+
+### Profile Management
+
+```
+POST /v1/guests                          # CreateGuestProfile
+GET  /v1/guests/{guest_id}/profile      # GetGuestProfile
+PATCH /v1/guests/{guest_id}/profile     # UpdateGuestProfile
+```
+
+Profile is separated from identity — `Guest` holds credentials while `GuestProfile` holds loyalty tier, preferences (room floor, bed type, pillow type), and tags (VIP, FAMILY, BUSINESS).
+
+### Redeem Loyalty Points
+
+```
+POST /v1/guests/{guest_id}/loyalty/redeem
+Request body: { "reservation_id": "uuid", "points": 5000 }
+Response 200: { "points_redeemed": 5000, "discount": 50.00, "updated_total": 690.04 }
+```
+
+Exchange rate: 100 points = $1.00. Platinum members get 1.25x multiplier.
+
+## Cancellation & Policy Previews
+
+### Validate Cancellation
+
+```
+GET /v1/reservations/{reservation_id}/cancellation-preview
+Response 200:
+{
+  "refund_amount": 567.00,
+  "cancellation_fee": 0.00,
+  "policy_code": "FLEX",
+  "deadline_hours_remaining": 24
+}
+```
+
+Returns the calculated refund without actually cancelling. The guest-facing UI shows this before the confirm-cancel button.
+
+### Validate Modification
+
+```
+GET /v1/reservations/{reservation_id}/modification-preview?new_check_in=2026-08-16&new_check_out=2026-08-19&new_room_type=rt_suite
+Response 200:
+{
+  "price_difference": 45.00,
+  "payment_status": "AUTHORIZED_ADDITIONAL",
+  "availability": "AVAILABLE",
+  "policy_impact": "no_penalty"
+}
+```
+
+## Group & Block Booking
+
+### Create Group Block
+
+```
+POST /v1/hotels/{hotel_id}/group-blocks
+Request body:
+{
+  "event_name": "TechConf 2026",
+  "room_type_ids": ["rt_deluxe_king", "rt_standard_twins"],
+  "num_rooms": 30,
+  "release_deadline": "2026-07-15T00:00:00Z",
+  "group_rate_id": "grp_rate_001"
+}
+Response 201:
+{
+  "group_block_id": "uuid",
+  "status": "ACTIVE",
+  "rooms_confirmed": 0,
+  "rooms_remaining": 30
+}
+```
+
+Rooms in a group block are removed from public availability. If unconfirmed by the release deadline, they auto-release back to inventory.
+
+### Group Block Management
+
+```
+PATCH /v1/group-blocks/{group_block_id}   # Update room count or deadline
+POST /v1/group-blocks/{group_block_id}/release   # Release remaining rooms
+GET  /v1/hotels/{hotel_id}/group-blocks?status=&date_from=  # List
+```
+
+## Channel Manager API (External-facing)
+
+These endpoints are called by external booking channels (Expedia, Booking.com, GDS). Authentication via mutual TLS + API keys. Rate-limited per partner.
+
+### Sync Inventory
+
+```
+POST /v1/channels/{partner_id}/sync
+Headers:
+  Idempotency-Key: sync_12345   // provided by channel
+  X-Signature: hmac_hash
+Request body:
+{
+  "external_reservation_id": "exp_abc123",
+  "property_id": "prop_nyc_001",
+  "room_type_id": "rt_deluxe_king",
+  "check_in": "2026-08-15",
+  "check_out": "2026-08-18",
+  "operation": "BOOK",
+  "num_rooms": 1
+}
+```
+
+Idempotent via `Idempotency-Key`. If the same sync event arrives twice, it's silently deduplicated. Produces `inventory.sync` Kafka event.
+
+### Sync Rates
+
+```
+POST /v1/channels/{partner_id}/rates
+Request body:
+{
+  "property_id": "prop_nyc_001",
+  "rate_plan_id": "rp_standard",
+  "effective_date": "2026-08-15",
+  "price": 210.00,
+  "currency": "USD"
+}
+```
+
+Enforces rate parity — if the channel has parity enforcement enabled, prices cannot be lower than the direct site.
+
+### Webhook Subscription
+
+```
+POST /v1/channels/{partner_id}/subscribe-webhook
+Request body: { "url": "https://expedia.com/webhooks/availability" }
+```
+
+Channels with webhook support receive real-time push when availability changes. Polling fallback (`GET /v1/channels/{partner_id}/inventory`) exists for channels without webhook capability.
+
+## Operational & Admin API
+
+Protected by internal admin auth (mTLS + service account tokens). Not exposed to guests or channel partners.
+
+### Room State Management
+
+```
+POST /v1/admin/rooms/{room_id}/state
+Request body: { "state": "DIRTY", "updated_by": "frontdesk_agent_42" }
+```
+
+Updates room physical state. Audited — records who changed it and when. PMS systems call this automatically after housekeeping.
+
+### Manual Availability Override
+
+```
+POST /v1/admin/availability
+Request body:
+{
+  "property_id": "prop_nyc_001",
+  "room_type_id": "rt_deluxe_king",
+  "override_dates": ["2026-11-20", "2026-11-21"],
+  "available_rooms": 0,
+  "reason": "maintenance_window"
+}
+```
+
+Used for emergency situations (pipe burst, fire alarm). Always audited and triggers an `alerts.overbook` notification if availability drops to zero.
+
+### Reports
+
+```
+GET /v1/admin/reports/occupancy?property_id=&date_from=&date_to=
+Response: { "occupancy_rate": 0.87, "RevPAR": 164.43, "ADR": 189.00 }
+
+GET /v1/admin/reports/bookings?property_id=&date_from=&date_to=&status=
+Response: { "total_bookings": 1247, "by_status": { "confirmed": 890, "checked_in": 234, "cancelled": 123 } }
+```

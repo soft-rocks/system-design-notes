@@ -1,0 +1,107 @@
+---
+title: Requirements
+description: Functional requirements, non-functional requirements, and scale assumptions for the Twitter design.
+---
+
+## Functional Requirements
+
+### Tweet / Post
+- Users can create short text posts ("tweets"), up to 280 characters.
+- Tweets may include media attachments: images (up to 4), GIFs (up to 5 min), videos.
+- Users can mention other users via `@username` in tweets.
+- Users can retweet (re-share) other users' tweets.
+- Users can reply to tweets, forming a conversation thread.
+- Users can edit their own tweets (optional, for this design).
+
+### Follow / Unfollow
+- Users can follow and unfollow other users.
+- Following is directed and asymmetric (A follows B does not imply B follows A).
+- No hard limit on follower/following counts.
+
+### Timeline (Home Feed)
+- Each user has a personalized home timeline showing tweets from users they follow.
+- Timeline is ordered by recency (newest first).
+- Timeline must be generated efficiently, even for users with thousands of followers or following.
+
+### Engagement Actions
+- Users can "like" tweets.
+- Like counts are visible publicly.
+
+### Profile
+- Users have a profile with username, display name, bio, profile photo, and header image.
+- Each user can view their own tweet history, liked tweets, and profile page.
+
+### Search & Discovery
+- Users can search for tweets, users, and keywords.
+- Trending topics may be displayed (covered in deep dive).
+
+### Notifications
+- Users receive notifications when someone replies to, retweets, or likes their tweet.
+- Notifications should be delivered in near real-time.
+
+---
+
+## Non-Functional Requirements
+
+### Read-Heavy Workload
+- Twitter is heavily read-dominated: ~100 reads per write on average.
+- Timeline reads must be fast (< 1s for 95th percentile).
+
+### Write Scalability
+- Must handle millions of tweets per day with reasonable latency.
+- Write latency for a single tweet: < 1s.
+
+### Consistency Model
+- **Timeline (home feed): eventual consistency is acceptable.** It's fine if a tweet appears in timelines seconds after posting.
+- **Tweet reads: eventual consistency is acceptable.**
+- **Follow relationships: strong consistency preferred.** If A follows B and sees B's tweet, the follow must be recorded before the timeline includes it.
+- **Like counts: eventual consistency is acceptable.**
+
+### Availability
+- High availability target: 99.9%+ uptime.
+- The system should degrade gracefully — serving stale data is better than serving errors.
+
+### Latency
+- Timeline load: p95 < 1 second.
+- Tweet creation: p95 < 1 second.
+- Search: p95 < 2 seconds.
+
+### Durability
+- Tweets are durable and must not be lost.
+- Data must survive hardware failures, datacenter outages.
+
+### Security & Privacy
+- Protect against spam, abuse, and rate-limit abuse.
+- Support private/sensitive tweet settings.
+- Content moderation pipelines.
+
+---
+
+## Scale Assumptions
+
+### User Base
+- Active daily users (DAU): ~50M
+- Monthly active users (MAU): ~300M
+- Total registered users: ~1B
+
+### Tweet Volume
+- Tweets per day: ~500M (~5.8k tweets/sec)
+- Peak bursts: ~12k tweets/sec during major events
+
+### Read Volume
+- Timeline reads per day: ~50B (~580k reads/sec)
+- Tweet reads (profile, individual tweet): ~500M reads/day
+
+### Follow Graph
+- Average follows per user: ~500
+- Average followers per user: ~500
+- "Super-nodes" (celebrities): 10M+ followers
+
+### Storage
+- Average tweet size (text + metadata): ~200 bytes
+- Media storage: separate system (image CDN + video storage)
+- Daily new tweets: ~250GB/day
+- Estimated 3-year storage: ~300TB
+
+### Ratio
+- Read:Write ratio ~ 100:1

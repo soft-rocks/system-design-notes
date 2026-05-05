@@ -1,0 +1,114 @@
+---
+title: Multi-Device Sync
+description: Designing cross-device synchronization for message history, status, and preferences
+---
+
+## Problem
+
+A single user may be logged in on multiple devices (phone, tablet, desktop, web). All devices must see the same messages, conversation state (last read, typing), and user preferences with eventual consistency.
+
+## Device Registration
+
+### Device Registration
+
+```mermaid
+flowchart LR
+    subgraph DB["devices table"]
+        D1["user_123 | dev_001 | fcm_token_a | sess_xxx"]
+        D2["user_123 | dev_002 | fcm_token_b | sess_yyy"]
+        D3["user_123 | dev_003 | apns_token_c | sess_zzz"]
+    end
+    Note["Unique: (user_id, device_id)"]
+```
+
+## Message Delivery Model
+
+```mermaid
+flowchart TD
+    M["Message Hello (stored once)"]
+    M --> D1["Device 001 (phone)\ndelivered, read on phone"]
+    M --> D2["Device 002 (web)\ndelivered, read on web"]
+    M --> D3["Device 003 (desktop)\ndelivered, still delivered"]
+    Note["Status shared across devices (per conversation)"]
+```
+
+## Sync Protocol
+
+### On Device Connect
+
+```mermaid
+sequenceDiagram
+    participant D as Device B (desktop)
+    participant S as Server
+    participant R as Redis
+
+    D->>S: Connect with session token + device_id
+    S->>R: Validate session
+    R-->>S: Session valid
+    S-->>D: Return device list + last_read cursors + pending messages
+    D->>S: ACK
+    S->>R: Update last_seen
+```
+
+### Cross-Device Status Sync
+
+```mermaid
+sequenceDiagram
+    participant DA as Device A (phone)
+    participant S as Server
+    participant DB as Device B
+    participant DC as Device C
+
+    DA->>S: Read ACK for message_id
+    S->>S: Update delivery_receipts(status="read")
+    S->>DB: Broadcast message.read event
+    S->>DC: Broadcast message.read event
+    DB->>DB: Update UI (read)
+    DC->>DC: Update UI (read)
+```
+
+## Key Challenges
+
+### Device List Management
+- User sees list of active devices
+- Can revoke any device remotely (invalidate session in Redis + DB)
+- Revoked device gets disconnected immediately
+
+```mermaid
+sequenceDiagram
+    participant DA as Device A
+    participant S as Server
+    participant R as Redis
+    participant DB as DB
+    participant DB as Device B
+
+    DA->>S: DELETE /devices/dev_002
+    S->>R: Delete session in Redis
+    S->>DB: Delete session in DB
+    S->>DB: Push disconnect event to Device B
+    DB->>DB: Closed (must re-authenticate)
+```
+
+### Timestamp Consistency
+
+Problem: Different devices may send messages with different local timestamps.
+
+Solution:
+- Server assigns canonical timestamp on write (always)
+- Client uses server timestamp for display and ordering
+- Client-local timestamps only used for draft/pre-send state
+
+### Offline Device Handling
+
+| Scenario | Behavior |
+|---|---|
+| Device offline, user reads on another device | Push notification triggers device to sync |
+| Device offline, new message sent | Push notification with preview; device fetches full message on connect |
+| Device long-inactive (>30 days) | Mark as stale; may be removed from active device list |
+
+## Security Implications
+
+- Each device has independent session token
+- Revoking one device doesn't affect others
+- New device registration may require re-verification (SMS/OTP)
+- All devices share E2EE key material (per-device ratchet chains)

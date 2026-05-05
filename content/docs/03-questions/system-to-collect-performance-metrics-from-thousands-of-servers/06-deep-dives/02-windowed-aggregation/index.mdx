@@ -1,0 +1,152 @@
+---
+title: "Deep Dive: Windowed Aggregation"
+description: "Flink-based tumbling window aggregation with late-arrival handling and histogram merging"
+---
+
+## Flink Window Design
+
+The aggregation service processes the Kafka `metrics-write` topic using Apache Flink streaming jobs. Each job is keyed by `series_key` to ensure all data for a metric series is processed by the same Flink task.
+
+**Flink job topology:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Flink Job Manager                          │
+│                                                              │
+│  Source: Kafka (metrics-write)                               │
+│   ├─ Partition 0 → TaskManager-1 (series_key range 0-31)    │
+│   ├─ Partition 1 → TaskManager-1 (series_key range 32-63)   │
+│   └─ Partition 127 → TaskManager-8 (series_key range 192-)  │
+│                                                              │
+│  Transform: KeyBy(series_key)                                │
+│    → Ensures all data for one series goes to same task       │
+│                                                              │
+│  Window: TumblingWindow(5m)                                  │
+│    → Fixed-size, non-overlapping windows                     │
+│    → Window aligned to epoch boundaries (00:00, 00:05, etc.) │
+│                                                              │
+│  ProcessWindowFunction:                                      │
+│    For each key + window:                                    │
+│      1. Collect all values                                   │
+│      2. Compute avg, min, max, count, rate                   │
+│      3. Merge histogram buckets                              │
+│      4. Emit aggregated record                               │
+│                                                              │
+│  Sink: HBase/Cassandra (aggregated_store)                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Parallelism:**
+
+```
+Kafka partitions: 128
+Flink tasks per partition: 2 (so 256 total tasks)
+TaskManager nodes: 32 (8 tasks per node)
+```
+
+Each task processes ~78K series_keys (20M series / 256 tasks). This distributes load evenly because series_keys are uniformly hashed across partitions.
+
+**Aggregation computation:**
+
+```go
+func aggregateValues(values []float64, points []HistogramPoint) AggregatedRecord {
+    return AggregatedRecord{
+        Avg:  sum(values) / len(values),
+        Min:  min(values),
+        Max:  max(values),
+        Count: len(values),
+        Rate: (values[len(values)-1] - values[0]) / window_duration,
+        // Histogram merging done per-bucket (see next section)
+        P50: percentile(values, 0.5),
+        P95: percentile(values, 0.95),
+        P99: percentile(values, 0.99),
+    }
+}
+```
+
+## Histogram Merging
+
+Histograms are the hardest aggregation because you can't average bucket counts across windows. You must merge the raw bucket definitions.
+
+**Problem:** If window A has bucket `[0, 10ms): 500 counts` and window B has `[0, 10ms): 300 counts`, the merged bucket count is 800. But if the bucket boundaries differ between windows (agent-configurable), you need to interpolate.
+
+**Solution: Fixed bucket boundaries system-wide.**
+
+```
+Histogram bucket boundaries (shared config, updated via Flink config center):
+  [0, 1ms), [1, 5ms), [5, 10ms), [10, 25ms), [25, 50ms),
+  [50, 100ms), [100, 250ms), [250, 500ms), [500ms, 1s),
+  [1s, 2.5s), [2.5s, 5s), [5s, 10s), [10s, +inf)
+```
+
+Because all agents use the same bucket boundaries, merging is a simple addition:
+
+```
+For each bucket i:
+  merged_count[i] = sum(values[j].bucket_count[i] for all j in window)
+  merged_sum = sum(values[j].bucket_sum for all j in window)
+```
+
+For p50/p95/p99, we compute from the merged bucket counts using linear interpolation between bucket boundaries.
+
+**Histogram storage in aggregated store:**
+
+```
+Columns per series_key + timestamp:
+  - hist_count[N]     (one column per bucket: 0, 1, 2, ... N-1)
+  - hist_sum          (sum of all observations)
+  - hist_total_count  (total number of observations)
+  - hist_p50          (pre-computed from merged buckets)
+  - hist_p95
+  - hist_p99
+```
+
+## Late-Arrival Handling
+
+Events arriving after the window has closed are handled with a two-tier approach.
+
+**Primary path: 1-minute grace period**
+
+Flink's `allowedLateness(1m)` keeps windows open for 1 extra minute to accept late events. Late events trigger a recomputation of the aggregation for that window.
+
+```
+Window: [00:00, 00:05)
+Watermark: 00:06 (5min window + 1min allowedLateness)
+
+Events arriving before 00:06:
+  → Added to window, aggregation recomputed
+  
+Events arriving after 00:06:
+  → Sent to dead-letter queue for manual processing
+  → NOT included in the 5min rollup (acceptable for monitoring)
+```
+
+**Fallback path: query-time repair**
+
+If a series has a gap in the 5-minute rollup (because the agent was down), the query service detects the gap and fills it from raw store data.
+
+```
+Query: GET /query?query=cpu_usage&start=00:00&end=01:00&step=5m
+  → Returns 12 data points for the 1h window
+  → If point at 00:15 is missing → query service reads raw store
+    for 00:10-00:20 and computes a replacement
+  → Result: 12 points, gap-filled
+```
+
+**Watermark strategy:**
+
+```
+Event-time vs processing-time:
+  - Events use event-time (agent's timestamp)
+  - Watermark = processing_time - 1min grace
+  - If agent is sending delayed data (e.g., from a recovery), watermark
+    allows the data to be processed within the grace period
+```
+
+**Edge case: clock skew between agents**
+
+Agents may have clocks that drift by up to ±2 seconds from the collector. This is handled by:
+
+1. **Agent-side NTP**: All agents run chrony/ntpd with ±0.1s accuracy
+2. **Collector-side drift detection**: If a series' timestamps jump >10s between consecutive batches, the collector flags the agent and resets the dedup window
+3. **Window alignment tolerance**: 5-minute tumbling windows aligned to epoch (00:00, 00:05) have ±150s tolerance on each side — ±2s clock skew is well within this

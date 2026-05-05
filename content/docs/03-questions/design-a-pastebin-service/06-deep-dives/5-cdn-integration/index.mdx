@@ -1,0 +1,167 @@
+---
+title: CDN Integration
+description: Deep dive into CDN edge caching strategy for paste reads.
+---
+
+### CDN Integration
+
+#### Challenge
+
+Serving ~100M reads/day with near-zero origin load while enforcing per-paste TTL (from creation time to `expires_at`) and preventing `private` pastes from leaking to edge caches. The CDN must handle a viral paste that spikes from 0 to 100K reads in seconds without overwhelming the origin.
+
+**Key constraints**:
+- CDN only caches `public` and `unlisted` pastes. `private` pastes must never reach the CDN — they bypass it entirely.
+- Each paste has a different expiration time (600s, 3600s, 86400s, 604800s, or never). CDN TTL must be dynamically set per paste, not globally.
+- CDN caches responses at the URL level (`/p/\{key\}`). URL changes (e.g., paste updated — though pastes are immutable) would require cache invalidation.
+- Cache key collisions: Two different pastes must never serve each other's content.
+
+#### Solution: Cloudflare Edge Caching with Dynamic TTL and Origin Shield
+
+**1. CDN Caching Rules**
+
+```
+Cache Key: GET https://pastebin.com/p/\{paste_key\}
+
+Cache-Control header (set by origin):
+  public, max-age=<remaining_seconds>, s-maxage=<remaining_seconds>, immutable
+
+Where:
+  remaining_seconds = max(0, expires_at - NOW())
+  If remaining_seconds &lt;= 60 → Cache-Control: no-store (TTL too short for CDN value)
+  If expires_at is NULL (never expire) → Cache-Control: public, max-age=31536000, s-maxage=31536000 (1 year)
+```
+
+- **`public`**: Allows CDN to cache the response.
+- **`max-age`**: Browser cache lifetime.
+- **`s-maxage`**: CDN cache lifetime (overrides `max-age` for shared caches).
+- **`immutable`**: Tells browsers the response never changes, so skip conditional requests entirely.
+
+**2. Cache Bypass Rules**
+
+| Condition | Action |
+|-----------|--------|
+| `access_mode = private` | Origin-only; set `Cache-Control: private, no-store`. Note: private pastes use a separate URL path `/private/` which is excluded via a CDN bypass rule — no response header inspection needed. |
+| Request has `Authorization` header | Bypass cache (authenticated users get higher rate limits, tracked per-request) |
+| Request has `If-None-Match` / `If-Modified-Since` | Serve from CDN cache; return 304 Not Modified if still valid |
+| `remaining_seconds` less than or equal to 60 | No-store (TTL too short for CDN to benefit) |
+
+**3. Edge Configuration (Cloudflare)**
+
+```yaml
+# Cloudflare Cache Rules (modern API)
+- Name: "Paste content — honor origin Cache-Control"
+  Filter: "http.request.uri contains '/p/'"
+  Settings:
+    action: "cache"
+    ttl: 0  # defer to origin Cache-Control max-age/s-maxage
+    cache_everything: true
+
+- Name: "Private paste — never cache"
+  Filter: "http.request.uri contains '/private/'"
+  Settings:
+    action: "bypass"
+    ttl: 0
+
+- Name: "Health check — never cache"
+  Filter: "http.request.uri contains '/health'"
+  Settings:
+    action: "bypass"
+    ttl: 0
+```
+
+**Key distinction**: The main paste rule uses `cache_level: "cache_everything"` with `ttl: 0`, which tells Cloudflare to **honor the origin's `Cache-Control` headers** exactly. This is critical because each paste has a unique TTL (`expires_at`). A fixed TTL would cause some pastes to expire too early and others too late.
+
+The "Private paste" rule uses `cache_level: "bypass"` because private pastes explicitly set `Cache-Control: private, no-store` on the origin response — this rule is a safety net to ensure no edge case leaks private content into the CDN.
+
+If `cache_level: "cache_everything"` is not available in your Cloudflare plan, the equivalent is `cache_level: "bypass"` combined with a custom cache rule that reads the `Cache-Control` header. In Cloudflare's terminology, the modern "Cache Rules" API uses `cache-rule: \{ status: "cache", ttl: 0 \}` to achieve the same effect.
+
+**4. ETag and Conditional GET Support**
+
+```
+Client → GET /p/abc123
+  → CDN cache hit:
+    → Client has If-None-Match: "a7f3c8e9d1b2..."
+    → CDN: compare ETag with cached variant
+    → Match → 304 Not Modified (no body transfer)
+    → No match → 200 with fresh content + new ETag
+  → CDN cache miss:
+    → Origin generates ETag from content_hash
+    → Response header: ETag: "a7f3c8e9d1b2..."
+    → Store in CDN with ETag variant
+```
+
+- **ETag value**: SHA-256 `content_hash` as the ETag. Since content is immutable, the hash never changes — this is a stable identifier.
+- **304 responses** are served entirely from the CDN cache (no origin call), saving bandwidth for clients that just checked for updates.
+
+**5. Private Paste Routing — Distinct URL Pattern**
+
+`private` pastes use a separate URL path (`/private/`) that the CDN rules explicitly exclude. This guarantees no private content reaches the CDN edge:
+
+```
+Public/Unlisted: GET https://pastebin.com/p/\{paste_key\}
+Private:         GET https://pastebin.com/private/\{paste_key\}
+```
+
+```
+Request flow for private paste:
+  Client → CDN (Cloudflare)
+    → CDN rule: path contains '/private/' → bypass cache → forward to origin
+    → Origin: Paste Service serves content directly
+    → Response headers: Cache-Control: private, no-store, no-cache
+    → CDN: does NOT cache this response
+```
+
+This approach eliminates ambiguity — the URL pattern itself determines CDN routing. No response header inspection is needed, so the first request for a private paste is never cached.
+
+**6. Cache Warming on Write**
+
+When a new paste is created, it is not pre-warmed into the CDN (CDN caches on first read). However, a **cache warm header** is set on the write response:
+
+```
+Cache-Control: public, max-age=<remaining_seconds>, s-maxage=<remaining_seconds>, immutable
+```
+
+This ensures the very first read (which triggers the CDN cache store) gets the correct TTL from the origin.
+
+**7. Purge/Invalidate on Delete**
+
+```
+Client → DELETE /api/v1/pastes/\{key\}
+  → Origin updates DB status to 'deleted'
+  → Origin purges CDN cache:
+    → Cloudflare Purge API: POST /cdn_caching/cache_purge
+      \{ "files": ["https://pastebin.com/p/{key\}"] }
+  → Return 204
+```
+
+- **Purge is fire-and-forget**: If the purge fails, the CDN serves stale content for up to the remaining TTL. The client will then get the response from origin, which checks `expires_at` and returns 410 Gone. The stale CDN entry is a maximum-TTL safety net.
+- **Alternative**: Use versioned URLs (`/p/\{key\}/v\{version\}`) instead of purges. Not needed here because pastes are immutable — delete is the only mutation.
+
+**8. CDN Performance**
+
+| Metric | Target | Rationale |
+|--------|--------|-----------|
+| CDN PoP coverage | 200+ PoPs globally | Cloudflare network |
+| P95 CDN response time | < 20ms | Edge cache hit, no origin call |
+| P95 cache miss (CDN → origin) | < 50ms | Origin serves + CDN stores |
+| Origin load reduction | > 85% of reads served by CDN | Based on 100:1 read/write ratio and viral paste distribution |
+| Cache hit rate (public pastes) | > 90% | TTL up to 7 days for most pastes |
+
+**9. Edge Case Handling**
+
+| Scenario | Handling |
+|----------|----------|
+| Viral paste (10K+ reads/min) | CDN edge absorbs all reads after first cache store; origin sees only 1–2 fetches |
+| CDN outage | Client falls back to origin; origin serves from Redis + object storage |
+| Stale cache after TTL expiry | Origin has the source of truth (DB check + `expires_at` validation); stale content is purged within TTL window |
+| Origin responds with 5xx | CDN caches 5xx by default; set `Cache-Control: no-store` on 5xx responses at the origin, or configure a Cloudflare Error Page that does not cache 5xx responses |
+| Large paste (> 64KB) | Enforced at API gateway level — no request exceeds the 64KB paste size limit (Section 1), so CDN size limits are never reached |
+
+**10. CDN vs. Local LRU Coordination**
+
+The CDN handles the bulk of public/unlisted read traffic (Tier 1). The Local LRU and Redis (Tiers 2–3) handle:
+- `private` pastes (CDN-bypassed)
+- CDN cache misses (TTL expired)
+- Requests from users with `Cache-Control: no-cache` headers
+
+These tiers operate independently of the CDN — they serve as the origin's protection layer against backend load when the CDN has nothing to offer.

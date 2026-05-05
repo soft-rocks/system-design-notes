@@ -1,0 +1,147 @@
+---
+title: High Level Design
+description: Architecture overview, service responsibilities, and key design decisions
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    subgraph Clients["Client Tier"]
+        C1["Desktop Client"]
+        C2["Mobile Client"]
+        C3["Web Client"]
+        C4["3rd-party Integrations"]
+    end
+
+    subgraph Edge["Edge / CDN Tier"]
+        CDN["CDN · Static Content"]
+        EDGE["TLS Termination · DDoS Protection"]
+    end
+
+    subgraph LBs["Load Balancers"]
+        LB1["REST Proxy LB"]
+        LB2["Sync WS LB"]
+        LB3["Public Link LB"]
+    end
+
+    subgraph Gateways["Gateway Tier"]
+        GW_API["API Gateway / Auth\nJWT · Rate Limit · Routing"]
+        GW_SYNC["Sync Gateway\nConnection Mgmt · Heartbeats · Backpressure"]
+        GW_PUB["Public Link Proxy\nToken Auth"]
+    end
+
+    subgraph Services["Microservice Tier"]
+        S1["Metadata Service\nCRUD · Versioning"]
+        S2["Storage Service\nObject Lifecycle"]
+        S3["Sync Engine\nDiff · WebSocket Push"]
+        S4["Share / Access Service\nPermissions · Inheritance"]
+        S5["Search Service\nFull-text · Indexing"]
+        S6["Dedup & Integrity\nHash Check"]
+        S7["Conflict Resolver\nOT / CRDT Merge"]
+        S8["Notification Service\nEmail · Push · In-app"]
+        EVENTBUS["Event Bus (Kafka)\nAll services publish/consume"]
+    end
+
+    subgraph Data["Data Layer"]
+        RDS["RDS Primary\nUser & Metadata"]
+        RDS_R["RDS Read Replica"]
+        S3_OBJ["S3 / GCS\nFile Body · Versions"]
+        REDIS["Redis Cache\nSession · Permissions · Hot Data"]
+    end
+
+    subgraph Background["Background Jobs"]
+        CRON["Cron / Scheduler\nGC · Index Rebuild · Quota"]
+    end
+
+    Clients -->|"HTTPS / wss"| Edge
+    Edge --> LBs
+    LB1 --> GW_API
+    LB2 --> GW_SYNC
+    LB3 --> GW_PUB
+
+    GW_API --> Services
+    GW_SYNC --> Services
+    GW_PUB --> S4
+
+    S1 --> RDS
+    S2 --> S3_OBJ
+    S3 --> REDIS
+    S4 --> REDIS
+    S5 --> RDS
+    S6 --> S3_OBJ
+    S7 --> EVENTBUS
+    S8 --> EVENTBUS
+
+    S1 -.-> EVENTBUS
+    S2 -.-> EVENTBUS
+    S3 -.-> EVENTBUS
+    S4 -.-> EVENTBUS
+    S5 -.-> EVENTBUS
+    S6 -.-> EVENTBUS
+    S7 -.-> EVENTBUS
+    S8 -.-> EVENTBUS
+
+    RDS --> RDS_R
+
+    CRON -.-> S2
+    CRON -.-> S5
+```
+
+## Service Responsibilities
+
+### Metadata Service
+- Central service managing File, FileReference, User records.
+- RDS (PostgreSQL) with read replicas.
+- Sharding by userId for isolation and horizontal scale — each user's metadata lives on one shard.
+- Each user's data is strictly owned — no cross-user joins on File/Meta tables.
+
+### Storage Service
+- Wraps cloud object storage (S3 / GCS / MinIO).
+- Manages object lifecycle: put, get, delete by ObjectRef (bucket + key).
+- Handles encryption at rest (KMS-managed keys).
+- Object key format: `\{sha256_prefix\}/\{contentHash\}` (content-addressable; multiple versions across users share the same object).
+- **Deduplication:** `DedupCheck(sha256)` before write — if hash exists, reuse existing object. Reference-count each content object; garbage-collect when refcount reaches zero. Shared files' versions all point to the same object, so refcount survives all users.
+- **Integrity:** SHA256 verified on upload; content-addressable keys make accidental corruption detectable.
+
+### Sync Engine
+- Consumes SyncOperation journal entries.
+- Computes diffs between sync checkpoints.
+- Manages WebSocket connections to clients for real-time push.
+- Handles backpressure — drops idle connections, queues bursty clients.
+
+### Share / Access Service
+- Enforces permissions on every request via Permission service.
+- Permission cache (Redis) to avoid database lookups per request.
+- Public token service for share links — generates unguessable UUIDs.
+
+### Search Service
+- Maintains a reverse index of file names + content (for indexed types).
+- Elasticsearch cluster with a shared index per data type (e.g., `files_index`, `content_index`), using `userId` as the routing key to ensure all of a user's data lands on the same shard. At 100M users, separate per-tenant indexes are infeasible — a shared index with routing is the standard pattern.
+- Content extracted via worker pool (Tika for Office docs, OCR for images/PDFs).
+
+### Dedup & Integrity Service
+- Content-addressable storage: compute sha256 before write.
+- If hash exists, reuse existing object — no duplicate writes.
+- **Reference counting:** Each FileVersion record holds a reference to the content object. On upload, if hash exists, increment refcount; on version delete, decrement. Object is garbage-collected only when refcount reaches zero.
+- For shared files, a single content object may have many FileVersion references across different users — refcount ensures the object outlives all of them.
+
+### Conflict Resolver
+- For text files: OT (Operational Transformation) or CRDT-based merge.
+- For binary files: last-write-wins + conflict copy ("conflicted copy").
+- Conflict events published for user notification.
+
+### Notification Service
+- Sends emails, push notifications when files are shared or conflicts arise.
+
+## Key Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Data isolation | Per-user sharding on userId | No cross-user joins; scales horizontally |
+| Sync model | Event journal + client polling / WebSocket | Handles offline-first; strong ordering |
+| Versioning | Content-addressable + ref counting | Enables dedup, space savings |
+| Storage | Cloud object storage (S3/GCS) | Durability, scale, cost-effective |
+| Database | PostgreSQL (RDS) | ACID for metadata; well-understood |
+| Cache | Redis | Sessions, permission cache, hot metadata |
+| Events | Kafka | Ordered, durable, fan-out for consumers |

@@ -1,0 +1,76 @@
+---
+title: High Level Design
+description: Architecture overview, component diagram, and technology choices for Google Calendar.
+---
+
+## Architecture Overview
+
+- **Service topology:** API Gateway → Event Service (core) + RecurrenceEngine + AvailabilityService + NotificationService + SyncService + SearchService + ShareService
+- **Data layers:** CockroachDB (primary store, multi-region active-active), Redis (cache + ACL), Kafka (event stream), Elasticsearch (search index)
+- **Key design decisions:**
+  1. Multi-primary CockroachDB for active-active cross-region → RPO < 1s, local read/write latency
+  2. Recurrence expansion at read time (not pre-materialized) → storage efficiency, consistency, but CPU cost on calendar view loads
+  3. Write-through Redis cache with short TTL (30s) → balances freshness with DB offload
+  4. Kafka event stream for fan-out → decouples search indexing, notifications, analytics from critical path
+
+---
+
+## Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              Clients                                     │
+│  Web   Mobile   CLI  第三方(Exchange/CalDAV)   Apps(Contacts, Meet)    │
+└────────────┬────────────────────────────────────────────────────────────┘
+             │ HTTPS / WebSocket / gRPC
+             ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        CDN / Load Balancer                              │
+│                     (Global, anycast DNS + GFE)                         │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        API Gateway                                      │
+│  JWT Auth │ Rate Limit │ TLS 1.3 │ Request Routing                      │
+│          Region A         Region B         Region C                     │
+└──────┬──────────────┬──────────────┬────────────────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Event Service (core)                             │
+│  CRUD │ Validation │ Overlap Check │ ETag Management │ Partial Update  │
+└──┬──────────┬──────────┬──────────┬──────────┬─────────────────────────┘
+   │          │          │          │          │
+   ▼          ▼          ▼          ▼          ▼
+┌──────┐ ┌─────────┐ ┌────────┐ ┌──────────┐ ┌────────────┐
+│Redis │ │Cockroach│ │Kafka   │ │Recurrence│ │Share       │
+│Cache │ │DB (AA)  │ │Stream │ │Engine    │ │Service     │
+└──────┘ └─────────┘ └────────┘ └──────────┘ └────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          ▼                     ▼                     ▼
+   ┌────────────┐       ┌────────────┐       ┌────────────┐
+   │Elastic-   │       │Notification│       │   Analytics│
+   │search     │       │  Service   │       │  Pipeline  │
+   └────────────┘       └────────────┘       └────────────┘
+          │                     │
+          ▼                     ▼
+   ┌────────────┐       ┌─────────────────────────────────┐
+   │  Sync      │       │     WebSocket / Webhook / Poll  │
+   │  Service   │       │     (Real-time event push)      │
+   └────────────┘       └─────────────────────────────────┘
+```
+
+---
+
+## Technology Choices
+
+| Component | Choice | Why | Alternative | Tradeoff |
+|-----------|--------|-----|-------------|----------|
+| Primary DB | CockroachDB | Multi-region active-active, SQL schema, auto-sharding, Raft | Spanner, YugabyteDB | CockroachDB has lower ops overhead; Spanner has stronger global consistency but higher latency |
+| Cache | Redis Cluster | Write-through caching, ACL lookups, &lt;2ms latency | Memcached | Redis has persistence, pub/sub (for sync), richer data structures |
+| Event Stream | Kafka | Fan-out, replay, ordering guarantees | Pulsar, Kinesis | Mature ecosystem; Pulsar has better multi-tenancy but less maturity |
+| Search | Elasticsearch | Full-text with relevance, incremental indexing | Solr, Algolia | Kafka connector integration; managed alternatives less flexible |
+| Cross-region | CockroachDB Raft | Built-in multi-region, auto failover, &lt;1s RPO | Custom async replication | Raft adds write latency but guarantees consistency |
+| Real-time sync | WebSocket + CDC | Push-based, &lt;1s latency, connection pooling | SSE, polling | Bidirectional and persistent; SSE is simpler but unidirectional |

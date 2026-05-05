@@ -1,0 +1,220 @@
+---
+title: "Data Flow"
+description: "Data flow for the performance metrics collection system — write path, read path, and aggregation"
+---
+
+## Write Path
+
+When an agent collects metrics from a server, it batches and pushes them to the ingestion layer.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Server Host (10,000 hosts)                                       │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────┐        │
+│  │  Agent Process (StatsD / Node Exporter / OTel)       │        │
+│  │                                                      │        │
+│  │  1. Scrape metrics from:                             │        │
+│  │     - /proc/stat (CPU)                               │        │
+│  │     - /proc/meminfo (memory)                         │        │
+│  │     - /sys/block/* (disk I/O)                        │        │
+│  │     - /proc/net/dev (network)                        │        │
+│  │     - Application SDK (HTTP requests, latencies)     │        │
+│  │                                                      │        │
+│  │  2. Batch by 10s interval                            │        │
+│  │  3. TCP push to nearest collector endpoint           │        │
+│  │     (or UDP for non-critical metrics)                │        │
+│  └──────────────┬───────────────────────────────────────┘        │
+└─────────────────┼────────────────────────────────────────────────┘
+                  │
+                  │ TCP: keep-alive connection, batch every 10s
+                  │ Max: 10K series, 100K samples per batch
+                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Ingestion Layer                                │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │  Collector Service (10 instances, behind LB)             │     │
+│  │                                                          │     │
+│  │  1. Parse and validate payload                            │     │
+│  │  2. Dedup: check Redis (same series_key + timestamp       │     │
+│  │     within 60s window → drop if duplicate)               │     │
+│  │  3. Write to Kafka: partition = hash(series_key)          │     │
+│  │  4. Acknowledge to agent (TCP) or silently drop (UDP)     │     │
+│  └────────────────────────┬────────────────────────────────┘     │
+│                           │                                       │
+└───────────────────────────┼───────────────────────────────────────┘
+                            │
+                            │ Kafka topic: metrics-write
+                            │ Partition: hash(series_key) ensures
+                            │   all data for a series goes to same partition
+                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Time-Series Store                              │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │  HBase / Cassandra (sharded by series_key)               │     │
+│  │                                                          │     │
+│  │  Partition: series_key                                   │     │
+│  │  Clustering: timestamp DESC                              │     │
+│  │  Columns: value, ingest_time                             │     │
+│  │  TTL: 24h (automatic expiration of raw data)             │     │
+│  │                                                          │     │
+│  │  Row size: ~5,000 data points per series × 24h          │     │
+│  │          = ~3.5KB per series × 20M series ≈ 70 TB       │     │
+│  └─────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Deduplication Logic
+
+```
+Dedup Service (Redis):
+  Key: dedup:\{series_key\}:\{timestamp_bucket_10s\}
+  Value: 1
+  TTL: 60s (covers agent retransmission window)
+
+Collector:
+  if redis.setnx(dedup_key, 1, expire=60) == true:
+    write_to_kafka()
+  else:
+    // duplicate detected, skip
+    log("duplicate dropped", series_key, timestamp)
+```
+
+## Read Path
+
+Dashboard users and API consumers query metrics through the query service.
+
+```
+┌──────────────────┐
+│  Dashboard / API │
+└───────┬──────────┘
+        │ GET /api/v1/query?query=avg(cpu_usage)&start=...&end=...
+        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Query Gateway                                  │
+│                                                                   │
+│  1. Rate limit per user/token                                     │
+│  2. Check query cache (same query string + time range)           │
+│     → Hit: return cached result (TTL 2m)                          │
+│     → Miss: route to Query Service                                │
+└───────────────┬──────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Query Service                                  │
+│                                                                   │
+│  1. Parse query → identify metric name + label filters           │
+│  2. Look up series_keys from Label Index                         │
+│     (Cassandra secondary index on metric_name + labels)          │
+│     Returns: ~100–1000 matching series_keys                       │
+│                                                                   │
+│  3. Determine data source based on time range:                   │
+│     ┌──────────────────────────────────────────────────────────┐ │
+│     │ Time Range       │ Source                              │ │
+│     ├──────────────────────────────────────────────────────────┤ │
+│     │ < 5 minutes      │ Raw store (HBase, 10s granularity)  │ │
+│     │ 5m – 1h          │ Aggregated store (5-min rollups)    │ │
+│     │ 1h – 90 days     │ Aggregated store (1h rollups)       │ │
+│     │ > 90 days        │ Aggregated store (24h rollups)      │ │
+│     └──────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  4. Fan-out read to all relevant shards (one per series_key)     │
+│     Read from:                                                     │
+│     - Raw store (for recent data)                                  │
+│     - Aggregated store (for historical data)                      │
+│                                                                   │
+│  5. Merge results from all shards                                 │
+│  6. Apply query operations (avg, rate, histogram percentiles)    │
+│  7. Downsample to match requested step                            │
+│  8. Cache result (TTL 2m)                                         │
+│  9. Return to client                                              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Query Caching
+
+Since dashboard queries often repeat (same query, same time range), a two-level cache reduces load:
+
+| Cache | What | TTL | Location |
+| --- | --- | --- | --- |
+| L1 | Query result hash | 2m | Local (per Query Service instance) |
+| L2 | Query result hash | 5m | Redis (shared across instances) |
+
+## Aggregation Flow
+
+Raw metrics are downsampled into increasingly coarse rollups to reduce storage and improve query performance.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   Kafka Topic: metrics-write                  │
+│  Partitioned by series_key — each partition has 1–2 consumer  │
+└──────────┬───────────────────────────────────────────────────┘
+           │
+           │ consume (Aggregation Consumer)
+           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│              Aggregation Service                                  │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  Windowed Processor (Flink/Spark Streaming)                 │  │
+│  │                                                             │  │
+│  │  Key: series_key                                            │  │
+│  │  Window: 5 minutes                                          │  │
+│  │                                                             │  │
+│  │  For each window:                                           │  │
+│  │    1. Collect all raw values in the window                  │  │
+│  │    2. Compute rollups: avg, min, max, count, rate           │  │
+│  │    3. For histograms: merge bucket counts                    │  │
+│  │    4. Compute p50/p95/p99 percentiles                        │  │
+│  └───────────────┬────────────────────────────────────────────┘  │
+│                  │                                                │
+│                  ▼                                               │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Tiered Storage Writer                                    │   │
+│  │                                                           │   │
+│  │  5-min rollup  → write to Aggregated Store (90d retention)│   │
+│  │  1h rollup     → write to Aggregated Store (90d retention)│   │
+│  │  24h rollup    → write to Daily Rollup Store (1y ret.)   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   Aggregated Store (HBase/Cassandra)              │
+│                                                                   │
+│  Table: aggregated_metrics                                        │
+│  Partition: series_key                                            │
+│  Clustering: timestamp DESC                                       │
+│  Columns: avg, min, max, count, rate                              │
+│  TTL: 90d (auto-expire)                                           │
+│                                                                   │
+│  Table: daily_rollups                                             │
+│  Partition: series_key                                            │
+│  Clustering: day (date)                                           │
+│  Columns: daily_avg, daily_max, daily_min                         │
+│  TTL: 1y (auto-expire)                                            │
+│                                                                   │
+│  Storage savings:                                                 │
+│  ┌──────────────┬───────────────┬───────────┬─────────────┐     │
+│  │ Granularity  │ Data Points   │ Storage   │ Retention   │     │
+│  ├──────────────┼───────────────┼───────────┼─────────────┤     │
+│  │ 10s          │ ~8,640/day    │ ~70 TB    │ 24h         │     │
+│  │ 5min         │ ~288/day      │ ~2.9 TB   │ 90 days     │     │
+│  │ 1h           │ ~24/day       │ ~240 GB   │ 90 days     │     │
+│  │ 24h          │ 1/day         │ ~0.8 GB   │ 1 year      │     │
+│  └──────────────┴───────────────┴───────────┴─────────────┘     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Window Alignment
+
+To avoid data loss during window processing, a 2-minute tumbling window with 1-minute late-arrival tolerance is used:
+
+```
+Window: [00:00, 00:05) — but allows events up to 00:06
+Aggregation starts after: 00:06 (2-minute grace period)
+```
+
+Late events within the tolerance window are handled by re-aggregating from raw data. Events outside tolerance are dropped (acceptable for monitoring data).

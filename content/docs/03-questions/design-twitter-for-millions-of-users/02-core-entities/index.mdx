@@ -1,0 +1,154 @@
+---
+title: Core Entities
+description: Entity definitions, relationships, and indexing strategy for the Twitter design.
+---
+
+## Entity Definitions
+
+### User
+Represents a registered account.
+
+```
+User {
+  id: long (auto-increment or snowflake) // Primary key, 64-bit integer
+  username: string (unique, indexed)       // e.g., "elonmusk"
+  display_name: string                    // e.g., "Elon Musk"
+  password_hash: string                   // Never store plain-text; bcrypt/scrypt
+  email: string (unique, indexed)
+  bio: string (max 160 chars)
+  location: string
+  website: string
+  profile_image_url: string               // CDN URL for profile photo
+  banner_image_url: string                // CDN URL for header photo
+  followers_count: int                    // Cache, denormalized
+  following_count: int                    // Cache, denormalized
+  tweets_count: int                       // Cache, denormalized
+  verified: boolean
+  created_at: timestamp
+  updated_at: timestamp
+  deleted: boolean                        // Soft delete flag
+}
+```
+
+### Tweet
+A single post created by a user.
+
+```
+Tweet {
+  id: long (auto-increment or snowflake) // Primary key, 64-bit integer
+  author_id: long (FK -> User.id)       // Foreign key to User
+  text: string (max 280 chars)
+  media_urls: string[]                  // Array of media URLs (JSON serialized)
+  in_reply_to_tweet_id: long (nullable) // FK -> Tweet.id, for thread linking
+  quoted_tweet_id: long (nullable)      // FK -> Tweet.id, for quote tweets
+  retweet_of_tweet_id: long (nullable)  // FK -> Tweet.id, for retweets
+  created_at: timestamp
+  updated_at: timestamp
+  deleted: boolean                      // Soft delete flag
+  location_lat: double (nullable)       // Optional geotag
+  location_lon: double (nullable)
+}
+```
+
+### Follow
+Represents a follow relationship between two users.
+
+```
+Follow {
+  follower_id: long (FK -> User.id)     // The user who is following
+  following_id: long (FK -> User.id)    // The user being followed
+  created_at: timestamp
+  PK: (follower_id, following_id)       // Composite primary key
+}
+```
+
+### Like
+Represents a like on a tweet.
+
+```
+Like {
+  id: long                              // Primary key (for ordering)
+  user_id: long (FK -> User.id)         // User who liked
+  tweet_id: long (FK -> Tweet.id)       // Tweet that was liked
+  created_at: timestamp
+  PK: (user_id, tweet_id)               // Composite unique key
+  Index: tweet_id -> for counting & listing likes
+}
+```
+
+### Notification
+Represents a user-facing notification event.
+
+```
+Notification {
+  id: long                              // Primary key
+  recipient_id: long (FK -> User.id)    // User receiving the notification
+  actor_id: long (FK -> User.id)        // User who triggered the action
+  tweet_id: long (FK -> Tweet.id)       // Related tweet (nullable)
+  type: enum \{LIKE, RETWEET, FOLLOW, REPLY, MENTION\}
+  read: boolean
+  created_at: timestamp
+  Index: recipient_id + created_at      // For user's notification feed
+}
+```
+
+---
+
+## Relationships
+
+### User ↔ Tweet (1:N)
+- One user creates many tweets.
+- Tweets reference `author_id` via foreign key.
+- Used for: user timeline, profile page, search indexing.
+
+### Tweet ↔ Tweet (Self-referencing, 1:N)
+- A tweet can have many replies (child tweets).
+- A tweet can reference one parent tweet (reply/quote).
+- Used for: conversation threads, quote tweets, retweets.
+
+### User ↔ User (Follow graph, M:N)
+- Follow is a directed edge: follower → following.
+- Stored in the `Follow` table for relational DBs, or in a graph DB / adjacency list.
+- Used for: feed generation, follower list, following list.
+
+### User ↔ Like (1:N)
+- One user can like many tweets.
+- Unique constraint: a user can only like a tweet once.
+- Used for: like counts, user's liked tweets page.
+
+### User ↔ Notification (1:N)
+- One user receives many notifications.
+- Notifications are user-facing, stored by recipient.
+- Used for: notification feed, push/email notifications.
+
+---
+
+## Indexing Strategy
+
+### User Table
+- `PK`: id
+- `UNIQUE INDEX`: username
+- `UNIQUE INDEX`: email
+- `INDEX`: created_at (for "new users" listing)
+
+### Tweet Table
+- `PK`: id
+- `INDEX`: author_id + created_at DESC (user timeline query)
+- `INDEX`: created_at DESC (for search / trending)
+- `INDEX`: in_reply_to_tweet_id (for thread retrieval)
+- Full-text index on `text` (for tweet search)
+- Secondary indexes on geotags (location-based search)
+
+### Follow Table
+- `PK`: (follower_id, following_id) — composite unique key
+- `INDEX`: following_id + created_at (for "who's following X" queries)
+- Note: The adjacency list view is the primary query pattern: get all `following_id` for a given `follower_id`
+
+### Like Table
+- `PK`: (user_id, tweet_id) — composite unique key
+- `INDEX`: tweet_id + created_at DESC (for like listing on a tweet)
+
+### Notification Table
+- `PK`: id
+- `INDEX`: recipient_id + created_at DESC (user's notification feed, paginated)
+- `INDEX`: read + created_at (for filtering read/unread notifications)

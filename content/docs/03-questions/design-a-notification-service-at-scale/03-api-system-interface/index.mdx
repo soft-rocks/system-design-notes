@@ -1,0 +1,188 @@
+---
+title: API / System Interface
+description: REST/GraphQL APIs, internal gRPC services, worker protocol, and event bus for a distributed notification service.
+---
+
+## REST API
+
+All API paths are prefixed with `/api/v1`. Auth via tenant API key (header: `X-API-Key`). Rate-limited per tenant.
+
+### Send Notifications
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| POST | `/notifications` | Send a single notification | Tenant |
+| POST | `/notifications/batch` | Send to N recipients | Tenant |
+| POST | `/notifications/schedule` | Schedule a notification for later | Tenant |
+| GET | `/notifications/\{id\}` | Get notification status | Tenant |
+| GET | `/notifications` | List notifications (paginated) | Tenant |
+| POST | `/notifications/\{id\}/cancel` | Cancel a queued notification | Tenant |
+
+**Send Single Notification:**
+```json
+POST /api/v1/notifications
+{
+  "tenant_id": "acme-corp",
+  "template_id": "order-shipped",
+  "recipients": [
+    \{"user_id": "user-123", "address": "user@example.com"\}
+  ],
+  "channels": ["EMAIL", "PUSH"],
+  "priority": "HIGH",
+  "metadata": \{"order_id": "ORD-456"\}
+}
+```
+
+**Batch Send:**
+```json
+POST /api/v1/notifications/batch
+{
+  "tenant_id": "acme-corp",
+  "template_id": "flash-sale",
+  "recipients": [
+    \{"user_id": "user-1", "address": "user1@example.com"\},
+    \{"user_id": "user-2", "address": "user2@example.com"\},
+    ...
+  ],
+  "channels": ["EMAIL"],
+  "priority": "MEDIUM",
+  "scheduled_at": "2026-05-04T09:00:00Z"
+}
+```
+
+### Templates
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/templates` | Create a template |
+| GET | `/templates` | List templates |
+| GET | `/templates/\{id\}` | Get template details |
+| PUT | `/templates/\{id\}` | Update template |
+| DELETE | `/templates/\{id\}` | Soft-delete template |
+
+### User Preferences
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/users/\{userId\}/preferences` | Get user preferences |
+| PUT | `/users/\{userId\}/preferences` | Update preferences |
+| GET | `/tenants/\{tenantId\}/users/\{userId\}/preferences` | Tenant-level preference query |
+
+### Webhooks (Delivery Callbacks)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/webhooks` | Register a webhook |
+| GET | `/webhooks` | List webhooks |
+| DELETE | `/webhooks/\{id\}` | Delete webhook |
+
+### Health & Metrics
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| GET | `/metrics` | Prometheus metrics |
+| GET | `/tenants/\{tenantId\}/stats` | Per-tenant delivery stats |
+
+## gRPC Interface
+
+Internal service communication for notification dispatch.
+
+### NotificationService
+
+```protobuf
+service NotificationService {
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc SendBatch(SendBatchRequest) returns (SendBatchResponse);
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+  rpc StreamEvents(StreamRequest) returns (stream Event);
+}
+
+message SendRequest {
+  string tenant_id = 1;
+  string template_id = 2;
+  string content = 3;
+  Channel channel = 4;
+  string recipient_user_id = 5;
+  string recipient_address = 6;
+  Priority priority = 7;
+  map&lt;string, string&gt; metadata = 8;
+}
+
+message SendBatchRequest {
+  string tenant_id = 1;
+  string template_id = 2;
+  string content = 3;
+  repeated BatchRecipient recipients = 4;
+  repeated Channel channels = 5;
+  Priority priority = 6;
+}
+
+message BatchRecipient {
+  string user_id = 1;
+  string address = 2;
+}
+
+enum Channel {
+  PUSH = 0;
+  EMAIL = 1;
+  SMS = 2;
+  IN_APP = 3;
+  WEBHOOK = 4;
+  SLACK = 5;
+}
+
+enum Priority {
+  LOW = 0;
+  MEDIUM = 1;
+  HIGH = 2;
+  CRITICAL = 3;
+}
+```
+
+### DispatchService
+
+```protobuf
+service DispatchService {
+  rpc Dispatch(DispatchRequest) returns (DispatchResponse);
+  rpc ReportDelivery(DeliveryReport) returns (Status);
+  rpc ReceiveWebhook(WebhookPayload) returns (Status);
+}
+
+message DispatchRequest {
+  string notification_id = 1;
+  string recipient_id = 2;
+  Channel channel = 3;
+  string address = 4;
+  string content = 5;
+}
+```
+
+## Event Bus
+
+### Topics
+
+| Topic | Published By | Consumed By |
+|-------|-------------|-------------|
+| `notification.created` | API Service | Dispatch workers, analytics |
+| `notification.sent` | Dispatch workers | Analytics, audit log |
+| `notification.failed` | Dispatch workers | Retry queue, alerting |
+| `notification.read` | Push/In-app service | Analytics |
+| `notification.opt_out` | User preference service | Audit, compliance |
+| `template.updated` | Template service | Cache invalidation |
+
+### Message Format
+
+```json
+{
+  "event_id": "evt-abc123",
+  "event_type": "notification.sent",
+  "timestamp": "2026-05-03T12:00:00Z",
+  "tenant_id": "acme-corp",
+  "notification_id": "notif-xyz789",
+  "channel": "EMAIL",
+  "recipient_user_id": "user-123",
+  "status": "SENT",
+  "metadata": {}
+}
+```

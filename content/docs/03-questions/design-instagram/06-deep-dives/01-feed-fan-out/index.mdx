@@ -1,0 +1,63 @@
+---
+title: Feed Fan-out
+description: Deep dive into the hybrid fan-out architecture — write-ahead, pull-based, and the hybrid strategy that balances read/write performance at scale.
+---
+
+## Write-Ahead Model
+
+In the write-ahead model, when a user posts a photo, the system proactively pushes the photo ID into the feed sets of all followers before the upload API returns.
+
+| Aspect | Detail |
+| --- | --- |
+| **Read complexity** | O(1) — single sorted set range query |
+| **Write complexity** | O(F) where F = follower count |
+| **Best for** | Users with &lt;10K followers |
+
+For a user with 10K followers, fan-out takes ~100ms (10K × 10ms per insert). For a user with 10M followers, that's ~100 seconds — unacceptable.
+
+## Pull-Based Model
+
+In the pull-based model, no fan-out occurs. The feed is assembled at read time by querying and merging recent posts from followed users.
+
+| Aspect | Detail |
+| --- | --- |
+| **Read complexity** | O(K × M) where K = followed users, M = posts per user |
+| **Write complexity** | O(1) — always fast |
+| **Best for** | Power users with millions of followers |
+
+For K=500 and M=5, that's 2,500 lookups + merge-sort per feed request. For celebrity followers, K is much larger, creating hot queries.
+
+## Hybrid Strategy
+
+Instagram dynamically chooses the strategy based on follower count:
+
+| User Tier | Follower Count | Strategy |
+| --- | --- | --- |
+| Normal | &lt;10K | Write-ahead to all followers |
+| Influencer | 10K – 1M | Hybrid: write-ahead to followers with &lt;5K followers; pull-based for larger followers |
+| Power User | >1M | Pure pull-based for all followers |
+
+**Degeneracy handling:** When pull-based results are sparse, the system falls back to engagement-based suggested content.
+
+**Fan-out batching:** Recent posts from the same user are batched into single operations (Cassandra BATCH / Redis pipeline).
+
+**Fan-out throttling:** If a follower's feed write is slow, the system falls back to pull-based for that follower and retries in the background.
+
+## Feed Set Data Model
+
+Each user's feed is stored as a sorted set in Cassandra (or Redis for hot users).
+
+**Table: `feed_sets` (Cassandra)**
+- Partition key: `user_id`
+- Clustering key: `score DESC` (reverse timestamp with millisecond precision)
+- Column: `photo_id`
+
+```
+SELECT photo_id FROM feed_sets WHERE user_id = ? LIMIT 20;
+```
+
+- ~200 photo IDs per feed page
+- TTL: 180 days (auto-expiry)
+- Compaction: TTL-based, size-tiered
+
+**Score calculation:** `photo_timestamp_ms` provides chronological ordering with millisecond precision for burst uploads.

@@ -1,0 +1,69 @@
+---
+title: Core Entities
+description: Core entities for distributed stream processing system
+---
+
+## Entity Definitions
+
+### Topic
+| Field | Type | Notes |
+|-------|------|-------|
+| `topicName` | String | Unique topic identifier (e.g., `user-events.orders`) |
+| `partitions` | Integer | Number of partitions (immutable after creation) |
+| `replicationFactor` | Integer | Number of replicas per partition |
+| `retentionMs` | Long | Message retention period (ms) |
+| `retentionBytes` | Long | Max storage per partition (bytes); 0 = unlimited |
+| `cleanupPolicy` | Enum | DELETE / COMPACT |
+| `maxMessageBytes` | Integer | Max message size (default 1MB) |
+| `createdAt` | Timestamp | Creation time |
+
+### Partition
+| Field | Type | Notes |
+|-------|------|-------|
+| `topicName` | String | Parent topic |
+| `partitionId` | Integer | Partition number (0-based, immutable) |
+| `leaderBroker` | String | Broker ID hosting the leader replica |
+| `isr` | List&lt;String&gt; | In-sync replicas (list of broker IDs) |
+| `logStartOffset` | Long | First readable offset (after deletion/compaction) |
+| `logEndOffset` | Long | Next offset to be assigned |
+
+### Replica
+| Field | Type | Notes |
+|-------|------|-------|
+| `topicName` | String | Parent topic |
+| `partitionId` | Integer | Parent partition |
+| `brokerId` | String | Broker hosting this replica |
+| `role` | Enum | LEADER / FOLLOWER |
+| `isInSync` | Boolean | Whether replica is caught up with leader |
+| `highWatermark` | Long | Last committed offset visible to consumers |
+| `logEndOffset` | Long | Last written offset (local view) |
+
+### Message
+| Field | Type | Notes |
+|-------|------|-------|
+| `topicName` | String | Target topic |
+| `partitionId` | Integer | Target partition |
+| `offset` | Long | Monotonically increasing position in partition |
+| `timestamp` | Long | Producer-assigned or broker-assigned timestamp |
+| `key` | Bytes | Optional message key (used for partitioning) |
+| `value` | Bytes | Message payload |
+| `headers` | Map | Metadata (content-type, trace-id, etc.) |
+
+### ConsumerGroup
+| Field | Type | Notes |
+|-------|------|-------|
+| `groupId` | String | Unique consumer group identifier |
+| `members` | List&lt;String&gt; | Active consumer member IDs |
+| `assignments` | `Map&lt;String, List&lt;Integer&gt;&gt;` | topic -→ [partition IDs] mapping |
+| `offsets` | `Map&lt;String, Long&gt;` | topic:partition -→ committed offset |
+
+## Relationships
+
+```
+Topic ──[1:N]──► Partition (a topic has multiple partitions)
+Partition ──[1:N]──► Replica (each partition has N replicas)
+Topic ──[1:N]──► ConsumerGroup (groups read from a topic)
+ConsumerGroup ──[1:1]──► Partition (each partition assigned to one group member)
+Producer ──[1:N]──► Message (a producer sends many messages)
+Message ──[1:1]──► Partition (each message belongs to one partition)
+```

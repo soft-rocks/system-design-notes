@@ -1,0 +1,218 @@
+---
+title: "API / System Interface"
+description: "APIs and system interfaces for the performance metrics collection system"
+---
+
+## Ingestion API — Agent → Collector
+
+Agents push metrics via a lightweight UDP/TCP protocol to the ingestion layer.
+
+### Batch Push
+
+```
+POST /api/v1/write
+Content-Type: application/json
+
+{
+  "series": [
+    {
+      "metric": "cpu_usage",
+      "labels": \{"host": "web-01", "service": "api", "region": "us-east-1"\},
+      "values": [
+        \{"timestamp": 1714729800000, "value": 45.2\},
+        \{"timestamp": 1714729810000, "value": 47.8\}
+      ]
+    },
+    {
+      "metric": "http_requests_total",
+      "labels": \{"host": "web-01", "service": "api", "method": "GET"\},
+      "values": [
+        \{"timestamp": 1714729800000, "value": 152340\},
+        \{"timestamp": 1714729810000, "value": 152405\}
+      ]
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+\{ "status": "accepted", "series_count": 2, "sample_count": 4 \}
+```
+
+**Constraints:**
+- Max batch: 10,000 series, 100,000 samples
+- UDP: max 1400 bytes per datagram (drop excess to prevent fragmentation)
+- TCP: keep-alive connection per agent (pool of 500 connections per collector node)
+- Idempotent: same series + same timestamp = deduplicated
+
+### Agent Pull Mode (alternative)
+
+```
+GET /api/v1/read/agent/\{agent_id\}/scrape_configs
+```
+
+Returns the list of metrics the agent should scrape. Agents self-configure based on this response.
+
+## Query API — Dashboard/User → Query Service
+
+### Query Metrics
+
+```
+GET /api/v1/query?query=avg(rate(cpu_usage[5m]))&time=1714729800&end=1714729800&step=10s
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "data": {
+    "result_type": "vector",
+    "result": [
+      {
+        "metric": \{"host": "web-01", "service": "api"\},
+        "values": [
+          [1714729780, 45.2],
+          [1714729790, 47.8],
+          [1714729800, 44.1]
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Query Range (time series over interval)
+
+```
+GET /api/v1/query_range?query=avg(rate(http_requests_total[1m]))&start=1714726200&end=1714729800&step=60s
+```
+
+### Label Values (for dropdown/filters in UI)
+
+```
+GET /api/v1/label/\{label_name\}/values
+GET /api/v1/label?match[]=job="api"
+```
+
+### Series Discovery
+
+```
+GET /api/v1/series?match[]=job="api"&match[]="cpu_usage"
+```
+
+Returns matching series_key + labels for UI auto-complete.
+
+## Alert Management
+
+### Create Alert Rule
+
+```
+POST /api/v1/alert/rules
+{
+  "name": "High CPU Usage",
+  "query": "avg(cpu_usage\{service=\"api\"\}) > 90",
+  "for_duration": "5m",
+  "labels": \{"severity": "critical"\},
+  "annotations": \{"summary": "CPU > 90% for 5 minutes on API service"\}
+}
+```
+
+### Get Alert Rules
+
+```
+GET /api/v1/alert/rules
+GET /api/v1/alert/rules/\{rule_id\}
+```
+
+### Alert States (real-time)
+
+```
+GET /api/v1/alerts?state=firing
+```
+
+Returns all currently firing alerts across all rules.
+
+## Internal Service Interfaces
+
+```
+┌────────────────────┐
+│    Ingestion API    │
+│    (Collector)      │
+│                    │
+│ • Parse batches     │
+│ • Dedup (Redis)    │
+│ • Route to shard   │
+└────────┬───────────┘
+         │
+         │ push (Kafka)
+         ▼
+┌────────────────────┐    ┌─────────────────────┐
+│   Aggregation       │    │   Time-Series Store  │
+│   Service           │    │                     │
+│ • 10s → 5min rollup │    │  • Write raw values  │
+│ • 5min → 1h rollup  │    │  • Columnar store    │
+│ • 1h → 24h rollup   │    │  • Partitioned by    │
+│ • Stored aggregated │    │    series_key        │
+└────────┬────────────┘    └─────────────────────┘
+         │
+         ▼
+┌────────────────────┐    ┌─────────────────────┐
+│   Query Service     │    │   Alert Evaluator    │
+│                    │    │                      │
+│ • Query parser     │    │  • Poll every 30s    │
+│ • Shard routing    │    │  • Evaluate rules    │
+│ • Merge results    │    │  • Update state      │
+│ • Cache (2m TTL)   │    │  • Fire alerts       │
+└────────┬───────────┘    └──────────┬───────────┘
+         │                           │
+         ▼                           ▼
+   Client/Dashboard            Alert channel
+                               (PagerDuty, Slack, webhook)
+```
+
+### CollectorService
+
+```
+accept(series: MetricSeries[], values: MetricValue[]): AcceptResult
+```
+
+1. Validate series (known metric name, valid label format)
+2. Check Redis dedup window (last 60s, same series_key + timestamp)
+3. Hash series_key to determine target shard
+4. Append to Kafka partition (shard_key = series_key)
+5. Return AcceptResult with accepted/failed counts
+
+### AggregationService
+
+```
+aggregate(series_key: UUID, timestamp: Timestamp): void
+```
+
+1. Read raw values for series_key from Kafka (last 5 minutes)
+2. Compute: avg, min, max, count, rate-of-change
+3. Write to aggregated storage (HBase/Cassandra)
+4. Repeat for 1h → 24h rollups
+
+### QueryService
+
+```
+query(query_string: string, start: Timestamp, end: Timestamp, step: Duration): QueryResult
+```
+
+1. Parse query string → execution plan
+2. Identify affected series_keys from label index (Cassandra secondary index)
+3. Fan-out to all relevant shards (read from aggregated store for >10s lookback)
+4. Merge and downsample results
+5. Return QueryResult
+
+### AlertEvaluator
+
+```
+evaluate(rules: AlertRule[], now: Timestamp): AlertStateChanges[]
+```
+
+1. For each enabled rule, execute the query
+2. If query result persists above threshold for `for_duration`, transition to `firing`
+3. If query result drops below threshold, transition to `resolved`
+4. Write AlertState change → alert dispatcher

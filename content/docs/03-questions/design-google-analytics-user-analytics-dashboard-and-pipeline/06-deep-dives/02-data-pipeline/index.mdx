@@ -1,0 +1,52 @@
+---
+title: Data Pipeline
+description: Kafka cluster design, ingestion protocol, schema evolution, and pipeline monitoring.
+---
+
+## Kafka Cluster Design
+
+**Topics:**
+
+| Topic | Partitions | Consumer Group | Key |
+|-------|-----------|----------------|-----|
+| `ga4-events` | 1000 | Multiple | hash(property_id) |
+| `ga4-sessions` | 1000 | Aggregator | property_id |
+| `ga4-export-batches` | 100 | BigQuery loader | property_id:date |
+
+**Replication:** ISR factor 3, `min.insync.replicas=2` for `acks=all`.
+
+**Consumer groups:**
+
+| Group | Processing | Delivery Guarantee |
+|-------|-----------|-------------------|
+| `sessionizer-group` | Exactly-once sessionization | Exactly-once |
+| `realtime-group` | Real-time tracking | At-least-once (idempotent counters) |
+| `export-group` | Export to GCS | At-least-once (idempotent writes) |
+
+## Ingestion Protocol
+
+**HTTPS POST with gzip payload:**
+
+```
+POST /collect/v2?t=event_type&tid=G-XXXXX&epn=event_name&ep.param=value&sid=session_id
+```
+
+- **Batch endpoint:** POST /batch — up to 20 events per request
+- **Idempotency:** `ri` (request ID) header for deduplication, 5min TTL in Redis
+- **Response:** HTTP 204 (no content) for accepted events; 200 with debug info for debug endpoint
+
+## Event Schema Evolution
+
+- **Schema versioning:** Events tagged with `schema_version` (currently v2)
+- **Backward compatibility:** New parameters are additive; removed parameters return null
+- **BigQuery schema:** Auto-updates via GCS source schema; evolution handled by load job
+
+## Pipeline Monitoring
+
+| Metric | Alert Threshold | Action |
+|--------|----------------|--------|
+| Consumer lag | > 60s on any partition | Scale consumer group |
+| Consumer lag | > 5min on any partition | P1 incident |
+| Throughput | Sudden drop > 50% | Investigate ingest service |
+| Error rate | > 1% of events | Check tracking ID validation |
+| E2E latency | Watermark event > 6h | Check BigQuery load job |

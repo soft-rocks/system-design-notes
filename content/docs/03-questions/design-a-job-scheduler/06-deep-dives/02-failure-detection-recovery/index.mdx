@@ -1,0 +1,168 @@
+---
+title: Failure Detection & Recovery
+description: Worker failure detection, scheduler failover, job retry, and network partition handling.
+---
+
+## Worker Failure Detection
+
+### Heartbeat-Based Detection
+
+Workers send heartbeats every 5s via the bidirectional gRPC stream. The scheduler tracks three timeouts:
+
+| Timeout | Duration | Action |
+|---------|----------|--------|
+| `heartbeat_interval` | 5s | Normal heartbeat period |
+| `heartbeat_timeout` | 15s (3 missed) | Mark worker as `OFFLINE` |
+| `grace_period` | 30s | Allow rescheduling to begin |
+| `hard_timeout` | 120s | Force-kill job on dead worker (cleanup) |
+
+### Multi-Channel Detection
+
+The scheduler uses three independent channels to detect worker failures:
+
+| Channel | Frequency | Detection Time | Purpose |
+|---------|-----------|----------------|---------|
+| gRPC stream heartbeats | 5s | 15s (3 missed) | Primary detection |
+| Worker lease in etcd | TTL 15s | 15s | Backup detection (independent of gRPC) |
+| Resource report | 30s | 30s | Secondary (detects resource leaks) |
+
+### False Positive Mitigation
+
+1. **Graceful drain**: Before marking OFFLINE, the scheduler sends a "verify" gRPC call. If the worker responds, it is marked `DRAINING` instead.
+2. **Cross-verification**: The scheduler checks if the worker's reported running job IDs match what the log store sees. If logs are still streaming, the worker may just have a delayed heartbeat.
+3. **Retry detection**: If a worker was OFFLINE < 60s ago, the scheduler waits 2 minutes before rescheduling jobs from it (prevents flapping).
+
+## Scheduler Failover
+
+The scheduler itself is the most critical component — if it fails, no jobs get scheduled. We use active-passive failover with etcd for leader election.
+
+### Leader Election
+
+The scheduler cluster uses etcd's lease-based leader election:
+
+```
+scheduler instance → create lease (TTL 30s) → register as leader → keep alive every 10s
+
+On keep-alive failure → lease expires → other scheduler acquires lease → becomes leader
+```
+
+| Phase | Duration | Mechanism |
+|-------|----------|-----------|
+| Leader detection by followers | 10-40s | Failed keep-alive (3 missed heartbeats) |
+| New leader election | < 500ms | etcd sequential lease grant |
+| State recovery | 5-30s | Re-read cluster state from etcd |
+
+### State Recovery
+
+The new leader must recover:
+1. **Cluster state**: Re-read from etcd — all workers, jobs, and assignments are persisted there.
+2. **In-flight jobs**: For each RUNNING job on the former leader, the new leader must determine if the job actually completed.
+3. **Scheduling queue**: The priority queue is rebuilt from etcd's PENDING and QUEUED records.
+
+### Recovery Strategies for In-Flight Jobs
+
+| Signal | Action |
+|--------|--------|
+| gRPC stream alive on old worker | Job continues; update state to RUNNING |
+| gRPC stream dead + heartbeat timeout | Job marked FAILED; trigger retry |
+| gRPC stream alive but heartbeat timeout | Send verify call; if response received, keep RUNNING |
+
+### Strengths
+- **Fast failover**: 15-50s total from failure to recovery (acceptable for batch workloads).
+- **Stateless schedulers**: Any scheduler can become leader since all state is in etcd.
+- **No job double-execution**: Verify-before-kill prevents jobs from running on both old and new leaders.
+
+### Weaknesses
+- **etcd dependency**: If etcd is unavailable, neither leader election nor state recovery works.
+- **Rebuild latency**: Rebuilding the priority queue from etcd takes time proportional to the number of pending jobs.
+
+## Job Retry & Recovery
+
+When a job fails, the scheduler must decide whether and how to retry it.
+
+### Retry Policy
+
+Each job can specify a retry policy:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_retries` | 3 | Maximum number of retry attempts |
+| `backoff_base` | 30s | Base delay for exponential backoff |
+| `backoff_max` | 1h | Maximum backoff delay (caps exponential growth) |
+| `backoff_jitter` | Random(0, 5s) | Prevents thundering herd on retry |
+
+### Backoff Calculation
+
+```
+delay = min(backoff_base * 2^attempt + jitter, backoff_max)
+```
+
+| Attempt | Delay (base=30s, jitter=0) |
+|---------|---------------------------|
+| 1 | 60s |
+| 2 | 120s |
+| 3 | 240s |
+| 4 (capped) | 3600s (1h) |
+
+### Failure Categorization
+
+Not all failures are equal. The scheduler classifies failures to determine retry behavior:
+
+| Failure Type | Example | Retry? |
+|--------------|---------|--------|
+| Transient | OOM kill, network timeout | Yes, with backoff |
+| Permanent | Missing file, invalid config | No, fail immediately |
+| Resource | No available workers | Yes, no backoff (polling) |
+| Deadline | Job exceeded its time limit | No, fail with DEADLINE_EXCEEDED |
+
+The scheduler uses the exit code and log patterns to classify failures:
+- Exit code 137 (SIGKILL) → likely OOM → retry
+- Exit code 1 + error message "ENOENT" → permanent → no retry
+- No exit code + gRPC stream dropped → network/worker failure → retry
+
+### Checkpoint-Based Recovery
+
+For long-running jobs (> 1h), the scheduler supports checkpointing:
+
+```
+Job starts → run to first checkpoint → worker saves state to object store → resume from checkpoint
+```
+
+If a job fails after N checkpoints, only the last partial segment needs reprocessing:
+- Without checkpoint: lose 2h of work, restart from 0
+- With checkpoint: lose 10 minutes of work, restart from last checkpoint
+
+Checkpoint overhead:
+- Write frequency: every 5 minutes
+- Storage: per-checkpoint size depends on job data (typically 100MB-1GB)
+- Latency: 1-5s per checkpoint write (depends on storage backend)
+
+## Network Partition Handling
+
+In multi-datacenter deployments, network partitions can split the cluster.
+
+### Partition Scenarios
+
+| Scenario | Impact | Handling |
+|----------|--------|----------|
+| Scheduler ↔ etcd partitioned | Cannot update state | Scheduler pauses scheduling (safe, not available) |
+| Scheduler ↔ worker partitioned | Cannot reach workers | Workers marked OFFLINE after heartbeat timeout; jobs rescheduled |
+| etcd partitioned | All schedulers lose persistence | Followers stop scheduling; leader keeps serving in-memory until lease expires |
+| Worker ↔ worker partitioned | Cross-region job dependencies broken | Dependency check fails → jobs stuck → alert |
+
+### Split-Brain Prevention
+
+Active-passive mode prevents split-brain: only one scheduler is active at a time. In active-active mode:
+
+- Each scheduler handles a disjoint set of worker groups (sharded by worker ID).
+- etcd linearizable reads/writes ensure consistency across partitions.
+- Partition tolerance: schedulers in different partitions may have divergent views; reconciliation occurs on partition healing.
+
+### Strengths
+- **Fail-fast**: Failures detected within 15s, scheduling resumes within 45s.
+- **Stateless schedulers**: Any scheduler instance can take over with zero warm-up.
+- **Checkpoint support**: Long jobs don't lose hours of work on failure.
+
+### Weaknesses
+- **etcd is a single point of failure**: Must be deployed as a 5-node cluster with proper replication.
+- **Checkpoint overhead**: Adds write pressure to storage; not all jobs support checkpointing.

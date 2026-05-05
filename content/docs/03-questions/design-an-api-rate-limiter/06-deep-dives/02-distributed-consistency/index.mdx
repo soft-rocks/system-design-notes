@@ -1,0 +1,104 @@
+---
+title: Distributed Consistency
+description: Deep dive into consistency models for distributed rate limiting
+---
+
+## Atomic Operations with Lua Scripts
+
+Without Lua, the rate limit check requires three round-trips:
+1. GET the bucket state (tokens, lastRefill)
+2. Compute refill locally
+3. SET the updated bucket state
+
+Between steps 1 and 3, another request can read the same stale state and allow an extra request. This is the classic **lost update problem**.
+
+Lua scripts solve this by executing atomically on the Redis server:
+```lua
+local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'lastRefill')
+local tokens = tonumber(bucket[1]) or capacity
+local lastRefill = tonumber(bucket[2]) or now_ts
+local elapsed = (ARGV[2] - lastRefill) / 1000
+tokens = math.min(capacity, tokens + elapsed * tonumber(ARGV[3]))
+local allowed = 0
+if tokens &gt;= tonumber(ARGV[1]) then
+  tokens = tokens - tonumber(ARGV[1])
+  allowed = 1
+end
+redis.call('HMSET', KEYS[1], 'tokens', tostring(tokens), 'lastRefill', tostring(ARGV[2]))
+redis.call('EXPIRE', KEYS[1], 3600)
+return \{allowed, math.floor(tokens)\}
+```
+
+This single atomic operation guarantees:
+- **Linearizability**: at any point in time, the bucket state reflects all prior operations in a total order.
+- **No over-consumption**: even under 1000 concurrent requests, the bucket never goes below zero.
+- **No double-counting**: each token is consumed at most once.
+
+## Handling Redis Failover
+
+### Redis Sentinel (Master-Slave + Failover)
+
+With Sentinel, Redis has one master (handles writes) and one or more replicas (read replicas). On master failure:
+
+1. Sentinel detects master failure (~30s timeout).
+2. A replica is promoted to master.
+3. All Rate Limiter Service instances receive a notification and reconnect to the new master.
+
+**Problem**: Any writes that were acknowledged by the old master but not yet replicated to the new master are lost. In a worst-case scenario, a client could exceed their rate limit by the number of requests served by the old master between its last sync and the failover.
+
+For our target of ~5K QPS peak and a typical replication lag of ~1ms, the worst-case over-consumption is ~5 requests during failover — acceptable for most use cases.
+
+### Redis Cluster (Sharded)
+
+Redis Cluster shards keys across N master nodes. Each shard has replicas. The trade-off:
+
+| Scenario | Impact on Rate Limiting |
+|---|---|
+| Single shard master fails | ~1/N of client state is at risk; replicas promote automatically |
+| Network partition (minority partition) | Affected shards return errors; gateway must have a fallback strategy |
+| Client moves between shards | Not possible — keys are hashed to a fixed shard; same client always hits the same shard |
+
+With 1M clients and 10 shards, each shard handles ~100K client states. A single shard failure affects ~10% of the client base.
+
+### Fallback Strategy on Redis Failure
+
+When Redis is unreachable:
+1. **Fail-open**: allow the request without rate limiting. This is the default — it's worse to block legitimate traffic than to allow a small over-limit.
+2. **Local bucket as emergency buffer**: Each gateway node maintains a small in-memory bucket per client (capped at 1000 entries). This survives Redis outages but only protects per-node, not per-client.
+3. **Circuit breaker**: After 3 consecutive Redis errors, the node enters "pass-through" mode for 10 seconds, allowing all requests and logging them for later reconciliation.
+
+## Partial Failure Scenarios
+
+### Redis Slow Operations
+
+A single Lua script on a busy Redis instance can take 0.5–5ms if there are many concurrent scripts or if the instance is under memory pressure (forcing a background save). Mitigations:
+- Use `redis-cli --stat` to monitor throughput and set appropriate maxclients.
+- Enable `no-appendfsync-on-rewrite no` to avoid fsync stalls.
+- Run Redis with `maxmemory-policy noeviction` — rate limit buckets must never be evicted.
+
+### Rate Limiter Service Crash
+
+If a Rate Limiter Service instance crashes:
+1. Its in-memory policy cache is lost (TTL 30s expiration means the worst impact is using a stale policy for 30s).
+2. **No state is lost** — all rate limit state lives in Redis.
+3. The gateway node re-creates the Rate Limiter Service on restart (or the orchestrator restarts it).
+4. The first request after restart triggers a policy reload from etcd.
+
+### Gateway-Redis Network Partition
+
+If the network between gateway nodes and Redis partitions:
+- All check requests to that Redis shard time out (default timeout: 100ms).
+- The gateway falls through to the circuit breaker (fail-open).
+- After the network heals, existing connections are reused — no warm-up needed.
+
+## Consistency vs Latency Tradeoffs
+
+The system is designed for **strong consistency** (every request is checked against the latest state in Redis). An eventual consistency model would be faster but risky:
+
+| Consistency Model | Latency Impact | Safety Impact |
+|---|---|---|
+| **Strong (current)** | p99 ~0.8ms (Redis round-trip + Lua) | No client exceeds their limit |
+| **Eventual (local cache + batched writes)** | p99 ~0.1ms (no Redis round-trip) | Client could exceed limit by up to 10x during the consistency window |
+| **Read-your-writes (read from Redis, write to local)** | p99 ~0.3ms | Better, but still allows concurrent over-consumption |
+
+The choice of strong consistency is justified because rate limiting is a **safety property** — exceeding the limit has direct business impact (overage billing, downstream service degradation). The 0.7ms latency difference (0.8ms vs 0.1ms) is negligible compared to typical API request latencies of 50–200ms.

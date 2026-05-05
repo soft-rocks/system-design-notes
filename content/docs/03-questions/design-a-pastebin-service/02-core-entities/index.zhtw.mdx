@@ -1,0 +1,32 @@
+---
+title: Core Entities
+description: Domain entities, attributes, constraints, access patterns, relationships, and volume estimates for the Pastebin service.
+---
+
+### Paste
+
+**Attributes**：
+
+- `paste_key`（string, 3–16 chars, unique）：Access identifier。Server-generated 或 user-requested。
+- `title`（string, max 256 chars, nullable）：Optional title。
+- `language`（string, nullable）：Programming language for syntax highlighting。
+- `content_hash`（string, 64 chars, unique）：Content 的 SHA-256 hash — deduplication key 與 blob store address。
+- `content_size`（int）：Size in bytes。
+- `created_at`（timestamp）：Creation time（UTC）。
+- `expires_at`（timestamp, nullable）：Expiration time。`NULL` 表示 never expire。
+- `access_mode`（enum: public, unlisted, private）：Visibility。`private` 同時表示 CDN bypass。
+- `status`（enum: active, expired, deleted）：Lifecycle state。
+
+**Constraints**：
+
+- Composite unique：(`paste_key`, `content_hash`)。
+
+### API Key
+
+**Attributes**：
+
+- `key_id`（string, UUID）：Record identifier。
+- `key_hash`（string）：Hashed API key。
+- `created_at`（timestamp）：Creation time。
+- `expires_at`（timestamp, nullable）：Expiration（90-day rotation）。
+- `revoked_at`（timestamp, nullable）：Revocation。

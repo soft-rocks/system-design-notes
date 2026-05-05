@@ -1,0 +1,12 @@
+{
+  "title": "Facebook Messenger or WhatsApp",
+  "description": "Design a real-time messaging platform at scale",
+  "children": [
+    "01-requirements",
+    "02-core-entities",
+    "03-api-system-interface",
+    "04-data-flow",
+    "05-high-level-design",
+    "06-deep-dives"
+  ]
+}

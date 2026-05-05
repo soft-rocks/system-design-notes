@@ -1,0 +1,127 @@
+---
+title: Multi-lingual & Personalization
+description: Deep dive into multi-lingual support and personalization for typeahead
+---
+
+## Multi-Lingual Tokenization
+
+**The core challenge**: Different languages have fundamentally different character structures. A single radix tree cannot efficiently handle both a 256-way branching factor (Latin) and a 20K-way factor (CJK) without extreme memory waste.
+
+### Hybrid Approach: Language-Specific Trees Under a Common Namespace
+
+| Language | Trie Strategy | Branching Factor | Edge Compression |
+|----------|-------------|------------------|------------------|
+| Latin (English, Spanish, etc.) | Per-character radix tree | 256 (byte-level) | Aggressive — long shared prefixes collapsed |
+| CJK (Chinese, Japanese, Korean) | Per-character trie | 20K+ (Unicode CJK block) | Critical — bigram compression for frequent character pairs |
+| Arabic | Per-character, RTL normalization | 800+ (Unicode Arabic block) | Moderate — contextual letter forms collapsed at normalization step |
+
+**Why per-language namespaces?** CJK characters never appear in Latin queries and vice versa. Separating them avoids allocating 20K child pointers for every Latin node.
+
+```
+# Namespace structure
+dict:lat:prefix:go → sorted_set \{("google", 98.5), ...\}
+dict:cjk:prefix:谷 → sorted_set \{("谷歌", 95.0), ("谷歌地图", 90.1), ...\}
+```
+
+**CJK bigram compression**: Group frequent character pairs (e.g., "谷歌" is a common bigram in Chinese) into single edges. This reduces effective branching from 20K to ~500 for common prefixes. Rare bigrams and single characters fall back to per-character traversal.
+
+### Character Normalization Pipeline
+
+All input goes through this pipeline **before** trie lookup:
+1. **Unicode NFKC normalization** — consistent encoding (e.g., fullwidth "ＧＯＯＧＬＥ" → halfwidth "GOOGLE")
+2. **Accent folding** (Latin only) — "café" → "cafe" for broader matching
+3. **RTL reversal** (Arabic only) — normalize right-to-left text to left-to-right representation for trie traversal
+4. **Language detection** — heuristic: if any CJK character → CJK mode; else if Arabic script → Arabic mode; else → Latin mode
+
+## Suggestion Deduplication
+
+**Problem**: When merging results from multiple categories (history, global, trending), the same term can appear multiple times. "google maps" might appear in both the user's history and in global trending.
+
+**Deduplication strategy**: Run after all tiers and categories produce results, before final truncation.
+
+```
+function deduplicate(results):
+    seen = set()
+    output = []
+    for category in [HISTORY, TRENDING, GLOBAL]:
+        for result in results.by_category[category]:
+            if result.term not in seen:
+                seen.add(result.term)
+                output.append(result)
+            // If duplicate, skip — highest-priority category wins
+
+    return output[0:10]
+```
+
+**Priority order**: HISTORY > TRENDING > GLOBAL. A user's own search history always takes precedence over global popularity.
+
+**Cross-category merging** (before dedup): Results are collected from each category into a single pool, then sorted by combined score, then deduplicated. The `limit_per_category` constraint ensures diversity: no more than 3 results from any single category.
+
+## Personalization Ranking
+
+Personalization is a post-retrieval re-ranking step, not a retrieval concern.
+
+### Scoring Formula
+
+```
+final_score = 0.45 * global_score + 0.25 * history_affinity + 0.20 * location_boost + 0.05 * device_tuning + 0.05 * recency_boost
+```
+
+| Weight | Feature | Calculation | Source |
+|--------|---------|-------------|--------|
+| 0.45 | global_score | Pre-computed score from dictionary (frequency × freshness × CTR) | Radix tree top-k |
+| 0.25 | history_affinity | log1p(match_count_in_history) / log1p(20) | User session (last 20 queries) |
+| 0.20 | location_boost | exp(-distance_km / 50) × location_relevance_score | GPS / IP geolocation |
+| 0.05 | device_tuning | +0.1 if mobile AND term has mobile app; -0.05 if desktop | Session device type |
+| 0.05 | recency_boost | log1p(1 + days_since_first_seen / 30) | Dictionary metadata |
+
+### Why These Weights?
+
+- **global_score (0.45)**: The strongest signal — overall popularity is the best predictor of what a user wants
+- **history_affinity (0.25)**: Strong secondary signal — past behavior is the best personalization indicator
+- **location_boost (0.20)**: Highly impactful for local intent (restaurants, services, news)
+- **device_tuning (0.05)**: Subtle but measurable — mobile users prefer app-related queries
+- **recency_boost (0.05)**: New terms get a small boost to avoid the "rich get richer" problem
+
+These weights are **starting values**, tuned per-tenant via A/B testing. For a shopping platform like Amazon, history_affinity might be weighted higher (0.35) while global_score drops (0.35). For a news aggregator, location_boost might be 0.30 and recency_boost 0.15.
+
+### Weight Learning
+
+Weights are not static. They are learned from user interaction data:
+1. Collect click-through data: which results are selected at which position
+2. Train a learning-to-rank model (LambdaMART or RankNet) on the features
+3. Deploy the learned weights as feature flags, A/B tested against the baseline
+4. Retrain weekly; promote winning config to production
+
+## Location-Aware Suggestions
+
+**Geographic context layers:**
+1. **Local results**: Product/service names near user's location (restaurants, stores) — boosted by `location_boost` score
+2. **Language preference**: Auto-detected from GPS/cell tower/IP, defaults to local language
+3. **Regional trending**: Different trending terms per country (sports events, news) — maintained by per-region trending caches
+
+**Implementation**:
+- User's `location` field (from request or session) → Trending Service reads `trending:\{country\}:\{time_window\}`
+- Personalization re-ranking boosts location-prefixed terms (e.g., "pizza near me" → pizza restaurants in region)
+- Location resolution: GPS (mobile, ±50m accuracy), cell tower (±1km), IP geolocation (±10km, city-level)
+
+## Multi-Language Support in the Trie
+
+### CJK Character-Level Traversal
+
+For CJK queries, each character is a trie node. Unlike Latin where we collapse shared prefixes aggressively, CJK requires per-character traversal because:
+- CJK terms have fewer shared prefixes (Chinese has 50,000+ characters)
+- Bigram compression handles the most common pairs but rare sequences need fine-grained access
+- Memory is managed via separate namespace: `dict:cjk:prefix:\{char\}` keeps CJK nodes isolated from Latin
+
+### Cross-Language Search
+
+Some queries span languages — English speakers searching for Chinese brands: "苹果" (Apple in Chinese). The system handles this via:
+1. **Auto-detection**: Language detector switches to CJK mode if any CJK character is detected
+2. **Latin transliteration index**: Pre-compute common pinyin/romaji mappings for CJK terms
+3. **Fallback**: If no CJK results, try matching Latin characters against pinyin index
+
+```
+Query: "pingguo" → detect as pinyin → resolve to "苹果" → return Chinese results
+Query: "google maps" → detect as Latin → normal Latin radix tree lookup
+```

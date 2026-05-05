@@ -1,0 +1,127 @@
+---
+title: Search at Scale
+description: Elasticsearch index design, geospatial search, availability indexing, ranking, and caching strategy.
+---
+
+## Elasticsearch Index Design
+
+The search index stores flattened room-type-level documents that combine property data, room type attributes, current rates, and availability flags.
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "room_type_id": { "type": "keyword" },
+      "property_id": { "type": "keyword" },
+      "property_name": { "type": "text", "analyzer": "english" },
+      "location": { "type": "geo_point" },
+      "check_in": { "type": "date", "format": "yyyy-MM-dd" },
+      "check_out": { "type": "date", "format": "yyyy-MM-dd" },
+      "price_per_night": { "type": "float" },
+      "total_price": { "type": "float" },
+      "available": { "type": "boolean" },
+      "available_rooms": { "type": "integer" },
+      "bed_type": { "type": "keyword" },
+      "occupancy_max": { "type": "integer" },
+      "amenities": { "type": "keyword" },
+      "rating": { "type": "float" },
+      "review_count": { "type": "integer" },
+      "free_cancellation": { "type": "boolean" },
+      "breakfast_included": { "type": "boolean" },
+      "commission_rate": { "type": "float" }
+    }
+  }
+}
+```
+
+**One document per room type per date**: ~500K room types × 365 days = ~183M documents. Elasticsearch handles this at ~10K docs/sec ingestion and ~100ms query latency across 40 shards on 3 data nodes.
+
+**Why room-type-per-date, not property-per-date**: Availability changes per room type per date. A property-level document would require a full document update when any room type's availability changes. Room-type-per-date is the atomic unit of availability.
+
+**Index lifecycle management**: Documents older than 90 days are rolled to cold storage via ILM. The active index contains ~3 months of date ranges.
+
+## Geospatial Search
+
+Location-based search uses Elasticsearch's `geo_distance` query with a geohash-indexed `location` field (7 digits = 152m precision):
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "geo_distance": { "distance": "50km", "location": "40.7128,-74.0060" } },
+        { "range": { "available": { "gte": true } } }
+      ]
+    }
+  }
+}
+```
+
+**Latency**: 15-30ms for a 50km radius query (O(log n) geohash lookup).
+
+**City-centric optimization**: For city searches ("hotels in NYC"), we filter by `city_id` first (O(1) keyword lookup), then apply geospatial within city boundaries. This avoids expensive geospatial scans for the 80% of searches that are city-based.
+
+**Bounding box pre-filter**: Before geospatial filtering, we compute a bounding box from the radius and filter by `range` on lat/lng — reduces candidate set by ~90% before the actual geodistance calculation.
+
+## Availability Indexing Strategy
+
+Updates come from two sources:
+
+1. **CDC (Debezium)**: Every PostgreSQL availability change → Kinesis → ES Indexer service.
+2. **Kafka (INVENTORY_UPDATED)**: Published by Booking Service and Channel Service on every booking/cancellation.
+
+**Freshness**: &lt;1 second lag. Acceptable because availability changes infrequently (only on booking, cancellation, blockhold, or manual override).
+
+**Bulk indexing**: Up to 100 documents or every 500ms, whichever comes first. Reduces ES indexing overhead from 1 req/change to ~1 req/100 changes.
+
+**Consistency**: ES is eventually consistent. Source of truth is PostgreSQL. If there's a divergence, the system falls back to direct PostgreSQL query via the Availability Service gRPC endpoint.
+
+**Crash resilience**: If the ES indexer crashes, events accumulate in Kinesis (7-day retention). On restart, it replays from the last committed offset. No data is lost.
+
+## Ranking & Relevance
+
+Results are ranked by a weighted score:
+
+```
+rank_score = 0.30 × relevance + 0.20 × rating + 0.15 × commission_rate
+            + 0.15 × price_score + 0.10 × proximity_score + 0.10 × personalization
+```
+
+| Signal | Weight | Details |
+|---|---|---|
+| Relevance (text match) | 30% | Property name, amenities match the query |
+| Rating | 20% | Guest rating (1-5), weighted by review_count |
+| Commission rate | 15% | Higher-commission partners rank higher |
+| Price | 15% | Cheaper results rank higher unless filtered "price ascending" |
+| Proximity | 10% | Closer to search center |
+| Personalization | 10% | Loyalty tier discounts, past stay preferences |
+
+**Why commission rate matters**: OTA commissions range from 10-25%. Showing higher-commission properties first can increase revenue by 5-10% without changing the user experience — the user sees the same results, only the ordering differs.
+
+**Personalization**: Logged-in users see properties matching their preferences (gold members see premium properties first, families see kid-friendly amenities). Guest-facing (not logged in) users get no personalization boost.
+
+## Caching Strategy
+
+### Redis Cache (Hot Path)
+
+Search queries are hashed and cached for 5 minutes:
+
+```
+cache_key = "search:" + sha256("2026-08-15:2026-08-18:2:nyc:amenities:breakfast")
+TTL = 300 seconds
+Hit rate = ~60%
+```
+
+**Why 5-minute TTL**: Availability changes infrequently. A 5-minute stale cache means the worst case is a user sees 1 extra room available that just got booked — they'll get a 409 on checkout, which is handled gracefully.
+
+**No cache invalidation**: We don't invalidate on availability changes (too expensive to compute which queries to evict). TTL handles staleness. Cache misses automatically fall through to fresh ES queries.
+
+**Cache warming**: For popular destinations (NYC, London, Tokyo), the top 100 search queries are pre-warmed every hour to ensure first-request latency is &lt;10ms.
+
+### Elasticsearch Local Cache
+
+Each ES node maintains a 10MB query result cache for the last ~50 queries, avoiding re-execution of identical queries hitting the same shard.
+
+### CDN Edge Cache
+
+Room type details, property photos, and amenity descriptions are static (change &lt;1x/day). Cached at the CDN edge with 1-hour TTL, served from the nearest edge location (&lt;20ms latency globally).

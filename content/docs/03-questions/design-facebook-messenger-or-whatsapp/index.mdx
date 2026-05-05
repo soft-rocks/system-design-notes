@@ -1,0 +1,17 @@
+---
+title: Design Facebook Messenger or WhatsApp
+description: System design for a messaging platform at scale with real-time messaging, voice/video calls, media sharing, and end-to-end encryption.
+---
+
+## Overview
+
+Facebook Messenger and WhatsApp are messaging platforms that enable real-time text, voice, and video communication at global scale. Both services must deliver messages in under a second to billions of users across varying network conditions, while supporting features like group chats, media sharing, end-to-end encryption, and multi-device sync. This design focuses on the shared architectural patterns underlying such platforms.
+
+## Sections
+
+- [Requirements](01-requirements) — Functional and non-functional requirements, scale targets, and assumptions
+- [Core Entities](02-core-entities) — Domain entities: User, Conversation, Message, DeliveryReceipt, TypingIndicator
+- [API / System Interface](03-api-system-interface) — REST APIs, WebSocket protocol, and system service boundaries
+- [Data Flow](04-data-flow) — Message delivery, offline sync, history sync, typing indicators, and call flows
+- [High Level Design](05-high-level-design) — Three-tier architecture: WS gateways, core services, sharded storage
+- [Deep Dives](06-deep-dives) — E2EE, WebSocket gateway at scale, message ordering & deduplication, multi-device sync

@@ -1,0 +1,149 @@
+---
+title: Expiration System
+description: Deep dive into lazy + periodic expiration strategy for pastes with configurable TTLs.
+---
+
+### Expiration System
+
+#### Challenge
+
+Managing paste lifecycle across 4 different TTL tiers (600s, 3600s, 86400s, 604800s) plus "never expire" while ensuring expired pastes are immediately inaccessible and deleted pastes respect the 24-hour soft-delete recovery window. A periodic cleanup job must not compete with the 1,157 reads/sec and 12 writes/sec for DB resources.
+
+**Key constraints**:
+- Expired pastes must return **410 Gone** (not 404) to distinguish "was valid, now expired" from "never existed."
+- Deleted pastes have a 24-hour soft-delete recovery window. During this window, the paste metadata is marked `status = 'deleted'` and the blob persists in object storage. After 24 hours, both are permanently purged.
+- TTLs are set by the client at creation time and cannot be changed (pastes are immutable).
+- With ~1M pastes/day and average TTL of ~24 hours, at any moment ~1M pastes are in-flight. Background cleanup must process these without blocking reads.
+
+#### Solution: Two-Layer Expiration (Lazy on Read + Periodic Background Cleanup)
+
+**1. Lazy Expiration — Primary (Per-Read)**
+
+Every paste read checks expiration. This is the primary expiration mechanism because:
+- It requires zero background infrastructure.
+- It guarantees immediate inaccessibility the moment a paste expires.
+- It handles the "never expire" case naturally (no TTL set, no check needed).
+
+```python
+async def get_paste(key: str) -> Paste | Response:
+    # 1. Check cache (Redis)
+    metadata = redis.get(f"paste:\{key\}")
+
+    if metadata:
+        # Fast path: check expiration in cache
+        if metadata.expires_at < now():
+            # Expired — invalidate cache, return 410
+            redis.delete(f"paste:\{key\}")
+            return Response(status=410, body="Gone")
+        # Continue with cache-hit read path
+        return fetch_content(metadata.content_hash)
+
+    # 2. Cache miss — check DB
+    row = db.query(
+        "SELECT content_hash, expires_at, access_mode, status "
+        "FROM pastes WHERE paste_key = %s", key
+    )
+    if not row:
+        return Response(status=404, body="Not Found")
+
+    # 3. Check soft-delete
+    if row.status == "deleted":
+        return Response(status=410, body="Gone")
+
+    # 4. Check TTL expiration
+    if row.expires_at and row.expires_at < now():
+        # Expired — return 410. DO NOT update DB status here:
+        # every read of an expired paste would hit the primary with a write,
+        # defeating read-replica offloading. The periodic cleanup job (below)
+        # handles DB cleanup; lazy expiration is read-only.
+        redis.delete(f"paste:\{key\}")
+        return Response(status=410, body="Gone")
+
+    # 5. Active paste — serve content + warm cache
+    redis.hset(f"paste:\{key\}", {
+        "content_hash": row.content_hash,
+        "expires_at": row.expires_at.isoformat(),
+        "access_mode": row.access_mode
+    })
+    redis.expire(f"paste:\{key\}", int((row.expires_at - now()).total_seconds()) + 60)
+    return fetch_content(row.content_hash)
+```
+
+**2. Periodic Cleanup — Secondary (Background)**
+
+The lazy expiration only cleans up pastes that are *read* after expiration. Pastes that are never read again (dead links) accumulate in the database. The periodic cleanup removes them.
+
+```sql
+-- Batch deletion using CTE with LIMIT — safe in PostgreSQL
+WITH expired AS (
+    SELECT paste_key FROM pastes
+    WHERE status = 'active'
+      AND expires_at IS NOT NULL
+      AND expires_at < NOW() - INTERVAL '1 hour'
+    LIMIT 10000
+)
+DELETE FROM pastes
+WHERE paste_key IN (SELECT paste_key FROM expired);
+```
+
+Key design decisions:
+- **CTE with LIMIT**: PostgreSQL executes the CTE first (up to 10K paste_keys), then the outer DELETE removes exactly those rows. This is the recommended pattern for batch deletes in PostgreSQL.
+- **`WHERE expires_at < NOW() - INTERVAL '1 hour'`**: Pastes that expired within the last hour are kept in the DB. If a user tries to read them, the lazy expiration handles it. This avoids unnecessary deletes of recently-expired pastes that might still be read.
+- **`LIMIT 10000`**: Small batch size to avoid long-running transactions and lock contention. Each execution deletes up to 10K rows in a single transaction. Note: `ORDER BY` is omitted because PostgreSQL does not guarantee deterministic ordering within a CTE that feeds a DELETE — selecting any 10K expired rows is semantically correct.
+- **Runs every 15 minutes (multi-pass)**: Balance between cleanup frequency and overhead. At 1M pastes/day with average TTL 24 hours, ~41K pastes expire per hour. The cleanup job runs every 15 minutes, each batch deleting up to 10K rows, for a total capacity of ~40K/hour. Pastes expiring within the last few minutes of each 15-minute window are left for the next run (lazy expiration handles them on read).
+
+**3. Soft-Delete Cleanup — Post-Deletion Purge**
+
+```sql
+-- Delete soft-deleted pastes after 24-hour recovery window
+DELETE FROM pastes
+WHERE status = 'deleted'
+  AND deleted_at < NOW() - INTERVAL '24 hours'
+LIMIT 10000;
+```
+
+- **`deleted_at`** is set at deletion time (`NOW()`).
+- After 24 hours, the paste is permanently removed from the DB.
+- A separate **blob orphan scan** (see Paste Storage Engine) purges the corresponding object from storage.
+
+**4. Cache Expiration Coordination**
+
+| Event | Redis TTL Action | DB Status Action |
+|-------|------------------|------------------|
+| Paste created | `EXPIRE paste:<key> <expires_at - NOW() + 60>` | `INSERT status = 'active'` |
+| Lazy expiration on read | `DEL paste:<key>` | No DB update — lazy expiration is read-only. Periodic cleanup handles actual deletion. |
+| Periodic cleanup | No action (TTL already expired) | `DELETE` (batch, 10K per run) |
+| User deletion | `DEL paste:<key>` | `UPDATE status = 'deleted', deleted_at = NOW()` |
+| Soft-delete purge | No action (already deleted) | `DELETE` (batch, 24-hour grace) |
+
+The Redis TTL and DB `expires_at` are **independent but coordinated**:
+- Redis TTL handles fast-path expiration on reads (sub-millisecond).
+- DB `expires_at` is the source of truth for lazy expiration checks on cache misses.
+- If Redis TTL expires before DB `expires_at`, the lazy expiration check on DB fallback still serves the paste correctly until `expires_at`.
+- If DB `expires_at` expires but Redis TTL hasn't, the Redis entry is stale. The next read will check `expires_at` against `NOW()` and find the paste expired, then delete the Redis entry.
+
+**5. Never-Expire Pastes**
+
+Pastes with `expires_at IS NULL` (created with `expires_in: "never"`):
+- No Redis TTL is set — the key persists indefinitely in Redis.
+- No lazy expiration check is needed (`expires_at IS NULL` → skip expiration logic).
+- Not included in periodic cleanup queries (`WHERE expires_at IS NOT NULL`).
+- These pastes are **soft-deletable**: a user DELETE sets `status = 'deleted'`, and the 24-hour recovery window applies.
+
+**6. Expiration Monitoring**
+
+| Metric | Source | Alert Threshold |
+|--------|--------|-----------------|
+| Expired pastes in DB (count) | `SELECT count(*) FROM pastes WHERE expires_at < NOW() - INTERVAL '1 hour' AND status = 'active'` | > 50K (indicates cleanup lag) |
+| Soft-deleted pastes awaiting purge | `SELECT count(*) FROM pastes WHERE status = 'deleted' AND deleted_at < NOW() - INTERVAL '24 hours'` | > 10K |
+| Cleanup job duration | Application metrics | > 30 seconds (batch too large) |
+| Stale cache entries | Application-level check: count of Redis keys where Redis `expires_at` > current time AND DB `status = 'expired'` | > 100 (indicates Redis/DB drift) |
+
+**7. Failure Modes**
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Periodic cleanup job fails | Expired pastes accumulate in DB, consume disk | Lazy expiration still works; expired pastes return 410 on read. Disk impact is linear — at 10KB/paste, 10M expired pastes = 100GB |
+| Redis node crashes | TTL entries lost; expired pastes still accessible via DB fallback | Lazy expiration on DB fallback catches all expired pastes |
+| Clock skew between services | Inconsistent `NOW()` checks | Use `NOW()` from DB for authoritative time; Redis TTL is approximate |
+| High read volume during cleanup | Cleanup batches take longer | LIMIT 10K per batch; runs during off-peak hours |

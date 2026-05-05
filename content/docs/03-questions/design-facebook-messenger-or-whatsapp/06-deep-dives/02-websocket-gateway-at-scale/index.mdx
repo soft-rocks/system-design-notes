@@ -1,0 +1,89 @@
+---
+title: WebSocket Gateway at Scale
+description: Designing a gateway that handles hundreds of millions of concurrent connections
+---
+
+## Problem
+
+Gateway must handle hundreds of millions of persistent WebSocket connections with sub-second message delivery, across global regions, with graceful degradation on network instability.
+
+## Architecture
+
+### Connection Routing: Hash-Based Sharding
+
+```mermaid
+flowchart LR
+    U1["user_12345"] --> H1["hash % 1000"]
+    H1 --> N423["gateway_node_423"]
+    U2["user_67890"] --> H2["hash % 1000"]
+    H2 --> N781["gateway_node_781"]
+```
+
+Each gateway node is responsible for a fixed range of user_ids (by hash mod N, where N = gateway pool size).
+
+### Gateway Node Responsibilities
+
+```mermaid
+flowchart TD
+    subgraph GatewayNode["Gateway Node"]
+        CM["Connection Manager\nWS conn pool · Ping/pong · Keepalive"]
+        MR["Message Router\nsender -> find recv's gateway"]
+        AH["Auth Handler\nToken verify · Session lookup"]
+        QM["Queue Manager\nPending msgs · Batch send"]
+        PP["Presence Publisher\nRedis pub/sub"]
+    end
+```
+
+### Message Routing Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant G1 as Gateway 1
+    participant MS as Message Service
+    participant G7 as Gateway 7
+    participant B as Client B
+
+    A->>G1: Send message
+    G1->>MS: Route to Message Service
+    MS->>MS: Lookup recipient's gateway
+    MS->>G7: Push to Client B
+    G7->>B: Deliver message
+```
+
+### Heartbeat & Recovery
+| Mechanism | Detail |
+|---|---|
+| **Ping/pong** | Server pings every 30s; client responds within 10s |
+| **Backoff** | Exponential backoff on reconnect (1s, 2s, 4s, ..., 60s cap) |
+| **Stateless sessions** | Session stored in Redis; any gateway node can resume |
+| **Message queue** | Pending messages queued per user; delivered on reconnect |
+
+### Scaling the Gateway Pool
+
+When adding gateway nodes:
+1. Add new node to pool
+2. Update hash ring: `hash(user_id) % (N+1)`
+3. Users whose range changes reconnect to new node on next heartbeat
+4. During transition, both old and new gateway route to Message Service
+
+### Handling Network Instability (Mobile)
+
+```mermaid
+flowchart TD
+    A["Old connection drops"] --> B["Client initiates reconnect with backoff"]
+    B --> C["New connection authenticated via session token (Redis)"]
+    C --> D["Gateway fetches pending messages since last ACK"]
+    D --> E["Gap messages retrieved via message history sync"]
+```
+
+### Capacity Planning
+
+| Metric | Target |
+|---|---|
+| Concurrent connections per node | 500K - 1M |
+| Messages per second per node | 50K - 100K |
+| Memory per connection | ~2KB (buffer, state) |
+| Node memory needed (1M conns) | ~2GB |
+
+**Mitigation**: Use connection-aware deployment (users in same region to same node pool) to reduce cross-region latency.

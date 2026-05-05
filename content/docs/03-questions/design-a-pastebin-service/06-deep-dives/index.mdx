@@ -1,0 +1,23 @@
+---
+title: Deep Dives
+description: Detailed examination of key subsystems — paste storage engine, database sharding, short key generation, caching, CDN, expiration, performance, security, rate limiting, access control, HA/DR, observability, content moderation, and migration strategy.
+---
+
+### Deep Dives — 14 Subsystem Designs
+
+## Subsystems
+
+- [Paste Storage Engine](design-a-pastebin-service/06-deep-dives/1-paste-storage-engine) — Content-addressed storage, deduplication, lifecycle management, and read/write paths
+- [Database Sharding](design-a-pastebin-service/06-deep-dives/2-database-sharding) — Row-level sharding strategy for PostgreSQL
+- [Short Key Generation](design-a-pastebin-service/06-deep-dives/3-short-key-generation) — Short key generation strategy for paste access
+- [Cache Optimization](design-a-pastebin-service/06-deep-dives/4-cache-optimization) — Multi-tier caching strategy for 100:1 read-heavy workload
+- [CDN Integration](design-a-pastebin-service/06-deep-dives/5-cdn-integration) — CDN edge caching strategy for paste reads
+- [Expiration System](design-a-pastebin-service/06-deep-dives/6-expiration-system) — Lazy + periodic expiration strategy for pastes with configurable TTLs
+- [Performance Optimization](design-a-pastebin-service/06-deep-dives/7-performance-optimization) — End-to-end latency tuning and scaling sensitivity analysis
+- [Security](design-a-pastebin-service/06-deep-dives/8-security) — Threat model and defense-in-depth strategy
+- [Rate Limiting](design-a-pastebin-service/06-deep-dives/9-rate-limiting) — Distributed rate limiting using sliding window counters with Redis
+- [Access Control](design-a-pastebin-service/06-deep-dives/10-access-control) — Access mode enforcement, API key authentication, and visibility tiers
+- [HA/DR](design-a-pastebin-service/06-deep-dives/11-ha-dr) — High availability and disaster recovery strategy
+- [Observability](design-a-pastebin-service/06-deep-dives/12-observability) — Monitoring, metrics, logging, and alerting infrastructure
+- [Content Moderation](design-a-pastebin-service/06-deep-dives/13-content-moderation) — Operational content filtering
+- [Migration Strategy](design-a-pastebin-service/06-deep-dives/14-migration-strategy) — Zero-downtime migration for shard rebalancing, schema evolution, and deferred compression

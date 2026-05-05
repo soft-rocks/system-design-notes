@@ -1,0 +1,120 @@
+---
+title: Requirements
+description: Functional and non-functional requirements, scale assumptions, and pricing algorithm requirements for Uber's surge pricing system.
+---
+
+## Functional Requirements
+
+### Dynamic Pricing Engine
+
+- **Surge multiplier calculation**: Compute a pricing multiplier based on real-time supply-demand imbalance in a geo-zone.
+- **Price caps**: Enforce regulatory and business-defined maximum/minimum surge multipliers (e.g., 1.0x–4.0x).
+- **Price floor**: No discount below base fare (1.0x) unless running a promotional campaign.
+
+### Geo-Zone Management
+
+- **Hexagonal grid system**: Divide city map into ~1km² hexagonal zones (H3 indexing).
+- **Zone aggregation**: Aggregate supply/demand metrics per zone for pricing decisions.
+- **Zone boundaries**: Handle cross-border trips with fair price attribution between zones.
+
+### Real-Time Event Processing
+
+- **Order pickup ingestion**: Track every driver acceptance in real-time.
+- **Order drop-off ingestion**: Track every completed ride for supply release.
+- **Driver location streaming**: Continuous GPS updates from moving drivers.
+- **Rider request ingestion**: Every ride request generates a demand spike signal.
+
+### Surge Level Broadcasting
+
+- **Zone-level surge display**: Show surge multiplier in rider app within 30 seconds of calculation.
+- **Driver notification**: Alert nearby drivers when surge enters a zone.
+- **Surge decay**: Gradually reduce multiplier after sustained balance recovery.
+
+### Analytics & Reporting
+
+- **Revenue impact tracking**: Per-zone, per-hour revenue vs. baseline.
+- **Elasticity measurement**: Measure rider demand response to surge levels.
+- **Driver utilization metrics**: Track acceptance rate at different surge levels.
+
+### A/B Testing Framework
+
+- **Algorithm variant testing**: Run multiple pricing algorithms in parallel across geo-zones.
+- **Control group isolation**: Maintain untreated zones for comparison.
+- **Statistical significance monitoring**: Automated detection of winner/loser algorithms.
+
+## Non-Functional Requirements
+
+### Latency
+- Surge calculation: p99 < 5 seconds from last event to multiplier update
+- Zone update broadcast: p99 < 10 seconds from calculation to rider app
+- GPS ingestion: p99 < 2 seconds from device to storage
+
+### Throughput
+- Peak event ingestion: 500K events/second (driver location, ride requests, pickups, drop-offs)
+- Surge calculations: 100K zone computations/minute
+- Multiplier broadcasts: 50K zone updates/minute
+
+### Reliability
+- No price oscillation: surge multiplier must change monotonically (no jump > 0.5x per 5-minute window)
+- Circuit breaker: fall back to last known multiplier if calculation fails
+- Idempotent event processing: duplicate GPS/ride events must not corrupt state
+
+### Consistency
+- Per-zone strong consistency: all instances must agree on the surge multiplier for a given zone
+- Cross-zone eventual consistency: zone boundaries may have 5-second divergence
+- Driver-side consistency: drivers see consistent pricing across the city
+
+### Availability
+- 99.99% uptime during peak hours (7AM–10PM local time in each region)
+- Graceful degradation: fall back to zone-level caching if real-time engine is unavailable
+- Regional isolation: failure in one region does not affect other regions
+
+### Security & Compliance
+- Price change audit trail: log every surge calculation with inputs and output
+- Regulatory reporting: export surge data for local compliance review
+- Anti-gaming: detect and prevent algorithm exploitation by ride-sharing bots
+- GDPR: driver/rider location data anonymized after 30 days
+
+## Scale Assumptions
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Active riders | 100M+ | Global Uber-scale platform |
+| Active drivers | 50M+ | Driver supply pool |
+| Ride requests/hour | 50M | ~2M req/hr in peak hours |
+| Peak events/sec | 500K | GPS (400K) + ride events (100K) |
+| Active geo-zones | 100K | ~1km² hex zones across 500 cities |
+| Surge calculations/minute | 100K | One per active zone |
+| Data retention | 90 days raw, 7 years aggregated | Regulatory and analytics |
+
+**Storage estimates:**
+- GPS location stream: 500K events/sec × 200 bytes × 86400s ≈ 8.6 TB/day
+- Ride events: 100K events/sec × 500 bytes × 86400s ≈ 4.3 TB/day
+- Surcharge history: 100K zones × 288 readings/day × 100 bytes ≈ 2.8 GB/day
+
+## Pricing Algorithm Requirements
+
+### Input Features
+
+| Feature | Source | Update Frequency |
+|---------|--------|------------------|
+| Active drivers in zone | GPS stream | Per location update (~30s) |
+| Pending requests in zone | Ride request events | Per request |
+| Historical demand pattern | Time-series DB | Daily (pre-computed baseline) |
+| Weather conditions | External API | Per forecast update (hourly) |
+| Event calendar | Event DB | Daily batch |
+| Traffic congestion | GPS speed analysis | Per 5 minutes |
+| Time of day | System clock | Continuous |
+
+### Output
+
+- **Surge multiplier**: Float between 1.0 and 4.0
+- **Zone confidence score**: 0–100 indicating prediction confidence
+- **Algorithm version**: ID of the pricing model used
+
+### Algorithm Requirements
+
+- **Deterministic**: Same inputs always produce same output (reproducibility)
+- **Explainable**: Each multiplier must be accompanied by feature importance scores
+- **Rollback support**: Ability to revert to previous algorithm version in < 1 minute
+- **Canary deployment**: Test new algorithm on 5% of zones before full rollout

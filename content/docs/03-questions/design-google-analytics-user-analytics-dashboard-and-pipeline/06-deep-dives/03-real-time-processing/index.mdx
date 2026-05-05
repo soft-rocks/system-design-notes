@@ -1,0 +1,60 @@
+---
+title: Real-Time Processing
+description: Active user counting, top-N tracking, sliding event windows, and real-time API.
+---
+
+## Real-Time Architecture
+
+The real-time tracking system uses a Kafka consumer polling `ga4-events` at **1s intervals**, with two parallel tracking paths:
+
+1. **Redis-based** — persistent across restarts: active user counts, top-N metrics
+2. **In-memory** — volatile sliding window for detailed ad-hoc real-time queries
+
+## Active User Counting
+
+**Algorithm:** Sliding window counter with TTL
+
+- **Key:** `rt:active_users:\{property_id\}`
+- **On each event:** `INCR` + `EXPIRE 30min`
+- **Decay:** Counter naturally decays as TTLs expire without re-increment
+- **Accuracy:** ±10% under high throughput (TTL approximation)
+- **Latency:** event → counter updated within 1s (poll interval)
+- **Storage:** Single Redis key per property — negligible memory footprint
+
+```
+Event arrives → INCR rt:active_users:\{pid\} → EXPIRE 30min
+```
+
+## Top-N Tracking
+
+**Redis sorted sets** updated via `ZINCRBY` on each event:
+
+| Key | Member | Score |
+|-----|--------|-------|
+| `rt:top_pages:\{property_id\}` | page_path | page_view count |
+| `rt:top_events:\{property_id\}` | event_name | event count |
+| `rt:top_sources:\{property_id\}` | source/medium | session count |
+
+- **Query:** `ZREVRANGE` with LIMIT for top-K
+- **TTL:** Entire set expires after 30min inactivity
+
+## Sliding Event Window
+
+**In-memory sorted set** (by timestamp) per property.
+
+| Parameter | Value |
+|-----------|-------|
+| Capacity | 100K events per property window |
+| Eviction | LRU when exceeded |
+| Memory budget | ~20GB (100K x 2KB x 10K properties) |
+
+**Use case:** Real-time drill-down — "what events did US users fire in the last 5min?"
+
+## Real-Time API Response
+
+| API | Complexity | Avg Latency |
+|-----|-----------|-------------|
+| `getActiveUsers` | O(1) Redis GET | < 1ms |
+| `runRealtimeReport` | O(N) scan of window (worst 100K) | ~50ms |
+
+Dashboard requests fan-out to all tracked properties, merged at the API layer.

@@ -1,0 +1,20 @@
+---
+title: Deep Dives
+description: Detailed design topics for a messaging platform
+---
+
+## Deep Dive Topics
+
+This messaging platform design covers four critical subsystems in depth:
+
+### [End-to-End Encryption](01-end-to-end-encryption/)
+Double-Ratchet algorithm (Signal Protocol) for per-conversation encryption. X3DH key exchange, forward secrecy, group key distribution with key prefix trees, and the storage implications of E2EE on search and multi-device sync.
+
+### [WebSocket Gateway at Scale](02-websocket-gateway-at-scale/)
+Hash-based connection sharding, gateway node architecture with concurrent connection management, message routing across gateway boundaries, heartbeat/recovery, and capacity planning for millions of persistent connections.
+
+### [Message Ordering & Deduplication](03-message-ordering/)
+Snowflake ID generation for globally unique, time-ordered identifiers. Conversation-level ordering guarantees, client-side idempotent sends with send_id tracking, and retry safety for delivery receipts.
+
+### [Multi-Device Sync](04-multi-device-sync/)
+Cross-device message delivery model (one copy in DB, push to all devices), session management with device revocation, cross-device read status sync, and handling offline device behavior.

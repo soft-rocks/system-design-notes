@@ -1,0 +1,29 @@
+---
+title: "Design Facebook's News Feed"
+description: "Design the ranking, personalization, and hybrid push-pull fan-out system behind Facebook's News Feed serving 1B+ users"
+---
+
+## Overview
+
+Design a News Feed system for Facebook — the ranked, personalized content stream that 1B+ users open 10+ times per day. The system must serve sub-second feed renders for 10 billion daily feed generations from a candidate pool of hundreds of posts per user.
+
+**Key challenges:**
+- **50:1 read-write ratio**: 10B feed renders/day vs 200M posts/day — fan-out at this scale is impossible to do fully eagerly
+- **Personalization at scale**: ~7 trillion ranking evaluations/day with 100+ features per user
+- **Real-time freshness**: Posts from close friends appear within 10 seconds
+- **Diversity vs relevance**: Preventing staleness without sacrificing engagement
+
+## Read the Full Design
+
+| Section | Description |
+| --- | --- |
+| [Requirements](01-requirements/) | Functional requirements, non-functional targets, scale assumptions |
+| [Core Entities](02-core-entities/) | Post, Reaction, Comment, Share, User, Follow Graph, Feed Render Snapshot |
+| [API / System Interface](03-api-system-interface/) | REST APIs, internal service contracts (RankService, CandidateService) |
+| [Data Flow](04-data-flow/) | Write path (hybrid fan-out), read path (ranking pipeline), real-time updates |
+| [High Level Design](05-high-level-design/) | Three-tier architecture, component diagram, technology choices |
+| [Deep Dives](06-deep-dives/) | Ranking algorithm, fan-out strategy, real-time updates, scaling, diversity |
+
+## Summary
+
+The Facebook News Feed is a **rank-then-return** system with a **hybrid push-pull fan-out** model. Posts are not pre-computed; instead, ~700 candidates are fetched and scored in real-time for each user using a Two-Tower DNN. Fan-out uses push for small authors (&lt;500 followers) and pull for celebrities (>50K followers), reducing write cost by ~60%. The system handles 10K feed renders/sec at p99 &lt;1s latency across 4 caching layers.

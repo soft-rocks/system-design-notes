@@ -1,0 +1,272 @@
+---
+title: Scheduling Algorithms
+description: Deep dive into FIFO, priority-based, fair-share, backfill, and DRF scheduling algorithms.
+---
+
+## FIFO Scheduling
+
+### Overview
+
+FIFO (First In, First Out) is the simplest scheduling algorithm. Jobs are served in the order they arrive, with no consideration of size, priority, or resource requirements.
+
+### Algorithm
+
+```
+queue = sorted by submission_time ascending
+
+for each job in queue:
+    if job fits on an available worker:
+        assign job to best-fit worker
+        remove from queue
+    else:
+        break  # Jobs are ordered; stop at first job that doesn't fit
+```
+
+### Strengths
+- **Predictable ordering**: No starvation, first-come-first-served.
+- **Simple**: O(N) queue traversal with no complex scoring.
+- **Good for**: Single-tenant environments or when all jobs have similar resource requirements.
+
+### Weaknesses
+- **Small job blocking**: A small job behind a large job sits idle even though resources are available.
+- **No priority differentiation**: Urgent jobs cannot preempt non-urgent ones.
+- **Poor resource utilization**: Fragmented resource gaps go unused.
+
+### Time Complexity
+- Queue traversal: O(N) where N is pending jobs.
+- Worker matching: O(M) where M is available workers.
+- Total: O(N * M) per scheduling cycle.
+
+## Priority-Based Scheduling
+
+### Overview
+
+Each job has a priority score (1-100). The scheduler always picks the highest-priority job first. Within the same priority, FIFO ordering is used as a tiebreaker.
+
+### Priority Calculation
+
+The effective priority combines several factors:
+
+```
+effective_priority = base_priority
+                   + age_boost
+                   + deadline_pressure
+```
+
+| Factor | Calculation | Max Boost |
+|--------|-------------|-----------|
+| `base_priority` | User-specified (1-100) | 100 |
+| `age_boost` | min(elapsed_seconds / 10, 20) | +20 |
+| `deadline_pressure` | If deadline < 1h: (1 - remaining/total) * 30 | +30 |
+
+### Algorithm
+
+```
+pending_jobs = sorted by effective_priority DESC, then submission_time ASC
+
+for each job in pending_jobs:
+    best_worker = find_best_fit(job, available_workers)
+    if best_worker:
+        assign job to best_worker
+        mark job as scheduled
+    else:
+        continue  # Try next highest-priority job
+```
+
+### Strengths
+- **Urgent jobs complete first**: Deadline pressure naturally boosts near-deadline jobs.
+- **Age-based fairness**: Old jobs get a priority boost, preventing starvation.
+- **Configurable**: Users can tune base_priority for their workloads.
+
+### Weaknesses
+- **Priority inversion**: A large high-priority job can block many small low-priority jobs.
+- **Complex scoring**: Different components contribute to the effective priority, making debugging harder.
+
+### Preemption
+
+For jobs with hard deadlines, the scheduler can preempt lower-priority jobs:
+
+```
+if job.deadline is set and job.priority > preemptable_job.priority:
+    preempt preemptable_job
+    reschedule preemptable_job in queue
+```
+
+Preemption safety:
+- Preempted jobs are saved to the queue with their original submission time (no priority loss).
+- Preempted job resources are returned to the pool immediately.
+- The preempting job is assigned to the freed resources.
+
+## Fair-Share Scheduling
+
+### Overview
+
+Fair-share scheduling ensures that no single tenant, team, or project monopolizes cluster resources. Each share is allocated a weighted fraction of total capacity.
+
+### Weighted Fair Queuing
+
+Each tenant i is assigned a weight w_i. The fair-share fraction for tenant i is:
+
+```
+share_i = w_i / sum(all w_j)
+```
+
+The scheduler tracks the weighted completion ratio:
+
+```
+utilization_i = actual_resources_used_i / target_share_i
+```
+
+At each scheduling cycle, the scheduler ranks tenants by `utilization_i` DESC (highest overutilized first) and then schedules jobs from the most underutilized tenants.
+
+### Hierarchical Fair Sharing
+
+In large organizations, fair-share hierarchies mirror the organizational structure:
+
+```
+Cluster
+├── Team A (weight 40%)
+│   ├── Project A1 (weight 60%)
+│   └── Project A2 (weight 40%)
+├── Team B (weight 35%)
+│   ├── Project B1 (weight 70%)
+│   └── Project B2 (weight 30%)
+└── Team C (weight 25%)
+    └── Project C1 (weight 100%)
+```
+
+Resources flow top-down: each node gets a fraction based on its weight, and sub-teams compete within that allocation.
+
+### Drift Tolerance
+
+Perfect real-time enforcement is too expensive. The scheduler allows short-term drift:
+
+| Metric | Threshold | Action |
+|--------|-----------|--------|
+| Share deviation | < 5% of target | No correction needed |
+| Share deviation | 5-15% of target | Increase scheduling priority for under-served tenants |
+| Share deviation | > 15% of target | Pause scheduling for over-served tenants |
+
+### State Tracking
+
+- Rolling 5-minute and 30-minute utilization windows (different timescales correct different anomaly types).
+- State stored in etcd with TTL-based expiration.
+- Scheduling decisions read from cached fair-share state in memory.
+
+### Strengths
+- **Multi-tenancy protection**: Prevents any single team from starving others.
+- **Hierarchical**: Mirrors organizational structure.
+- **Gradual correction**: Uses drift thresholds to avoid thrashing.
+
+### Weaknesses
+- **Weight tuning burden**: Admin must configure and maintain weight hierarchy.
+- **Short-term bursts**: Fair-share only corrects over longer windows; a team can still burst beyond its share within a 5-minute window.
+- **Gaming risk**: Teams might create many small projects to game hierarchical shares (mitigated by tenant-level quotas).
+
+## Backfill Scheduling
+
+### Overview
+
+Backfill improves utilization by allowing short jobs that fit into resource gaps to run ahead of longer jobs that arrived earlier.
+
+### The Problem
+
+```
+Queue: [Large job (10 CPU, 2h wait)] [Small job (1 CPU, 30s wait)]
+Slots available: 1 CPU
+
+FIFO would leave 9 CPU idle for 2 hours waiting for the large job.
+Backfill runs the small job now, keeping the large job in queue.
+```
+
+### Eager Backfill — Safety-Bounded
+
+An eager backfill job is allowed only if it does **not delay the start of any job in the main queue**. This is checked by simulating the queue without the backfill candidate:
+
+```
+for each candidate in available_jobs:
+    simulated_start = simulate_queue(candidate, excluding_candidate=True)
+    if candidate.start_time &lt;= simulated_start:
+        schedule(candidate)  # Safe: no job is delayed
+```
+
+### Two-Bucket Approach
+
+The scheduler maintains two queues:
+
+| Queue | Content | Scheduling Order |
+|-------|---------|------------------|
+| Main | All jobs, ordered by submission time | FIFO / priority |
+| Backfill | Short jobs (< threshold, e.g., 10 min estimated runtime) | Fit into gaps |
+
+At each scheduling cycle:
+1. Try to schedule the head of the main queue. If it fits, schedule it and repeat.
+2. If the head cannot fit, scan the backfill bucket for jobs that fit in current gaps without delaying the main queue.
+3. Schedule all safe backfill candidates.
+
+### Thresholds
+
+| Parameter | Default | Rationale |
+|-----------|---------|-----------|
+| Max backfill job size | 10 min estimated runtime | Jobs longer than this may be long-running and deserve priority |
+| Max main queue delay caused | 0 (strict) | Conservative: no job in main queue can be delayed |
+| Backfill scan frequency | Per scheduling cycle | High-frequency scan maximizes utilization |
+
+### Strengths
+- **Higher utilization**: Fills resource gaps that FIFO would leave empty.
+- **No main-queue penalty**: Strict safety check ensures no job is delayed.
+- **Simple to implement**: Only requires a secondary queue and a feasibility simulator.
+
+### Weaknesses
+- **Scan cost**: Scanning the backfill bucket every cycle adds O(N_backfill) overhead.
+- **Job fragmentation**: Small jobs scattered across workers increase scheduling complexity for subsequent large jobs.
+
+## Dominant Resource Fairness (DRF)
+
+### Overview
+
+DRF generalizes fair-share to multi-dimensional resource allocation (CPU, memory, GPU, etc.). Each job has a vector of resource demands. DRF selects the job with the highest dominant share.
+
+### Dominant Share
+
+For each job, compute its share for each resource type:
+
+```
+share_for_resource_r = job_demand_r / total_cluster_r
+```
+
+The dominant share is the maximum across all resource types:
+
+```
+dominant_share(job) = max(share_for_cpu, share_for_memory, share_for_gpu, ...)
+```
+
+At each scheduling cycle:
+```
+best_job = argmin over all pending jobs of (dominant_share(job))
+assign best_job to available worker
+```
+
+### Example
+
+Cluster: 100 CPU, 100 GB memory. Two jobs compete:
+
+| Job | Request | CPU Share | Memory Share | Dominant Share |
+|-----|---------|-----------|--------------|----------------|
+| A | 20 CPU, 10 GB | 20/100 = 0.20 | 10/100 = 0.10 | **0.20** (CPU-bound) |
+| B | 5 CPU, 30 GB | 5/100 = 0.05 | 30/100 = 0.30 | **0.30** (memory-bound) |
+
+DRF picks Job A because its dominant share (0.20) < Job B's (0.30). After assignment, remaining resources: 80 CPU, 90 GB.
+
+Next round: Job B now has CPU share 0.05, memory share 30/90 = 0.33. Dominant share 0.33. Job A (now CPU share 40/80 = 0.50, memory 20/90 = 0.22, dominant 0.50). DRF picks B because 0.33 < 0.50.
+
+This converges to an envy-free allocation where no job prefers another's share.
+
+### Strengths
+- **Multi-dimensional fairness**: Considers all resource types, not just CPU.
+- **Envy-free**: No job would rather have another job's allocation.
+- **Incentivizes truthful reporting**: Jobs cannot game by inflating demand for non-bottleneck resources.
+
+### Weaknesses
+- **Cluster heterogeneity**: When workers differ in specs, DRF becomes approximated (use per-worker DRF).
+- **Burstiness**: DRF optimizes for long-term average; short-term bursts may feel unfair.

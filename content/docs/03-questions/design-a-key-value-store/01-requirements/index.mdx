@@ -1,0 +1,35 @@
+---
+title: Requirements
+description: Functional and non-functional requirements for distributed key-value store
+---
+
+## Functional Requirements
+
+- **Get/Set/Delete operations**: O(1) reads and writes for string keys and binary values.
+- **Batch operations**: Multi-get/set/delete in a single request for efficiency.
+- **TTL support**: Per-key expiration; auto-deletion of expired entries via background compaction.
+- **Range scans**: Key-prefix queries for sequential key patterns with lexicographic ordering.
+- **Replication**: Data replicated across multiple nodes for fault tolerance (N=3 by default).
+- **Consistency models**: Strong (linearizable) and eventual consistency modes selectable per-request.
+- **Auto-scaling**: Automatic partitioning and data migration as nodes are added or removed.
+- **Compaction**: Background garbage collection of expired and deleted entries, SSTable merging.
+
+## Non-Functional Requirements
+
+- **High throughput**: 100K+ read/write ops/sec per node with linear scaling across nodes.
+- **Low latency**: p99 read < 5ms, p99 write < 10ms on SSD-backed nodes.
+- **Durability**: Zero data loss across node failures; data survives node restarts and power loss.
+- **Availability**: 99.99% uptime during planned maintenance and single-node failures.
+- **Linear scalability**: Throughput scales linearly with added nodes; no hotspots.
+- **Fault tolerance**: Survive loss of up to (N-1)/2 nodes with majority-based replication.
+
+## Scale Assumptions
+
+- 100 nodes in production cluster
+- 10M keys per node (1B total keys)
+- Average key size: 64 bytes
+- Average value size: 1KB
+- 100K ops/sec read-heavy workload (80/20 read/write ratio)
+- 5MB/s write throughput per node
+- 50GB storage per node (5TB total)
+- 2 data centers for geo-redundancy

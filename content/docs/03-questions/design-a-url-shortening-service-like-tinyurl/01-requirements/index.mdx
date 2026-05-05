@@ -1,0 +1,53 @@
+---
+title: Requirements
+description: Functional, non-functional requirements, scale estimates, and assumptions for the URL shortening service.
+---
+
+### Functional Requirements
+
+1. **URL Shortening**: Convert long URLs into compact, alphanumeric short codes (e.g., `https://tiny.url/abc123`)
+2. **Redirect**: When a short URL is accessed, perform HTTP 301/302 redirect to the original long URL
+3. **Custom Aliases**: Allow users to specify custom short codes (e.g., `tiny.url/my-brand`)
+4. **Expiration**: Support configurable expiration times for short URLs (optional feature)
+5. **Analytics**: Track basic usage metrics: click count, geographic location, device type, timestamp
+6. **API Access**: Provide RESTful API for programmatic URL shortening and retrieval
+7. **Error Handling**: Return appropriate HTTP status codes for invalid URLs, duplicate aliases, expired links
+
+### Non-Functional Requirements
+
+1. **Scalability**: Support 5M+ daily active users, ~580 RPS creation / ~23K RPS redirect (peak 4×). Auto-scaling to handle traffic bursts.
+2. **Availability**: 99.99% uptime SLA with multi-region deployment (multi-AZ in 2+ regions)
+3. **Latency**:
+   - Short URL creation: < 100ms P95
+   - Redirect lookup: < 50ms P95
+4. **Durability**: 99.9999% data durability (no lost URLs)
+5. **Cost Efficiency**: Optimize for low infrastructure cost per operation
+6. **Security**:
+   - Prevent malicious URL shortening (phishing, malware)
+   - Rate limiting to prevent abuse
+   - HTTPS-only endpoints
+   - Input validation and sanitization
+7. **Reliability**: Handle partial failures gracefully (e.g., database outages)
+8. **Maintainability**: Modular architecture with clear separation of concerns
+9. **Extensibility**: Support future features (e.g., password protection, analytics dashboards)
+
+### Scale Estimates
+
+- **Daily active users**: 5M+
+- **New URLs per day**: 50M+
+- **Redirects per day**: 2B+
+- **Storage**: ~27 TB/year growth (50M new URLs/day × ~600 bytes per record including indexes + 3× replication ≈ 90 GB/day)
+- **Bandwidth**: ~83 Mbps average for redirect responses (2B redirects × ~300 bytes per 302 response ≈ 600 GB/day); peak ~4× average
+- **Throughput**: ~580 requests/second for creation (50M/day ÷ 86,400s); ~23,150 requests/second for redirection (average); peak 4× average (~92,600 RPS)
+- **Cache hit rate**: > 95% combined (local LRU + Redis) — hot 5% of URLs drive ~80% of redirect traffic
+- **Read-to-write ratio**: ~40:1 overall, but skewed: top 5% of URLs account for ~80% of reads
+
+### Assumptions
+
+- Primary use case: Marketing, social media sharing, SMS links
+- No need for user accounts (anonymous service)
+- Short codes should be 6-8 characters (base62: a-z, A-Z, 0-9)
+- Redirects should preserve original URL parameters
+- No need for URL editing after creation
+- Content is publicly accessible (no private/protected URLs)
+- Primary traffic pattern: ~40:1 read-to-write ratio, with heavy tail (top 5% of URLs drive ~80% of reads)

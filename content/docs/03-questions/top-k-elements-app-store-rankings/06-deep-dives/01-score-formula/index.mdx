@@ -1,0 +1,56 @@
+---
+title: Score Formula
+description: Signal normalization, weight assignment, and score composition.
+---
+
+## Signal Normalization
+
+Raw signals have different scales and ranges. Normalization to a consistent 0–100 scale is essential.
+
+| Signal | Raw Range | Normalization Method |
+|--------|----------|---------------------|
+| Downloads (daily) | 0 – 10M+ | **Percentile rank** against historical baseline: `score = percentile_rank(download_count) × 100` |
+| Ratings | 1.0 – 5.0 | **Linear scaling**: `score = (rating / 5.0) × 100` |
+| Sentiment | -1.0 – 1.0 | **Shift + scale**: `score = ((sentiment + 1) / 2) × 100` |
+| Crash-free rate | 0.0 – 1.0 | **Direct mapping**: `score = crash_free_rate × 100` |
+| Retention (D7) | 0.0 – 1.0 | **Direct mapping**: `score = retention_D7 × 100` |
+| Revenue (daily) | 0 – ∞ | **Percentile rank** against category baseline: `score = percentile_rank(revenue) × 100` |
+
+**Why percentile for downloads/revenue?** These follow a power-law distribution — raw values are dominated by a few blockbuster apps. Percentile ranking ensures fair comparison across the long tail.
+
+**Why linear for ratings?** Ratings are already on a bounded, meaningful scale.
+
+## Weight Assignment
+
+Weights reflect the relative importance of each signal to app quality and user satisfaction.
+
+| Signal | Weight | Rationale |
+|--------|--------|-----------|
+| Downloads | 0.25 | Strong indicator of user adoption and discoverability |
+| Ratings | 0.20 | Direct user satisfaction signal |
+| Sentiment | 0.10 | Qualitative satisfaction from review text |
+| Crash-free rate | 0.15 | Technical stability — critical for user experience |
+| Retention | 0.15 | Long-term value — users who keep using the app |
+| Revenue | 0.15 | Business health — revenue signals sustainable development |
+
+**Constraint:** `Σ weights = 1.0` — ensures total score is always in 0–100 range.
+
+## Score Composition
+
+```
+total_score = Σ (normalized_signal_i × weight_i)
+
+Example (Game A):
+  Downloads:  95.0 × 0.25 =  23.75
+  Ratings:    88.0 × 0.20 =  17.60
+  Sentiment:  72.0 × 0.10 =   7.20
+  Crash-free: 96.0 × 0.15 =  14.40
+  Retention:  45.0 × 0.15 =   6.75
+  Revenue:    82.0 × 0.15 =  12.30
+  ───────────────────────────────
+  total_score = 82.0
+```
+
+**Score stability:** Weights are updated via Admin API with gradual rollout (A/B testing over 48 hours). No single-weight change exceeds ±0.05 per update cycle.
+
+**Decomposability:** Each app's score is stored with `component_scores` map, enabling the `/score-breakdown` endpoint to explain why an app ranks where it does.

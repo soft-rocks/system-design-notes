@@ -1,0 +1,86 @@
+---
+title: Compaction Strategies
+description: Tiered vs size-tiered compaction, tombstone handling, and GC strategies
+---
+
+## The Compaction Problem
+
+As writes accumulate, multiple SSTable files are created on disk. Without compaction, reads would need to search through many files, degrading performance. Compaction merges multiple SSTables into fewer, larger files while removing expired entries and tombstones.
+
+**Without compaction, the read path degrades:**
+
+```
+After 1 hour of writes (64MB memtable flushes every ~10 seconds)
+  -> 360 SSTable files on disk
+  -> Each read must check all 360 index blocks
+  -> Read latency increases from O(1) to O(log n) where n = file count
+```
+
+## Tiered Compaction
+
+Tiered compaction organizes SSTables into levels (L0, L1, L2, ...), where each level is 10x larger than the previous:
+
+```
+Level 0:   10 SSTables, max 10 files   (memtable flush target)
+Level 1: 100 SSTables, max 100 files   (10x L0 size)
+Level 2:1000 SSTables, max 1000 files  (10x L1 size)
+...
+Level N: Unlimited, merged to final    (all data, no compaction target)
+```
+
+**How it works:**
+
+1. Memtable flush produces an L0 SSTable (not sorted relative to other L0 files).
+2. When L0 exceeds the file count limit, the compactor selects L0 files and the L1 files that overlap with them, merges them, and produces sorted L1 SSTables.
+3. The process repeats up the levels.
+
+**Tradeoff: compaction vs read performance**
+
+| Level | File Count Limit | Read Performance | Compaction Frequency |
+|---|---|---|---|
+| L0 | 4 | Good (small) | High |
+| L1 | 20 | Good | Moderate |
+| L2 | 100 | Good | Low |
+| L3+ | Unlimited | Depends on bloom filter coverage | Very low |
+
+**Why L0 is unsorted relative to other L0 files?**
+
+L0 SSTables can overlap in key ranges (because they come from independent memtable flushes). This means multiple L0 files may contain the same key. The read path checks all L0 files (in reverse creation order, newest first) to find the latest value. This is acceptable because L0 has a small file count limit, so the overhead is bounded.
+
+## Size-Tiered Compaction
+
+Size-tiered compaction merges SSTables of similar size:
+
+```
+Small tier: SSTables < 1GB (not compacted yet, waiting to grow)
+Medium tier: SSTables 1-10GB (merged when count exceeds threshold)
+Large tier: SSTables > 10GB (final, compacted only for tombstone cleanup)
+```
+
+**Why size-tiered over tiered?**
+
+Size-tiered has lower write amplification because it merges fewer files at a time. It's preferred for write-heavy workloads. Tiered compaction has higher write amplification (merging many files per level) but provides more consistent read latency.
+
+## Tombstone Handling
+
+When a key is deleted, a tombstone (key + null value) is written. The tombstone must be replicated to all replicas but eventually removed by compaction:
+
+```
+Set key="user:123", value="Alice"  -> SSTable L0: \{"user:123": "Alice"\}
+Delete key="user:123"              -> SSTable L0: \{"user:123": <tombstone>\}
+Compaction removes both entries    -> SSTable L1: (key "user:123" gone)
+```
+
+**Tombstone lifecycle:**
+
+A tombstone must be retained until all replicas have seen it. If a replica is offline and reconnects, it must receive the tombstone so it knows to delete the key. The tombstone can only be safely removed from disk after all replicas have compacted past it. This requires a tombstone retention period (typically 7-30 days) to accommodate slow or offline replicas.
+
+**Why not delete tombstones immediately?**
+
+If a follower is lagging (e.g., recovering from a crash), it may not have seen the delete. Without the tombstone, it would re-include the deleted key during data recovery. This is a fundamental challenge of eventual consistency: deletions must propagate before they are garbage collected.
+
+verification
+[] ## The Compaction Problem
+[] ## Tiered Compaction
+[] ## Size-Tiered Compaction
+[] ## Tombstone Handling

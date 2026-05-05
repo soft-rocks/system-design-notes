@@ -1,0 +1,36 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for distributed metrics logging and aggregation system
+---
+
+## Functional Requirements
+
+- **Metrics collection**: ingest metrics from thousands of application servers via a lightweight agent (e.g., statsd client, Prometheus node exporter, or OpenTelemetry collector)
+- **Metric types**: support counters (monotonically increasing), gauges (fixed values), histograms (value distributions), and summary metrics (pre-computed quantiles)
+- **Multi-dimensional labeling**: each metric can have arbitrary key-value labels (host, service, region, version, instance)
+- **Real-time aggregation**: compute per-minute, per-hour, per-day rollups at ingestion time to avoid slow scans at query time
+- **Query engine**: support ad-hoc queries over any metric with arbitrary label filters and time ranges (PromQL-like DSL)
+- **Retention management**: configurable retention for raw data (24h), aggregated data (90 days), and daily rollups (1 year)
+- **Alerting**: users define alert rules (thresholds on metrics over time windows); system evaluates rules on a schedule and fires alerts via webhook/pager/email
+- **Dashboard queries**: optimized read path for dashboard queries with high concurrency — typically 10–50 concurrent queries per minute
+
+## Non-Functional Requirements
+
+- **High ingest throughput**: 10M metrics/sec aggregate ingestion across all clusters
+- **Query latency**: p99 dashboard query < 2s for 5-min granularity over 24h; < 10s for 1h granularity over 30d
+- **Durability**: metric data must not be lost; at-least-once ingestion with deduplication (idempotent writes)
+- **Horizontal scalability**: add ingestion nodes and query nodes independently
+- **Multi-region**: support active-active writes across 2 regions; replication lag < 5s; failover RTO < 30s
+
+## Scale Assumptions
+
+| Metric | Value |
+|---|---|
+| Application servers | 10,000 |
+| Metrics per server | ~1,000 |
+| Peak ingestion rate | 10M metrics/sec |
+| Concurrent dashboard queries | ~50 |
+| Raw data retention | 24h (1-min granularity) |
+| Aggregated data retention | 90 days (5-min granularity) |
+| Daily rollup retention | 1 year |
+| Daily data volume | ~1TB raw (with labels and timestamps) |

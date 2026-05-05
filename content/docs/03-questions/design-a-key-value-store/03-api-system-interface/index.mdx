@@ -1,0 +1,34 @@
+---
+title: API / System Interface
+description: API and system interfaces for distributed key-value store
+---
+
+## Client API (RPC/HTTP)
+
+- **Get(key) -> (value, error)**: Retrieve the value for a given key. Returns `NOT_FOUND` if key does not exist or has expired.
+- **Set(key, value, ttl?) -> error**: Store a key-value pair with optional TTL in seconds. Overwrites existing value.
+- **Delete(key) -> error**: Remove a key. Tombstone written for replication and eventual garbage collection.
+- **BatchGet(keys) -> [(key, value), ...]**: Fetch multiple keys in a single RPC. Keys not found are omitted from the result.
+- **BatchSet(entries) -> error**: Store multiple key-value pairs atomically within a single partition.
+- **Scan(prefix, limit, after?) -> [(key, value), ...]**: Range scan for keys matching a prefix, ordered lexicographically. Limited to `limit` results with pagination via `after` cursor.
+
+## Consistency Control
+
+- **Read Your Writes**: Each client session maintains a vector clock. Reads automatically include the latest vector clock seen by the client.
+- **Strong Read Flag**: `Set(key, value, \{consistency: 'linearizable'\})` ensures the write is replicated to a majority before acknowledging.
+- **Eventual Read Flag**: `Get(key, \{consistency: 'eventual'\})` reads from any replica, reducing read latency but potentially returning stale data.
+
+## Admin API
+
+- **ClusterStatus() -> \{nodes, partitions, replicas, under_replicated_count\}**: Get cluster health and partition assignment status.
+- **AddNode(node_id, addr) -> migration_token**: Add a node to the cluster. Returns a token tracking the data migration progress.
+- **RemoveNode(node_id) -> migration_token**: Gracefully decommission a node. Reassigns its partitions to remaining nodes.
+- **Rescale(partitions, replicas) -> migration_token**: Change replication factor. Rebalances data across the cluster.
+- **GetMetrics() -> \{ops_per_sec, latency_p50, latency_p99, storage_used, compaction_progress\}**: Node-level operational metrics.
+
+## System Interface (Internal)
+
+- **Raft RPC**: Standard Raft protocol — `AppendEntries` for log replication, `RequestVote` for leader election. Each partition is an independent Raft group.
+- **Partition Lease**: Nodes hold a lease for their partition leadership. Lease expiry triggers election to avoid stale leadership.
+- **Heartbeat**: 100ms heartbeat between leader and followers. Missing 3 consecutive heartbeats triggers a health check; 10 misses marks the node as down.
+- **Compaction Service**: Periodically merges SSTables, removes expired entries, and compacts index blocks. Runs at low I/O priority to avoid impacting client latency.

@@ -1,0 +1,143 @@
+---
+title: Data Flow
+description: Write path, read path, and sync/replication flows for the Twitter design.
+---
+
+## Write Path
+
+### 1. Tweet Creation
+
+```
+Client → API Gateway → Auth Service → Tweet Service → Media Service → Timeline Service (fan-out trigger) → DB → Message Queue
+```
+
+1. Client sends POST `/api/v1/tweets` with text + optional media IDs to the API Gateway.
+2. API Gateway validates the JWT token (delegating to Auth Service).
+3. Tweet Service validates tweet content (length, attachment limits).
+4. If media IDs are provided, Tweet Service calls Media Service to validate the media assets exist and are associated with the author.
+5. Tweet Service writes the tweet to the database (relational DB for metadata, NoSQL shard for high-write throughput).
+6. On success, Tweet Service returns the tweet ID to the client.
+7. **Fan-out trigger:** Tweet Service publishes an event `TweetCreated \{tweetId, authorId, timestamp\}` to a message queue (Kafka).
+8. Timeline Service (consumer) receives the event and initiates the fan-out process (see below).
+
+### 2. Fan-Out Process (Write Side)
+
+For each new tweet, the system must push the tweet ID into every follower's home timeline cache.
+
+```
+Message Queue → Timeline Service → Fan-out Engine → Redis/DynamoDB (follower timelines)
+```
+
+**Push-based fan-out (for "regular" users):**
+1. Timeline Service fetches the tweet's metadata (author, text preview, media) from DB.
+2. For each follower, the tweet ID + metadata is prepended to the follower's timeline list in Redis (O(1) LPUSH).
+3. Redis is capped at ~1000-2000 most recent tweet IDs per user (trim old entries with TRIM).
+4. This is very fast for followers with small follower counts.
+
+**Pull-based (for "super-nodes" / celebrities):**
+1. The fan-out engine detects that a user (e.g., @celebrity with 10M+ followers) posted.
+2. Instead of pre-computing timelines for all 10M followers, the tweet is written to a "celebrity feed" index.
+3. When a normal user follows @celebrity, their timeline query is adjusted to also pull from @celebrity's celebrity feed.
+
+**Hybrid approach (recommended):**
+- **Fan-out-on-write (push):** For users with < N followers (e.g., N = 1000). Pre-compute timelines.
+- **Fan-out-on-read (pull):** For super-nodes with > M followers (e.g., M = 10000). Retrieve tweets at read time.
+- **Hybrid zone (N < followers < M):** Batch the fan-out (schedule during off-peak, or merge multiple tweets into a single write).
+
+### 3. Like / Retweet / Reply Write Path
+
+```
+Client → API Gateway → [Tweet Service / Like Service] → DB → Message Queue → Notification Service
+```
+
+1. Client sends the action (like, retweet, reply).
+2. Service validates the action and writes to DB.
+3. On success, an event is published to Kafka.
+4. Notification Service consumes the event and creates notification entries for the affected user(s).
+
+---
+
+## Read Path
+
+### 1. Home Timeline Read
+
+```
+Client → API Gateway → Timeline Service → Redis (timeline cache) → DB (fallback) → Client
+```
+
+1. Client sends GET `/api/v1/feed/home` with optional `since` cursor.
+2. API Gateway authenticates the user via JWT.
+3. Timeline Service queries the user's timeline cache in Redis (LRANGE for pagination).
+4. Redis contains a list of tweet IDs. Timeline Service batch-fetches tweet metadata using `GET /api/v1/tweets/multiple`.
+5. If the cache is stale or empty, Timeline Service falls back to querying the DB for recent tweets from followed users.
+6. For super-node tweets, the Timeline Service merges celebrity feed results into the response.
+7. Response is returned to the client.
+
+**Key optimization:** Timeline Service uses a cache-aside pattern. If Redis misses, read from DB and repopulate Redis.
+
+### 2. User Timeline Read
+
+```
+Client → API Gateway → Tweet Service → DB → Client
+```
+
+1. Client sends GET `/api/v1/users/:id/tweets`.
+2. Tweet Service queries the DB by `author_id` with `created_at DESC` ordering.
+3. Results are cached in Redis for `:id/tweets` key (TTL-based invalidation on new tweet).
+4. Paginated results returned.
+
+### 3. Tweet Thread / Reply Read
+
+```
+Client → API Gateway → Tweet Service → DB → Client
+```
+
+1. Client sends GET `/api/v1/tweets/:id/replies`.
+2. Tweet Service queries tweets with `in_reply_to_tweet_id = :id` ordered by `created_at ASC`.
+3. Root tweet fetched first, then replies in chronological order.
+
+### 4. Search Read
+
+```
+Client → API Gateway → Search Service → Elasticsearch → Client
+```
+
+1. Client sends GET `/api/v1/search/tweets?q=keyword`.
+2. Search Service receives the query and hits Elasticsearch.
+3. Elasticsearch returns ranked results (by relevance, recency).
+4. Results are cached in Redis for common queries.
+
+---
+
+## Sync/Replication Flow
+
+### Database Replication
+
+```
+Primary DB (Region A) → Async Replication → Read Replica (Region A)
+Primary DB (Region A) → Async Replication → Read Replica (Region B) — Cross-region DR
+```
+
+1. All writes go to the primary database (sharded by `author_id` or `tweet_id`).
+2. Async replication to read replicas for timeline reads, profile reads, and search indexing.
+3. Cross-region replication for disaster recovery (RPO ~ seconds).
+4. Write-heavy workloads are handled via connection pooling to read replicas.
+
+### Redis Replication
+
+1. Redis cluster is deployed with sentinel or cluster mode.
+2. Timeline caches are partitioned by user ID (consistent hashing).
+3. Cross-region replication of Redis keys for DR (though timeline cache RPO can be higher since it's ephemeral).
+
+### Kafka / Message Queue
+
+1. Kafka topics are partitioned and replicated (min ISR = 3).
+2. Topics: `tweet-created`, `like-created`, `retweet-created`, `follow-created`, `notification-event`.
+3. Each consumer group (Timeline Service, Notification Service) processes events independently.
+4. Exactly-once or at-least-once semantics (duplicates are handled idempotently).
+
+### Search Index Replication
+
+1. Tweet Service publishes `tweet-indexed` events to Kafka.
+2. Search Service consumes events and updates the Elasticsearch index.
+3. Elasticsearch shards are replicated across nodes for fault tolerance.

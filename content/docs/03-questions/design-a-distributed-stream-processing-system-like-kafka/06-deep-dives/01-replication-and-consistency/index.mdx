@@ -1,0 +1,81 @@
+---
+title: Replication and Consistency
+description: ISR protocol, leader failover, and consistency guarantees
+---
+
+## Leader-Replica Model
+
+Each partition has exactly one leader and zero or more followers. The leader handles all reads and writes for its partition. Followers perform a passive replication — they pull data from the leader but do not accept client reads or writes. This design eliminates consensus overhead per message: writes are single-leader append operations rather than multi-party consensus.
+
+**Why single-leader per partition instead of multi-leader?**
+
+Single-leader simplifies ordering guarantees: all messages within a partition are strictly ordered. Multi-leader would require sequence numbers and conflict resolution within each partition, adding complexity without proportional throughput gains — parallelism comes from having more partitions, not more leaders per partition.
+
+**Why passive followers instead of active?**
+
+Active (multi-active) replication requires the leader to wait for acknowledgment from followers before completing writes (or risk data loss). Passive replication allows async pull: followers independently request data from the leader at their own pace. This decouples follower latency from producer latency. The tradeoff is a brief window of potential data loss if the leader fails before followers have caught up.
+
+## In-Sync Replica (ISR) Protocol
+
+The ISR is a dynamic subset of replicas that are fully caught up with the leader. A replica joins the ISR when it has fetched up to the leader's high watermark and is deemed healthy. It leaves the ISR if it falls behind a configurable threshold (`replica.lag.time.max.ms`, default 30s) or fails its health check.
+
+The ISR shrinks and grows over time:
+
+```
+Time T1: Leader=[P1,F1,F2,F3]  ISR=[P1,F1,F2,F3]  HW=1000
+Time T2: F3 lags (network partition) ISR=[P1,F1,F2]    HW=1000 (unchanged)
+Time T3: F3 recovers, catches up  ISR=[P1,F1,F2,F3]   HW=1100 (jumps to current)
+```
+
+**High Watermark (HW)**: The offset of the last message replicated to all ISR members. Only messages up to the HW are "committed" and visible to consumers. This is the key invariant: if a leader fails, the new leader's log never has messages beyond the HW of the old ISR, so no committed data is lost.
+
+**Why not use all replicas for acks decision?**
+
+Tying acknowledgment to all replicas would make producer latency depend on the slowest replica. The ISR approach means acks only wait for replicas that are actually in sync. When a replica falls behind, it's removed from the ISR, and acks only wait for the remaining fast replicas.
+
+**Tradeoff: consistency vs availability**
+
+When the ISR shrinks to just the leader (all followers lag), the broker can still accept writes with `acks=all` — but any data written exclusively to the leader (not yet replicated) would be lost if the leader fails. This is an inherent tradeoff: you can guarantee both durability and availability only if enough replicas are in sync. The `unclean.leader.election.enable` config allows electing a non-ISR replica as leader, which maximizes availability but risks data loss.
+
+## Write Consistency Guarantees (acks)
+
+The `acks` config controls the durability-availability tradeoff for each produce request:
+
+| acks | Behavior | Durability | Latency | Use Case |
+|---|---|---|---|---|
+| 0 | Fire and forget | None | Lowest | Metrics, telemetry where loss is acceptable |
+| 1 | Leader acknowledges | Leader may lose data if it crashes before replicating | Low | Logging, non-critical events |
+| all (or -1) | All ISR acknowledge | No data loss as long as one ISR member survives | Higher | Financial transactions, order processing |
+
+**Why `acks=all` is not truly "no data loss":**
+
+With `acks=all`, the leader acknowledges a write only after all in-sync replicas have appended it. If the ISR contains only one member (the leader itself), acks=all provides no additional durability. True durability requires an ISR size > 1, which in turn requires followers that are consistently caught up.
+
+**Latency model:**
+
+```
+producer_latency = network_to_leader + leader_process_time + replication_to_ISR + network_back
+```
+
+The replication_to_ISR component is the variable part — if ISR members are on the same rack with low network latency, this is negligible (< 1ms). If followers are in a different data center, it adds cross-DC latency (10-100ms).
+
+## Leader Failover
+
+When a leader fails, the first replica in the ISR (by partition assignment order) becomes the new leader automatically. This happens because the coordination store (ZooKeeper or Raft) detects the session expiration and triggers a new partition leader election.
+
+**Failover timeline:**
+
+```
+T0:    Leader crashes
+T0+50ms:  Follower detects connection loss (socket timeout)
+T0+300ms: Coordination store detects session expiration
+T0+350ms: New leader elected (first in ISR)
+T0+400ms: Metadata updated in coordination store
+T0+500ms: Clients receive updated metadata (next metadata fetch)
+```
+
+Total failover time: ~500ms, during which the partition is unavailable. Producers will get `NotLeaderForPartition` errors until their metadata refreshes.
+
+**Why not pre-warm standby leaders?**
+
+Pre-warming would double the replication work for every partition, halving effective throughput. The single-leader model accepts brief unavailability during failover as a tradeoff for higher steady-state throughput. For use cases requiring zero downtime, clients implement retry logic with exponential backoff.

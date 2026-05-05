@@ -1,0 +1,163 @@
+---
+title: "Approximate Counting"
+description: "When and how to use Count-Min Sketch for memory-efficient counter management"
+---
+
+## Counting vs. Memory: The Tradeoff
+
+With ~100K active articles, 234 buckets (across all granularities), and 100 bytes per counter key, we need ~2.3GB of Redis memory. This is manageable but not optimal. The question is: **do we need exact counts everywhere?**
+
+For a trending system, the answer is **no, not everywhere**:
+- **Top 100 articles**: need exact counts (they're being displayed to users)
+- **Articles ranked 101–10K**: need near-exact counts (good enough to rank correctly)
+- **Articles ranked 10K+**: don't matter — they can never be in the top K
+
+This observation leads to a **hybrid approach**: exact counts for the hot tail, approximate counts for the cold tail.
+
+## Count-Min Sketch (CMS)
+
+A Count-Min Sketch is a probabilistic data structure that provides approximate counts using sub-linear memory.
+
+```
+CMS Sketch (256 bytes for ε=0.001, δ=0.01):
+  ┌────────────────────────────────────────┐
+  │  row 0: [8] [3] [1] [7] [2] ... [5]    │  ← h₁
+  │  row 1: [2] [7] [4] [1] [9] ... [0]    │  ← h₂
+  │  row 2: [5] [1] [6] [3] [1] ... [4]    │  ← h₃
+  │  row 3: [1] [4] [2] [8] [3] ... [2]    │  ← h₄
+  └────────────────────────────────────────┘
+  Hash functions: h₁, h₂, h₃, h₄ with widths=256, depth=4
+  Total memory: 4 × 256 × 4 bytes = 4KB per sketch
+```
+
+### How CMS Works
+
+**Increment** (for event with article_id = "art_123"):
+```python
+for each hash function h_i:
+    sketch[h_i(article_id)] += 1
+```
+Time: O(depth), ~4 operations.
+
+**Query** (count for "art_123"):
+```python
+return min(h_i(article_id) for each row i)
+```
+Returns the **minimum** across all hash rows.
+
+**Why minimum?** The minimum is the closest to the true count. Other rows may have collisions (other articles hashing to the same cell), which cause **overcounting** — never undercounting.
+
+### Error Bounds
+
+Given parameters:
+- `ε` (epsilon): relative error. With ε=0.001, the estimate has error ≤ 0.1% of total event count.
+- `δ` (delta): failure probability. With δ=0.01, 99% of queries are within bounds.
+
+Memory: O((1/ε) × log(1/δ))
+
+| ε | δ | Rows | Width | Memory |
+|---|---| --- | --- | --- |
+| 0.001 | 0.01 | 4 | 256 | 4 KB |
+| 0.0001 | 0.001 | 7 | 10,000 | 112 KB |
+| 0.00001 | 0.0001 | 10 | 100,000 | 1.5 MB |
+
+For our use case, a small sketch (4–7 rows, 256–1000 columns) at 4–28 KB is negligible compared to 2.3GB for exact counters.
+
+## Hybrid Architecture
+
+```
+                    Incoming events
+                         │
+                   Partition by article_id
+                         │
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+    ┌─────────────┐ ┌───────────┐ ┌──────────────┐
+    │ Hot Articles │ │  Medium   │ │  Cold Articles│
+    │ (Top 1K)    │ │ (1K–10K)  │ │ (10K+)       │
+    │              │ │           │ │              │
+    │ Exact Redis  │ │ CMS sketch│ │ CMS sketch   │
+    │ counters     │ │ (shared)  │ │ (shared)     │
+    └─────────────┘ └───────────┘ └──────────────┘
+```
+
+### Classification: Hot vs. Medium vs. Cold
+
+```python
+# Check every 10 seconds
+def classify_article(article_id):
+    count = redis.get_counter_sum(article_id)  # sum across all buckets
+    rank = top_k_ranking(article_id)
+
+    if rank &lt;= 1000:
+        return "hot"
+    elif rank &lt;= 10000:
+        return "medium"
+    else:
+        return "cold"
+```
+
+**Dynamic classification**: An article moves from cold → medium → hot as it gains shares. The classification is checked every 10 seconds by a background worker.
+
+### Querying the Hybrid System
+
+```python
+def get_count(article_id, window):
+    if classify(article_id) == "hot":
+        return redis.sum_counter_buckets(article_id, window)  # exact
+    elif classify(article_id) == "medium":
+        return cms_medium.query(article_id, window)  # approximate, ε=0.001
+    else:
+        return cms_cold.query(article_id, window)  # approximate, ε=0.01
+```
+
+### Top-K with Hybrid Counts
+
+```python
+def get_top_k(window, K&gt;):
+    # Step 1: Exact counts for hot articles
+    hot_candidates = redis.scan_hot_articles()  # ~1K articles, exact counts
+
+    # Step 2: CMS gives us a hint for cold articles
+    # CMS can't directly give top-K (no way to scan), but we can use
+    # it for candidate filtering when a query includes a specific article
+    cold_estimates = cms_cold.batch_query(cold_candidate_list)  # if known
+
+    # Step 3: Combine and rank
+    all_counts = hot_candidates + cold_estimates
+    return top_k_algorithm(all_counts, K&gt;)
+```
+
+**Important caveat**: CMS cannot efficiently scan all articles for top-K (no key enumeration). So the hybrid approach works best when:
+1. The hot set (~1K–10K articles) fits in Redis and provides exact counts.
+2. CMS is used for **point lookups** (e.g., "how many shares did article X get?"), not for global ranking.
+3. The global top-K is computed only from exact counters; CMS supplements for non-rank queries.
+
+## Error Analysis: False Positives vs. False Negatives
+
+| Error Type | What Happens | Impact |
+| --- | --- | --- |
+| **False positive** (overcount) | CMS overestimates a cold article's count | Article ranks slightly higher than it should. Since cold articles can't be in top-K, impact is negligible. |
+| **False negative** (undercount) | CMS underestimates a hot article's count | **Never happens** with CMS — the minimum ensures we never undercount. |
+
+**CMS guarantees: no undercount.** This is critical — we can't accidentally demote a genuinely trending article due to approximation errors.
+
+## CMS vs. HyperLogLog
+
+| Feature | Count-Min Sketch | HyperLogLog |
+| --- | --- | --- |
+| Purpose | Approximate **counts** | Approximate **distinct elements** (cardinality) |
+| Supports increment | Yes | No (batch only) |
+| Supports point query | Yes (get count of specific item) | No (only total cardinality) |
+| Memory | O((1/ε) × log(1/δ)) | O(log log n) |
+
+For this problem, CMS is the right choice because we need per-article counts, not distinct user counts.
+
+## When to Use Pure CMS (No Exact Counters)
+
+If the active article space grows beyond 1M articles, Redis exact counters become expensive. At that scale:
+- Use CMS for all articles (4KB per sketch × batch per window = ~12KB × 3 windows = 36KB total)
+- Accept that the exact ranking of articles near the K boundary may have small errors
+- This is acceptable for "trending" use cases where approximate ranking is sufficient
+
+For our scale (100K active articles, 2.3GB Redis), the hybrid approach is overkill. Pure exact counters with hierarchical bucketing is sufficient and simpler.

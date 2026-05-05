@@ -1,0 +1,40 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for distributed stream processing system
+---
+
+## Functional Requirements
+
+- **Persistent message log**: append-only log with durable storage (disk-backed), retained for configurable period (days to months)
+- **Pub/Sub model**: producers publish to topics; consumers subscribe to topics
+- **Partitioning**: topics are split into partitions for parallelism; messages within a partition are strictly ordered by sequence number
+- **Consumer groups**: consumers form groups; each partition is consumed by exactly one consumer in the group; dynamic partition reassignment on member join/leave
+- **Offset management**: consumers track their position (offset) in each partition; supports manual and auto-commit with configurable intervals
+- **Fault tolerance**: replicas per partition (leader-follower); automatic leader election on broker failure; zero data loss for in-sync replicas
+- **Exactly-once semantics**: support at-least-once, at-most-once, and exactly-once delivery guarantees per producer session
+- **Stream processing**: lightweight processing via streaming APIs — transforms, filters, joins, windowed aggregations
+- **Schema registry**: manage message schemas (Avro/Protobuf) with backward/forward/compatible checking
+- **Connect framework**: built-in connectors for common data sources and sinks (databases, message queues, file systems, Kafka topics)
+- **Multi-tenancy**: isolation between tenants, per-topic and per-client quota controls, ACL-based access
+
+## Non-Functional Requirements
+
+- **High throughput**: 100K messages/sec per broker; 1M+ messages/sec for a 10-broker cluster
+- **Low latency**: p99 producer-to-consumer latency < 10ms for in-sync consumers
+- **Durability**: zero data loss — all committed messages are replicated across ≥3 brokers; persisted to disk before ack
+- **Horizontal scalability**: add brokers without downtime; linear throughput increase; auto-partition rebalancing
+- **Data retention**: configurable retention (time-based or size-based); auto-delete expired data efficiently
+- **Operations simplicity**: support cluster rebalancing, broker replacement, and topic lifecycle via simple HTTP/gRPC APIs
+
+## Scale Assumptions
+
+| Metric | Value |
+|---|---|
+| Broker nodes | 100 |
+| Total topics | 100,000 (shared across tenants) |
+| Peak ingestion | 1B messages/sec cluster-wide |
+| Total stored | 100B messages/day |
+| Average message size | 1KB |
+| Retention | 7 days (standard), 30 days (compliance), 1 year (audit) |
+| New data per day | ~10TB across all topics |
+| Concurrent consumer groups per topic | Up to 10 (one per downstream system) |

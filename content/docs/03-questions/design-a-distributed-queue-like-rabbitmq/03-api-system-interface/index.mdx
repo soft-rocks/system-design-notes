@@ -1,0 +1,161 @@
+---
+title: API / System Interface
+description: AMQP 0-9-1 protocol, Management REST API, cluster coordination, and internal service interfaces.
+---
+
+## AMQP 0-9-1 Protocol (Binary Framing)
+
+### Connection Lifecycle
+
+TCP connect → negotiate parameters → TCP close.
+
+### Channel Management
+
+- `channel.open()` → `channel.open-ok`
+- Channels multiplexed over a single TCP connection
+
+### QoS / Flow Control
+
+`basic.qos(prefetch_count, prefetch_size, global=false)` → `basic.qos-ok`
+
+| Parameter | Description |
+|-----------|-------------|
+| `prefetch_count` | Max unacked messages buffered per consumer |
+| `global` | If true, applies across all channels on the connection |
+
+### Message Publishing
+
+`basic.publish(exchange, routing_key, mandatory=false, immediate=false)` → message body frame → `basic.ack` (publisher confirm mode)
+
+| Flag | Behavior |
+|------|----------|
+| `mandatory` | Return to publisher if no queue bound to routing key |
+| `immediate` | Deliver to active consumer or return (deprecated) |
+
+### Message Consumption
+
+`basic.consume(queue, consumer_tag="", no_ack=false, exclusive=false, arguments={})` → `basic.consume-ok`
+
+**Delivery flow:**
+```
+basic.deliver(consumer_tag, delivery_tag, redelivered, exchange, routing_key)
+  → basic.ack(delivery_tag, multiple=false)   // success
+  → basic.nack(delivery_tag, requeue=true)    // reject + requeue
+  → basic.reject(delivery_tag, requeue=true)  // single reject (no multiple)
+```
+
+### Transaction Mode
+
+`tx.select()` → `tx.commit()` / `tx.rollback()` — channel-level transactions.
+
+---
+
+## Management HTTP API (REST)
+
+**Authentication:** cookie-based (guest/guest default) or token-based.
+
+### Overview
+
+`GET /api/overview` — cluster info, algorithm, node, erlang_version, object_counts, limits.
+
+### Queues
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/queues/vhost/` | List all queues |
+| GET | `/api/queues/vhost/name` | Queue details (message_stats, memory, disk_reads) |
+| POST | `/api/queues/vhost/name` | Declare queue |
+| PUT | `/api/queues/vhost/name` | Update queue (idempotent) |
+| DELETE | `/api/queues/vhost/name` | Delete queue |
+
+**Publish without client channel:**
+`POST /api/queues/vhost/name/publish`
+
+```json
+{
+  "payload": "...",
+  "properties": \{ "content_type": "application/json", "delivery_mode": 2 \},
+  "routing_key": "orders.created",
+  "headers": {}
+}
+```
+
+**Synchronous get:**
+`GET /api/queues/vhost/name/get` — Body: `\{ count, ack_mode, prefetch, truncate, encoding \}`
+
+### Exchanges & Bindings
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/exchanges/vhost/` | List exchanges |
+| PUT | `/api/exchanges/vhost/name` | Declare exchange |
+| DELETE | `/api/exchanges/vhost/name` | Delete exchange |
+| PUT | `/api/bindings/vhost/e/q/source/destination/pKey` | Bind |
+| GET | `/api/bindings/vhost/e/q/source/destination` | List bindings |
+| DELETE | `/api/bindings/vhost/e/q/source/destination/pKey/properties_key` | Unbind |
+
+### Channels, Connections, Consumers
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/channels/vhost/` | List channels (receiver_pid, messages_unack, prefetch_count) |
+| GET | `/api/connections/vhost/` | List connections (peer_address, state) |
+| DELETE | `/api/connections/name` | Force close |
+| GET | `/api/queues/vhost/name/consumers` | List consumers |
+
+### Vhosts & Permissions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/vhosts/` | List vhosts |
+| PUT | `/api/vhosts/name` | Create vhost |
+| PUT | `/api/vhosts/name/permissions` | Set permissions (configure/write/read) |
+
+---
+
+## Cluster Coordination (Node Discovery)
+
+RabbitMQ uses Erlang distribution for node coordination.
+
+**Auto-clustering** (RabbitMQ 3.32+): 3-node quorum of boot nodes for gossip-free startup.
+
+`rabbitmqctl join_cluster <node>` — joins existing cluster; learns topology via coordinator.
+
+### Queue Replication Models
+
+| Model | Type | Consistency | Auto-heal |
+|-------|------|-------------|-----------|
+| **Classic Mirror** | RPC-based sync | Master-writes, slaves replicate | Manual promote |
+| **Quorum Queue** | Raft consensus | Linearizable via Raft | Automatic leader election |
+
+**Classic Mirror:** `set_policy mirror <pattern> --ha-mode nodes --ha-params [node1, node2]`
+- One master per mirrored queue; slaves sync from master via RPC
+
+**Quorum Queue:** `--queue-type quorum`
+- Leader-follower via Raft; leader handles all writes; followers apply log entries
+- Auto-heal: new leader elected on failure
+
+---
+
+## Exchange-to-Exchange Binding
+
+Exchanges bind to other exchanges for fan-out routing trees.
+
+`PUT /api/bindings/vhost/source_exchange/destination_exchange`
+
+Useful for message transformation chains: exchange → exchange → exchange → queue.
+
+---
+
+## Internal Service Interfaces
+
+| Service | Methods | Responsibility |
+|---------|---------|----------------|
+| `QueueService` | `Declare/Publish/Consume/Ack/Nack` | Core queue operations |
+| `ExchangeService` | `Publish/Route(exchange, key, msg) → [queue]` | Message routing |
+| `BindingService` | `Bind/Unbind/MatchBindings(exchange, key) → [binding]` | Binding management |
+| `PublisherConfirm` | `Confirm(delivery_tags) → ack/nack`, `Return(no-route msg)` | Delivery confirmation |
+| `MirrorService` | `Mirror/Sync/Promote(master → slave)` | Classic mirror replication |
+| `RaftService` | `Leader/Propose/Read(queue, index)` | Quorum queue replication |
+| `FlowControl` | `CheckMemoryThreshold/ThrottlePublisher/DrainQueue` | Back-pressure management |
+| `ManagementAPI` | REST endpoints | Monitoring, metrics export (Prometheus) |

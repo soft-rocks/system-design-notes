@@ -1,0 +1,91 @@
+---
+title: High Level Design
+description: Architecture, components, and technology choices for the API rate limiter
+---
+
+## Architecture Overview
+
+The system has three layers:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      API Ecosystem                               │
+│                                                                  │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│   │ GW Node1 │  │ GW Node2 │  │  ...     │  │ GW NodeN │       │
+│   └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│        │ gRPC         │ gRPC        │ gRPC         │ gRPC        │
+│        └──────────────┴─────┬───────┴──────────────┘             │
+│                              │                                    │
+│                   ┌─────────▼──────────┐                         │
+│                   │  Rate Limiter      │                         │
+│                   │  Service (cluster) │                         │
+│                   │  ┌──────────────┐  │                         │
+│                   │  │ Local LRU    │  │ ← policy cache (30s)   │
+│                   │  │ Policy Cache │  │                         │
+│                   │  └──────────────┘  │                         │
+│                   └─────────┬──────────┘                         │
+│                              │                                    │
+│                   ┌──────────▼──────────┐                        │
+│                   │   Config Store       │                        │
+│                   │   (etcd cluster)     │                        │
+│                   └─────────────────────┘                        │
+│                                                                  │
+│                   ┌─────────────────────┐                        │
+│                   │   Redis Cluster      │                        │
+│                   │   (Redis Sentinel or │                        │
+│                   │    Redis Cluster)    │                        │
+│                   └─────────────────────┘                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Key design decisions:
+- **Sidecar model**: Rate Limiter Service runs alongside each API Gateway node (co-located). This keeps the hot path short — gRPC is sub-millisecond on the same machine.
+- **Shared state in Redis**: Rate limit state lives in Redis (distributed store), not in local memory. This ensures consistency across all gateway nodes for the same client.
+- **Config via etcd**: Policy changes are propagated via etcd watch streams, giving each node an eventually consistent (within ~100ms) view of the current policy.
+
+## Component Diagram
+
+```
+┌────────────┐    gRPC Check    ┌──────────────────┐     Lua script    ┌──────────────┐
+│ API Gateway│ ────────────────►│ Rate Limiter       │ ───────────────►│ Redis Cluster│
+│            │ ◄─────────────── │  Service           │                 │              │
+│ - Extract  │    \{allowed,     │  ┌──────────────┐  │                 │ - rl:{id\}:   │
+│   clientID │    remaining,    │  │ Local Cache  │  │                 │   \{scope\}:   │
+│ - Add      │    reset}        │  │ (policies)   │  │                 │   tokens,    │
+│   headers  │                  │  └──────────────┘  │                 │   lastRefill │
+└────────────┘                  │  ┌──────────────┐  │                 └──────────────┘
+                                │  │ etcd Watch   │  │                        ▲
+                                │  │ (policy sync)│  │                        │
+                                │  └──────────────┘  │                        │
+                                └──────────────────┘                        │
+                                                                            │
+┌────────────┐    REST POST/PUT     ┌──────────────┐   etcd write           │
+│ Admin API  │ ──────────────────► │ Config GW     │                      │
+│            │                      │ (policy store)│                      │
+└────────────┘                      └──────────────┘                      │
+                                                                        Lua script
+                                                                        (atomic read-modify-write)
+```
+
+## Technology Choices
+
+| Component | Choice | Rationale | Alternatives Considered |
+|---|---|---|---|
+| **Rate limit algorithm** | Token Bucket | Supports both sustained rate and burst; more flexible than fixed-window | Sliding Window Log (accurate but memory-heavy), Fixed Window (burst at boundaries), Leaky Bucket (harder to configure burst) |
+| **Distributed store** | Redis Cluster (or Sentinel) | Sub-millisecond reads/writes; Lua scripting for atomicity; well-understood | Memcached (no Lua), Cassandra (higher latency), DynamoDB (cold start variance) |
+| **Config store** | etcd | Strong consistency + watch streams + built-in lease for key expiration | Consul (heavier), ZooKeeper (ZAB protocol is complex), Redis PubSub (no persistence) |
+| **RPC** | gRPC | Low overhead, strongly-typed contracts, HTTP/2 multiplexing | REST (too much JSON overhead), Thrift (less mature ecosystem) |
+| **Policy cache** | In-memory LRU | Avoids config store round-trip on every request | External cache (adds network hop) |
+
+### Why Redis over in-memory + leader election?
+
+An alternative is to keep all state in-memory on one leader node. But Redis wins because:
+1. **No leader election complexity** — etcd or Consul leader election is error-prone and adds latency during failover.
+2. **Redis is fast enough** — single-hop Redis is ~0.2ms; the Lua script adds ~0.1ms overhead. Total p99 is well under 1ms.
+3. **Built-in persistence** — RDB snapshots prevent state loss on restart.
+4. **Scales horizontally** — Redis Cluster supports sharding by key hash, so state for 1M clients can span multiple nodes.
+
+### Why Lua scripts in Redis?
+
+Without Lua, a check-and-consume requires two round-trips (GET then SET), which is **non-atomic**. Two concurrent requests could both read `tokens = 5`, both deduct, and leave `tokens = -5`. Lua scripts execute atomically on the Redis server — only one script runs at a time, guaranteeing linearizable consistency.

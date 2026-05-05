@@ -1,0 +1,181 @@
+---
+title: "High Level Design"
+description: "High-level architecture for the most shared articles tracking system"
+---
+
+## Architecture Overview
+
+The system uses a **Lambda-style architecture** combining a durable event log with a low-latency counter store:
+
+```
+                            ┌─────────────┐
+                            │   Kafka     │
+                            │  (durable   │
+                            │   event log) │
+                            └──────┬──────┘
+                                   │ consume (3 parallel streams)
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+          ▼                        ▼                        ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ Aggregation     │    │ Aggregation     │    │ Aggregation     │
+│ Stream (5min)   │    │ Stream (1hr)    │    │ Stream (24hr)   │
+│ 10s buckets     │    │ 1min buckets    │    │ 10min buckets   │
+└────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+         │                      │                      │
+         └──────────────────────┼──────────────────────┘
+                                │
+                                ▼
+                  ┌─────────────────────────┐
+                  │     Redis Cluster       │
+                  │  (sharded counters +    │
+                  │   metadata cache)       │
+                  └────────────┬────────────┘
+                               │
+                    ┌──────────┼──────────┐
+                    │          │          │
+                    ▼          ▼          ▼
+          ┌────────────┐ ┌─────────┐ ┌──────────┐
+          │ Query API  │ │  SSE    │ │  Admin  │
+          │ (TopK)     │ │ Stream  │ │  Panel  │
+          └────────────┘ └─────────┘ └──────────┘
+```
+
+**Core principles**:
+1. **Durable-by-default**: Kafka is the source of truth; Redis is the fast path.
+2. **Independent scaling**: ingestion, aggregation, and query layers can scale independently.
+3. **Push-based aggregation**: counters are updated as events arrive, making reads O(1).
+
+## Component Diagram
+
+```
+                           External Sources
+                     Twitter │ Facebook │ Email │ SDK
+                               ▼
+                    ┌──────────────────────┐
+                    │   Ingestion Gateway   │  ← Stateless, horizontally scaled
+                    │   • Rate limiting     │     (10–50 instances)
+                    │   • Validation        │
+                    │   • Deduplication     │
+                    │     (idempotency key) │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │     Kafka Cluster     │  ← Partitions by article_id
+                    │   Topic: share-events │     replication=3
+                    │   Partitions: 48+     │
+                    └────┬───────┬────┬─────┘
+                         │       │    │
+              ┌──────────┘       │    └──────────┐
+              ▼                  ▼                 ▼
+     ┌────────────────┐ ┌──────────────┐ ┌────────────────┐
+     │ Stream Proc    │ │ Stream Proc  │ │ Stream Proc    │
+     │ Consumer Group │ │ Consumer     │ │ Consumer       │
+     │ (5min gran.)   │ │ (1hr gran.)  │ │ (24hr gran.)   │
+     └───────┬────────┘ └──────┬───────┘ └───────┬────────┘
+             │                 │                  │
+             ▼                 ▼                  ▼
+     ┌───────────────────────────────────────────────────┐
+     │                Redis Cluster (Tair)                │
+     │                                                   │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │  Counter Keyspace (sharded)                  │  │
+     │  │  counter:5m:10s:<ts>:<article_id> → count   │  │
+     │  │  counter:1h:1m:<ts>:<article_id> → count    │  │
+     │  │  counter:24h:10m:<ts>:<article_id> → count  │  │
+     │  └─────────────────────────────────────────────┘  │
+     │                                                   │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │  Cache Keyspace                              │  │
+     │  │  article:<id> → \{title, category, url\}      │  │
+     │  │  query:<hash>  → TopKResult (TTL=5s)        │  │
+     │  └─────────────────────────────────────────────┘  │
+     └───────────────────────┬───────────────────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+     ┌────────────┐  ┌──────────┐  ┌─────────────┐
+     │ TopKService │  │ SSE      │  │  Admin API  │
+     │ (stateless) │  │ Server   │  │  (monitoring│
+     └────────────┘  └──────────┘  │  dashboard) │
+                                   └─────────────┘
+```
+
+### Component Details
+
+| Component | Instances | State | Key Responsibility |
+| --- | --- | --- | --- |
+| Ingestion Gateway | 10–50 | Stateless | Validate, dedupe, forward to Kafka |
+| Kafka Cluster | 3–7 brokers | Distributed log | Durable event storage, partitioned delivery |
+| Stream Processor (5min) | 3–6 | Stateless | Aggregate into 10s buckets, write Redis |
+| Stream Processor (1hr) | 3–6 | Stateless | Aggregate into 1min buckets, write Redis |
+| Stream Processor (24hr) | 3–6 | Stateless | Aggregate into 10min buckets, write Redis |
+| TopKService | 5–10 | Stateless | Compute top-K from Redis counters |
+| Redis Cluster | 3–6 shards | Distributed cache | Low-latency counter storage |
+
+## Technology Choices
+
+### Why Redis (not DynamoDB/Cassandra)?
+
+| Criteria | Redis | DynamoDB | Cassandra |
+| --- | --- | --- | --- |
+| Latency | **< 1ms p99** | 10–30ms | 5–20ms |
+| Atomic INCR | **Native** | Emulated | Not available |
+| TTL support | **Native** | TTL plugin | TTL column |
+| Throughput | **500K+ ops/sec/shard** | Scales well | Scales well |
+
+Redis wins on latency and atomic operations. The counter workload is read-heavy (INCR) with simple key lookups — a perfect fit for an in-memory store.
+
+### Why not maintain top-K in a sorted set?
+
+A common alternative is to store each article in a Redis sorted set per window (e.g., `zadd topk:5m <count> <article_id>`). This has tradeoffs:
+
+| Approach | Pros | Cons |
+| --- | --- | --- |
+| **Sorted set (ZRANGE)** | Built-in ranking, O(log n) insert | O(n) to evict old entries; global sort is expensive at scale |
+| **Counter buckets + min-heap** | Independent TTL per bucket, O(n log K) query, memory efficient | More complex query logic |
+
+We choose **counter buckets + min-heap** because:
+- Each bucket gets a TTL, so old buckets auto-expire without maintenance.
+- With 100K active articles, scanning all counters takes < 10ms via pipeline MGET.
+- The min-heap of size K avoids full sorting.
+
+### Why Kafka (not RabbitMQ/Pulsar)?
+
+| Criteria | Kafka | RabbitMQ | Pulsar |
+| --- | --- | --- | --- |
+| Throughput | **Very high** | Moderate | Very high |
+| Retention | **Days (configurable)** | Until consumed | Years |
+| Replay | **Built-in** | No | Yes |
+| Partitioning | **By key (guaranteed order)** | Per-queue | By topic |
+
+Kafka's key partitioning guarantees all events for the same article go to the same consumer, preventing race conditions during aggregation.
+
+## System Deployment
+
+```
+                    AWS Regions: 2 (active-passive)
+                    Redis: ElastiCache (multi-AZ)
+                    Kafka: MSK (multi-AZ)
+
+          ┌─────────────────────────────────────────────┐
+          │              us-east-1 (Primary)             │
+          │                                              │
+          │  ┌─ Ingestion Gateway ─┐                     │
+          │  │  (EKS, 20 pods)     │                     │
+          │  └─────────────────────┘                     │
+          │                                              │
+          │  ┌─ Kafka Cluster (3 MSK nodes)             │
+          │  ┌─ Stream Processors (30 pods)              │
+          │  ┌─ TopKService (10 pods)                    │
+          │  ┌─ Redis Cluster (3 shards × 2 replicas)    │
+          │                                              │
+          └─────────────────────────────────────────────┘
+                         │ sync
+          ┌─────────────────────────────────────────────┐
+          │           us-west-2 (Standby)                │
+          │         (Kafka + Redis replication)          │
+          └─────────────────────────────────────────────┘
+```

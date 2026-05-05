@@ -1,0 +1,110 @@
+---
+title: Data Flow
+description: Data flow for distributed key-value store
+---
+
+## Write Path
+
+```
+Client -> Set(key="user:123", value="...", ttl=3600)
+         |
+         v
+    Hash(key) -> partition_id = Hash(key) % num_partitions
+         |
+         v
+    Lookup metadata cache -> leader for partition_id (Node A)
+         |
+         v
+    Node A (leader)
+         |-- 1. Append to local WAL (fsync)
+         |-- 2. Write to in-memory memtable (skip-list, sorted)
+         |
+         v
+    Node A proposes Raft log entry to followers
+         |
+         v
+    Followers (Node B, Node C) replicate and acknowledge
+         |
+         v
+    Quorum (leader + 1 follower) acknowledges -> write committed
+         |
+         v
+    Node A acknowledges success to client
+```
+
+1. Client sends SET request to the cluster's bootstrap endpoint. The client metadata cache maps the key hash to the responsible partition leader.
+2. Leader appends to the Write-Ahead Log (fsync to ensure durability).
+3. Leader writes to the in-memory memtable (a skip-list sorted by key).
+4. Leader proposes the mutation as a Raft log entry. Followers replicate and commit the entry.
+5. When quorum commits, leader acknowledges to client. Total latency = WAL fsync + Raft round-trip + memtable write.
+
+## Read Path
+
+```
+Client -> Get(key="user:123")
+         |
+         v
+    Hash(key) -> partition_id
+         |
+         v
+    Lookup metadata cache -> leader (Node A)
+         |
+         v
+    Node A (leader) reads from:
+         |-- Memtable (skip-list) — O(log n)
+         |   |-- If found, return value
+         |
+         |-- SSTable files (binary search on index)
+         |   |-- Bloom filter skip (if key not present, skip file read)
+         |   |-- Index block lookup -> file offset
+         |   |-- Read value from SSTable
+         |
+         |-- If not found, return NOT_FOUND
+         |
+         v
+    If strong read requested: check latest Raft term (no stale data)
+```
+
+1. Client computes the partition from the key hash and queries the leader.
+2. Leader checks the memtable first (in-memory, fastest).
+3. If not in memtable, checks the index blocks of SSTable files (in-memory hash map to file offsets).
+4. If index misses, reads the SSTable file to verify (bloom filter optimizes this by skipping unnecessary file reads).
+5. If strongly consistent, verifies the read term matches the latest committed term.
+
+## Sync/Replication Flow
+
+```
+Leader (Node A) writes to partition P
+         |
+         |-- Raft AppendEntries with new log entry
+         |       |
+         |       v
+         |  Follower (Node B) — ack after WAL written
+         |       |
+         |       v
+         |  Follower (Node C) — ack after WAL written
+         |
+         v
+    Quorum reached (A + B or A + C)
+         |
+         v
+    Leader commits entry, applies to memtable
+         |
+         v
+    Leader increments high watermark (last committed entry index)
+         |
+         v
+    Followers advance their high watermark and apply entries in order
+         |
+         v
+    Once follower catches up with leader, it becomes "in sync"
+         |
+         v
+    If follower falls behind (network lag, GC pause), it catches up via bulk transfer
+```
+
+1. Leader sends Raft AppendEntries RPCs to all followers with the new log entry.
+2. Followers append to their WAL and ack. Raft requires a majority (2 of 3) to commit.
+3. Once committed, the leader applies the entry to its memtable.
+4. Followers apply entries in order. If a follower is far behind, the leader sends a bulk snapshot (SSTable files) rather than replaying individual log entries.
+5. The Raft group monitors follower lag. A follower falling behind beyond a threshold is marked down, and the group can elect a new leader.

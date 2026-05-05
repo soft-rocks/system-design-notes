@@ -1,0 +1,276 @@
+---
+title: API / System Interface
+description: REST/GraphQL APIs, internal gRPC services, worker protocol, and event bus for a distributed job scheduler.
+---
+
+## REST API
+
+All API paths are prefixed with `/api/v1`. Authentication via JWT/OAuth2 bearer tokens. Rate-limited per tenant.
+
+### Job Submission & Management
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| POST | `/jobs` | Submit a new single-shot job | User/Service |
+| GET | `/jobs` | List jobs with filtering, pagination, sorting | User/Service |
+| GET | `/jobs/\{id\}` | Get job details and state | User/Service |
+| POST | `/jobs/\{id\}/cancel` | Cancel a pending or running job | User/Service |
+| POST | `/jobs/\{id\}/pause` | Pause a cron job or DAG | User/Service |
+| POST | `/jobs/\{id\}/resume` | Resume a paused cron job | User/Service |
+| GET | `/jobs/\{id\}/instances` | List all instances for a job | User/Service |
+| GET | `/jobs/\{id\}/instances/\{instanceId\}/logs` | Stream or fetch logs | User/Service |
+
+**Submit Job Request:**
+```json
+POST /api/v1/jobs
+{
+  "name": "daily-etl",
+  "tenant_id": "team-data-eng",
+  "queue": "production",
+  "job_definition_id": "def-abc123",
+  "priority": 50,
+  "deadline": "2026-05-04T02:00:00Z",
+  "metadata": \{"pipeline": "revenue-reporting"\}
+}
+```
+
+### Job Definitions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/job-definitions` | Create a reusable job definition |
+| GET | `/job-definitions` | List definitions (tenant-scoped) |
+| GET | `/job-definitions/\{id\}` | Get definition details |
+| PUT | `/job-definitions/\{id\}` | Update definition (creates new version) |
+| DELETE | `/job-definitions/\{id\}` | Soft-delete definition |
+
+### Cron Jobs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/cron-jobs` | Create a recurring cron job |
+| GET | `/cron-jobs` | List cron jobs |
+| GET | `/cron-jobs/\{id\}` | Get cron job details |
+| PUT | `/cron-jobs/\{id\}` | Update cron schedule |
+| DELETE | `/cron-jobs/\{id\}` | Delete cron job |
+
+### DAGs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/dags` | Create a DAG with nodes and triggers |
+| GET | `/dags` | List DAGs |
+| GET | `/dags/\{id\}` | Get DAG with execution status |
+| POST | `/dags/\{id\}/run` | Trigger a manual DAG run |
+| DELETE | `/dags/\{id\}` | Delete DAG |
+
+### Workers & Cluster
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/workers` | List all workers with status |
+| GET | `/workers/\{id\}` | Get worker details and running jobs |
+| GET | `/workers/\{id\}/drain` | Gracefully drain a worker |
+| GET | `/queues` | List queues with utilization |
+| GET | `/queues/\{name\}/backlog` | Get queue backlog and wait times |
+
+### Observability
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/jobs/stats` | Aggregated job metrics (success rate, avg duration) |
+| GET | `/jobs/history` | Historical execution data with time range filter |
+| GET | `/alerts` | List configured alerts |
+| POST | `/alerts` | Create/update alert rule |
+
+### WebSocket Events
+
+| Path | Description |
+|------|-------------|
+| `wss://host/ws/jobs/\{id\}/events` | Stream job state changes in real-time |
+| `wss://host/ws/jobs/\{id\}/instances/\{iid\}/logs` | Stream logs for a job instance |
+
+## GraphQL API
+
+For clients that need complex queries (e.g., dashboard UI), GraphQL is available at `/graphql`.
+
+```graphql
+query GetDAGStatus($dagId: ID!) {
+  dag(id: $dagId) {
+    state
+    nodes {
+      id
+      alias
+      status
+      lastJob {
+        status
+        startedAt
+        completedAt
+        exitCode
+      }
+    }
+  }
+}
+```
+
+## Internal Service Communication
+
+The control plane uses gRPC for synchronous calls and an event bus for asynchronous fan-out.
+
+### gRPC Service Interfaces
+
+**SchedulerService** — Leader scheduler exposes scheduling decisions.
+
+```protobuf
+service SchedulerService {
+  rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
+  rpc WatchJobs(WatchRequest) returns (stream JobUpdate);
+  rpc ReportWorkerStatus(WorkerStatusReport) returns (Status);
+}
+```
+
+**CronService** — Evaluates cron expressions and triggers job creation.
+
+```protobuf
+service CronService {
+  rpc Tick(TickRequest) returns (CronTickResponse);
+  rpc RegisterSchedule(RegisterScheduleRequest) returns (Status);
+}
+```
+
+**DAGService** — Manages DAG state and triggers downstream jobs.
+
+```protobuf
+service DAGService {
+  rpc CheckNode(DagNodeCheckRequest) returns (DagNodeCheckResponse);
+  rpc TriggerNode(DagNodeTriggerRequest) returns (Status);
+  rpc StreamDAGState(DagStreamRequest) returns (stream DagStateUpdate);
+}
+```
+
+**WorkerService** — Registers workers, receives heartbeats.
+
+```protobuf
+service WorkerService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (Status);
+  rpc Unregister(UnregisterRequest) returns (Status);
+}
+```
+
+### State Storage (etcd/Consul)
+
+| Path Prefix | Purpose | TTL |
+|-------------|---------|-----|
+| `/schedulers/\{id\}` | Leader election and health | 30s heartbeat |
+| `/workers/\{id\}` | Worker registration and status | 15s heartbeat |
+| `/jobs/\{id\}` | Job state (leader-owned writes) | Persistent |
+| `/queues/\{name\}` | Queue metadata and capacity | Persistent |
+| `/cron/\{id\}` | Cron job metadata and next_run | Persistent |
+
+### Lease-Based Coordination
+
+- Workers lease their registration via etcd TTL keys. Expired keys trigger OFFLINE status and job rescheduling.
+- Scheduler leader holds a leadership lease. On expiry, followers race for leadership via compare-and-swap.
+- During leader transition, new leader replays job states from persistent storage and re-evaluates queue orderings.
+
+## Worker API
+
+Workers communicate with the scheduler via a bidirectional gRPC stream — more efficient than HTTP polling for job assignment and status reporting.
+
+### Worker Agent Protocol
+
+The worker agent runs on each execution node and maintains a persistent gRPC stream to the scheduler leader.
+
+```protobuf
+service WorkerAgentService {
+  rpc AgentStream(stream AgentMessage) returns (stream AgentCommand);
+}
+
+message AgentMessage {
+  oneof payload {
+    RegisterMsg register = 1;
+    HeartbeatMsg heartbeat = 2;
+    JobStatusUpdate status_update = 3;
+    LogChunk log_chunk = 4;
+    ResourceReport resource_report = 5;
+  }
+}
+
+message AgentCommand {
+  oneof command {
+    AllocateJobs allocate = 1;
+    CancelJob cancel = 2;
+    UnregisterCommand unregister = 3;
+    HeartbeatAck heartbeat_ack = 4;
+    DrainWorker drain = 5;
+  }
+}
+
+message AllocateJobs {
+  repeated JobAllocation jobs = 1;
+}
+
+message JobAllocation {
+  string job_id = 1;
+  string instance_id = 2;
+  ResourceRequest resources = 3;
+  string image = 4;
+  repeated EnvVar env = 5;
+  repeated SecretMount secrets = 6;
+  string log_destination = 7;
+}
+```
+
+### Worker Lifecycle
+
+1. **Registration**: Worker starts → sends `RegisterMsg` → scheduler responds with `HeartbeatAck`.
+2. **Heartbeat Loop**: Worker sends heartbeats every 5s with current allocatable resources.
+3. **Job Allocation**: Scheduler streams `AllocateJobs` via the bidirectional channel.
+4. **Status Reporting**: Worker streams status updates and log chunks in real-time.
+5. **Graceful Drain**: Scheduler sends `DrainWorker` — agent finishes running jobs, then unregisters.
+6. **Failure Detection**: Scheduler misses 3 heartbeats (15s) → marks worker OFFLINE → reschedules jobs.
+
+### Log Streaming
+
+Logs flow from worker to scheduler via `LogChunk` messages, then forwarded to:
+- **Log Store** (Elasticsearch, Loki): long-term retention and search.
+- **WebSocket clients**: real-time log streaming.
+
+Logs are buffered on the worker (default 1MB ring buffer) and forwarded incrementally.
+
+## Event Bus / Webhook System
+
+### Event Bus
+
+The scheduler publishes job lifecycle events to an internal event bus (Kafka or NATS JetStream) for downstream consumers.
+
+**Topic:** `job-events`
+
+| Event Type | When Published |
+|------------|----------------|
+| `job.submitted` | Job accepted into queue |
+| `job.queued` | Job placed in scheduling queue |
+| `job.scheduled` | Job assigned to worker |
+| `job.started` | First container starts |
+| `job.completed` | Job succeeds |
+| `job.failed` | Job fails |
+| `job.cancelled` | User or system cancels |
+| `job.retried` | Retry triggered |
+| `job.deadlined` | Job exceeds deadline |
+| `dag.node.triggered` | DAG downstream trigger |
+| `cron.triggered` | Cron fires |
+
+### Webhook System
+
+Tenants configure webhook endpoints for job event notifications.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `url` | string | HTTPS endpoint |
+| `events` | list&lt;string&gt; | Subscribed event types |
+| `secret` | string | HMAC-SHA256 signing key |
+| `headers` | `map&lt;string, string&gt;` | Custom headers |
+| `retry_policy` | `\{max_retries, backoff\}` | Delivery reliability |
+
+The webhook delivery service guarantees at-least-once delivery with exponential backoff (max 5 retries). Failed deliveries are queued for manual inspection.

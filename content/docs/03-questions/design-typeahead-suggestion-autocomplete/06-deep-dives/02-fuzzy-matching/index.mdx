@@ -1,0 +1,121 @@
+---
+title: Fuzzy Matching & Auto-Correction
+description: Deep dive into fuzzy matching and auto-correction for typeahead
+---
+
+## Why Fuzzy Matching is Conditional
+
+Tier 1 (exact prefix) handles ~85% of queries with sufficient results. Running fuzzy matching on every query wastes compute and hurts p99 latency. But the condition "run only if < 5 results" introduces **unpredictable tail latency** — a query that normally gets 8 results returns in 0ms, while one that gets 4 results triggers a 500µs fuzzy search.
+
+**Better approach**: always run Tier 1, then fire Tier 2 + Tier 3 in parallel with a 3ms deadline. Results arriving after 3ms are silently dropped. This guarantees bounded latency regardless of query clarity.
+
+## Tier Architecture (Parallel with Deadline)
+
+```
+Tier 1: Exact prefix match (radix tree descent)     →  ~100µs  →  ALWAYS runs
+Tier 2: Damerau-Levenshtein ≤ 2 (pruned traversal)   →  ~500µs  →  runs in parallel, 3ms deadline
+Tier 3: Phonetic match (Double Metaphone)            →  ~200µs  →  runs in parallel, 3ms deadline
+                              ↓
+                    Merge + Score + Dedup + Top-10
+```
+
+- Tier 1 always returns first (it's the fast path). If it returns ≥ 10 results with combined score > threshold, Tier 2/3 results can be suppressed entirely.
+- Tier 2 + Tier 3 run on a dedicated CPU thread pool (4 cores per fuzzy matcher instance).
+- Total p99 latency budget: 3ms for all fuzzy tiers combined.
+
+## Damerau-Levenshtein Edit Distance
+
+**Why Damerau-Levenshtein (DL) over standard edit distance**: Transpositions are the most common typo pattern. "gogle" → "google" is a transposition of "o" and "g", which DL catches in 1 operation but standard edit distance requires 2 operations (delete + insert).
+
+| Typo Type | Example | Edit Distance | DL Distance |
+|-----------|---------|---------------|-------------|
+| Substitution | "gogle" → "google" (missing "o") | 1 | 1 |
+| Transposition | "gogle" → "google" (swapped) | 2 | 1 |
+| Insertion | "googel" → "google" | 1 | 1 |
+| Deletion | "gooogle" → "google" | 1 | 1 |
+
+**Pruned DL traversal on radix tree**: Walk the tree, maintaining a rolling 2-row DP matrix for edit distance. Prune branches where `min_possible_distance > 2`.
+
+- The matrix row length equals query length (typically 2-5 characters)
+- Pruning condition: `row_position - max_edit_distance > deepest_common_prefix`
+- Typical search space: 50-200 nodes for a 3-character query with edit distance ≤ 2
+- Worst case: a query like "a" with edit distance 2 could explore ~1000 nodes (but this is rare at p99)
+
+```cpp
+// Pseudocode for pruned DL traversal
+function fuzzySearch(node, query, row, col):
+    if col == query.length:
+        if node.hasWord and min(row) &lt;= 2:
+            yield (node.term, min(row))
+        return
+
+    // Pruning: can we possibly reach edit distance ≤ 2 from here?
+    if col + 2 < node.deepest_descendant_depth:
+        // Even with 2 edits, we can't reach deep enough
+        return
+
+    // Try match, substitute, insert, delete, transpose
+    // ... DP cell computation ...
+    // ... recursive descent ...
+```
+
+**Latency**: ~500µs per query on a single core (C++/Rust, SIMD-optimized row comparison).
+
+## Phonetic Matching
+
+**When edit distance fails** — "ph" vs "f", "sch" vs "s", "colonel" vs "kernel" — phonetic algorithms encode pronunciation, not spelling. These pairs have high edit distance but sound identical.
+
+| Algorithm | Encoding | Use Case | Index Size |
+|-----------|----------|----------|------------|
+| Double Metaphone | 2-character code | English names, brands | ~20GB |
+| Soundex | 4-char (1 letter + 3 digits) | Legacy systems | ~50GB |
+| NYSIIS | Variable length | US names, addresses | ~100GB |
+
+**Double Metaphone is preferred** because it produces the most accurate 2-character codes for English and brand names, and the 2-character encoding yields a manageable index size (~20GB for 10B terms).
+
+**Phonetic index structure**: Hash map `phonetic_code → term_id[]` sorted by score. For a 2-character code, there are only 676 possible codes (26²), so the map is small. Each entry stores the top-50 terms for that phonetic code.
+
+**Integration strategy:**
+1. At query time, compute Double Metaphone code for input
+2. Look up matching terms from phonetic index
+3. Phonetic results are **complementary** to edit-distance results — never replace them
+4. Merge into final top-k only if they have higher score than the lowest existing entry
+5. Phonetic results get a bonus multiplier (`1.2`) if the query has low Tier 1 results (indicating possible misspelling)
+
+## Hybrid Scoring
+
+```
+final_score = tier1_score * 1.0 + tier2_score * 0.85 + tier3_score * 0.7
+```
+
+- Tier 1 results get full score (they are exact matches)
+- Tier 2 (DL edit distance) gets 0.85x multiplier — good but not as confident
+- Tier 3 (phonetic) gets 0.7x multiplier — useful fallback but less precise
+
+Deduplication: the same term can appear from multiple tiers. Keep the highest-scoring entry and drop duplicates.
+
+```
+Example query: "gogle"
+
+Tier 1 (exact "gogle"): []  →  0 results
+Tier 2 (DL ≤ 2): [("google", 0.85), ("google maps", 0.82), ("gogol", 0.70)]
+Tier 3 (phonetic "JJ"): [("google", 0.70), ("google maps", 0.65), ("google scholar", 0.50)]
+
+Merge + dedup:
+  google:        max(0.85, 0.70) = 0.85  (from Tier 2)
+  google maps:   max(0.82, 0.65) = 0.82  (from Tier 2)
+  gogol:         0.70                   (from Tier 2, no dup)
+  google scholar:0.70                   (from Tier 3, no dup)
+
+Top-4: ["google", "google maps", "gogol", "google scholar"]
+```
+
+## Performance Optimization
+
+| Technique | Speedup | Trade-off |
+|-----------|---------|-----------|
+| SIMD row comparison (AVX2) | 4x | x86 only; needs NEON fallback for ARM |
+| Early termination at edit distance 1 | 30% fewer calls | Misses some distance-2 matches |
+| Phonetics only for Latin scripts | 100% skip for CJK | CJK doesn't benefit from phonetics |
+| Pre-computed phonetic index lookup | 200µs vs 500µs for DL | Fixed ~200µs cost regardless of results |
+| GPU offload (batch queries) | 10x throughput | Only for high-traffic endpoints; adds latency per-query |

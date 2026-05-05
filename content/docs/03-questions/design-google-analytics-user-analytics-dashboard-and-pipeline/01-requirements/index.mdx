@@ -1,0 +1,78 @@
+---
+title: Requirements
+description: Functional, non-functional requirements and scale assumptions for Google Analytics.
+---
+
+## Functional Requirements
+
+### Event Collection
+
+Track pageviews, screen views, clicks, form submissions, video plays, custom events via JavaScript SDK, mobile SDK, server-side API.
+
+### Session Management
+
+- Group events into sessions; session timeout (30 min)
+- Campaign attribution, new vs returning user detection
+
+### Real-time Analytics
+
+Active users, top pages, top events, traffic sources — ≤ 30s latency.
+
+### Standard Reports
+
+| Category | Examples |
+|----------|----------|
+| **Acquisition** | Traffic sources, channels, campaigns |
+| **Behavior** | Pageviews, event flow, site speed |
+| **Conversions** | Goals, e-commerce |
+| **Audience** | Demographics, geo, device |
+
+### Custom Reports
+
+Drag-and-drop builder with dimensions + metrics, filters, segments, pivots.
+
+### Funnel Analysis
+
+Step-by-step user journey visualization; drop-off rate per step; cohort-based retention.
+
+### Export & Integration
+
+BigQuery export, Data API, webhook events, Google Ads/Tag Manager integration.
+
+### Data Sampling
+
+When query exceeds sampled dataset (10M events), provide estimated vs unsampled results.
+
+### Alerting
+
+Threshold-based alerts on metrics (traffic spike, conversion drop); email/webhook notification.
+
+### Data Retention
+
+Configurable (2 months, 14 months); user-level and event-level data expiration.
+
+---
+
+## Non-Functional Requirements
+
+| Metric | Target |
+|--------|--------|
+| Event ingestion throughput | 10M events/sec peak; 1M events/sec sustained |
+| Event ingestion latency | p99 < 200ms (collection → indexed for real-time) |
+| Dashboard query (standard) | p99 < 5s |
+| Dashboard query (custom) | p99 < 30s |
+| Data freshness | Real-time ≤ 30s; daily reports < 2h after UTC midnight |
+| Availability | Dashboard 99.95%; Event collection 99.99% |
+| Scale | 10M websites; 100B events/day; 50M unique users/day per top-1000 site |
+| Storage | Raw events 13 months; aggregated data indefinite |
+
+---
+
+## Scale Assumptions
+
+- **Websites:** 10M tracked; ~200K e-commerce
+- **Events:** 100B events/day aggregate (~1.15M/sec sustained, ~10M/sec peak)
+- **Payload:** avg page view 2KB; avg custom event 500 bytes
+- **Long-tail:** top 1000 sites generate 50% of traffic
+- **Dashboard queries:** 50M/day (~580 QPS average)
+- **BigQuery export:** ~5TB/day raw event data

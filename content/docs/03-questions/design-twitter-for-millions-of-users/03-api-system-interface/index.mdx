@@ -1,0 +1,117 @@
+---
+title: API & System Interface
+description: REST endpoints and internal microservices for the Twitter design.
+---
+
+## REST Endpoints
+
+### Authentication
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/auth/register` | Register a new user |
+| POST | `/api/v1/auth/login` | Authenticate and return session/token |
+| POST | `/api/v1/auth/logout` | Invalidate current session |
+| POST | `/api/v1/auth/password/reset` | Initiate password reset |
+
+### User
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/users/:id` | Get user profile by ID |
+| GET | `/api/v1/users/by-username/:username` | Get user profile by username |
+| PATCH | `/api/v1/users/:id` | Update user profile |
+| GET | `/api/v1/users/:id/followers` | List followers (pagination) |
+| GET | `/api/v1/users/:id/following` | List following (pagination) |
+| POST | `/api/v1/users/:id/follow` | Follow a user |
+| DELETE | `/api/v1/users/:id/follow` | Unfollow a user |
+
+### Media
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/media/upload` | Upload image/video/GIF (multipart) |
+| GET | `/api/v1/media/:mediaId` | Get uploaded media by ID |
+| DELETE | `/api/v1/media/:mediaId` | Delete uploaded media |
+
+### Tweet (Create, Read, Update, Delete)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/tweets` | Create a new tweet |
+| GET | `/api/v1/tweets/:id` | Get a single tweet by ID |
+| PATCH | `/api/v1/tweets/:id` | Edit a tweet |
+| DELETE | `/api/v1/tweets/:id` | Delete (soft-delete) a tweet |
+| GET | `/api/v1/tweets/:id/replies` | Get replies to a tweet (thread) |
+| POST | `/api/v1/tweets/:id/retweet` | Retweet a tweet |
+| DELETE | `/api/v1/tweets/:id/retweet` | Undo a retweet |
+| POST | `/api/v1/tweets/:id/like` | Like a tweet |
+| DELETE | `/api/v1/tweets/:id/like` | Unlike a tweet |
+| GET | `/api/v1/tweets/:id/likes` | Get users who liked a tweet |
+
+### Feed & Timeline
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/feed/home` | Get home timeline (pinned fan-out) |
+| GET | `/api/v1/users/:id/tweets` | Get user's own tweet timeline |
+| GET | `/api/v1/users/:id/likes` | Get user's liked tweets |
+| GET | `/api/v1/tweets/multiple` | Batch-get multiple tweets by IDs |
+
+### Search
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/search/tweets` | Search tweets by keyword/hashtag |
+| GET | `/api/v1/search/users` | Search users by username/name |
+| GET | `/api/v1/search/hashtag/:tag` | Get tweets with a specific hashtag |
+
+### Notifications
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/notifications` | Get notifications for current user |
+| GET | `/api/v1/notifications/unread-count` | Get unread notification count |
+| POST | `/api/v1/notifications/read` | Mark notifications as read |
+
+---
+
+## Internal Services
+
+### Gateway / API Layer
+- **Purpose**: Single entry point for all client requests.
+- **Responsibilities**: Rate limiting, authentication middleware, request routing, load balancing.
+- **Tech**: NGINX, Kong, or AWS API Gateway.
+
+### Auth Service
+- **Purpose**: Handle registration, login, token issuance/revocation.
+- **Responsibilities**: JWT/session management, password hashing, MFA support.
+- **Tech**: OAuth2 / JWT, bcrypt.
+
+### User Service
+- **Purpose**: Manage user profiles, credentials, and the follow graph.
+- **Responsibilities**: User CRUD, follow/unfollow operations, profile caching (Redis).
+- **Tech**: Relational DB (PostgreSQL), Redis cache.
+
+### Tweet Service
+- **Purpose**: Manage tweet creation, retrieval, and deletion.
+- **Responsibilities**: Write tweets, read tweets by author or thread, soft-delete.
+- **Tech**: Relational DB for tweet metadata, NoSQL for high-write throughput.
+
+### Timeline Service
+- **Purpose**: Generate and serve personalized home feeds.
+- **Responsibilities**: Fan-out logic (push or hybrid), cache timeline per user, feed generation.
+- **Tech**: Redis / Cassandra / DynamoDB for timeline storage, message queue for fan-out trigger.
+
+### Notification Service
+- **Purpose**: Generate and deliver notifications.
+- **Responsibilities**: Create notifications on events (like, reply, mention), push/email delivery.
+- **Tech**: Message queue (Kafka/RabbitMQ), push notification provider (APNs, FCM).
+
+### Media Service
+- **Purpose**: Handle media upload, processing, and delivery.
+- **Responsibilities**: Image/video transcoding, thumbnail generation, CDN integration.
+- **Tech**: Object storage (S3), CDN (CloudFront), transcoding (FFmpeg).
+
+### Search Service
+- **Purpose**: Provide full-text search across tweets and users.
+- **Responsibilities**: Index tweets (text, hashtags, mentions), serve search queries.
+- **Tech**: Elasticsearch or OpenSearch.
+
+### Analytics / Monitoring Service
+- **Purpose**: Collect metrics, track KPIs, detect anomalies.
+- **Responsibilities**: Metrics collection, alerting, dashboards.
+- **Tech**: Prometheus, Grafana, Datadog.

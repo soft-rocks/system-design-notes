@@ -1,0 +1,189 @@
+---
+title: "Deep Dive: Query Optimization"
+description: "Query parsing, shard routing, and result merging for sub-second latency"
+---
+
+## Query Parser and Execution Plan
+
+The query language is PromQL-like. Parsing converts the string into an execution plan that can be routed to the right shards.
+
+**Query parsing pipeline:**
+
+```
+Query: avg(rate(http_requests_total\{service="api", method="GET"\}[5m]))
+
+  1. Tokenize: [avg, (, rate, (, http_requests_total, {, service="api",
+                method="GET", }, [, 5m, ), ), ]
+
+  2. Parse AST:
+     Avg(
+       Rate(
+         Selector\{metric="http_requests_total", labels={service="api", method="GET"\\&#125;&#125; 
+       )
+     )
+
+  3. Generate execution plan:
+     a. Identify metric name: "http_requests_total"
+     b. Look up label index: find series_keys matching service="api" AND method="GET"
+     c. Determine data source: 5m lookback → raw store (10s granularity)
+     d. Fan-out reads to all matching series_keys
+     e. Compute rate: (current_value - previous_value) / time_delta for each series
+     f. Compute avg across all series
+     g. Return single value
+```
+
+**Label index lookup (Cassandra):**
+
+```cql
+-- Label index table
+CREATE TABLE label_index (
+    metric_name text,
+    label_key text,
+    label_value text,
+    series_key uuid,
+    PRIMARY KEY ((metric_name), label_key, label_value, series_key)
+) WITH CLUSTERING ORDER BY (label_key ASC, label_value ASC);
+
+-- Query: find series_keys for metric + labels
+SELECT series_key FROM label_index
+WHERE metric_name = 'http_requests_total'
+  AND (label_key = 'service' AND label_value = 'api')
+  AND (label_key = 'method' AND label_value = 'GET');
+```
+
+This returns the intersection of series_keys matching all label filters. The query uses the `ALLOW FILTERING` clause (acceptable because the partition key limits the scan).
+
+## Shard Routing and Fan-Out
+
+Once the series_keys are identified, the query service fans out reads to all shards containing those series.
+
+**Fan-out strategy:**
+
+```
+Query Service (per request):
+  1. Identify 50–500 matching series_keys
+  2. Each series_key maps to a shard via: shard_id = series_key % num_shards
+  3. Typically 5–50 unique shards involved
+  4. Fan-out to each shard in parallel (goroutine per shard)
+  5. Wait for all shards (sync.WaitGroup, 1s timeout)
+  6. Merge and compute results
+```
+
+**Per-shard read:**
+
+```go
+func readFromShard(shard Shard, seriesKeys []UUID, start, end time.Time) ([]DataPoint, error) {
+    // Batch read: one request per shard handles all series_keys
+    // This reduces network round-trips from N to 1 per shard
+    
+    result := hbase.Scan(hbase.ScanRequest{
+        Table:       "raw_metrics",
+        SeriesKeys:  seriesKeys,
+        StartRow:    start.UnixMilli(),
+        EndRow:      end.UnixMilli(),
+        Columns:     []string\{"value"\},
+    })
+    return result.DataPoints, nil
+}
+```
+
+**Concurrent execution:**
+
+```go
+// Fan-out to all shards concurrently
+var wg sync.WaitGroup
+var mu sync.Mutex
+allResults := make(map[shardID][]DataPoint)
+
+for shardID, keys := range shardGrouping {
+    wg.Add(1)
+    go func(sid shardID, ks []UUID) {
+        defer wg.Done()
+        points, err := readFromShard(shard, ks, start, end)
+        if err != nil {
+            logError("shard read failed", sid, err)
+            return
+        }
+        mu.Lock()
+        allResults[sid] = points
+        mu.Unlock()
+    }(shardID, keys)
+}
+
+wg.Wait() // or timeout after 1s
+```
+
+**Timeout budget:**
+
+| Step | Budget |
+| --- | --- |
+| Label index lookup | 10ms |
+| Fan-out to 50 shards (parallel) | 200ms (max shard read time) |
+| Result merge + compute | 50ms |
+| Response serialization | 5ms |
+| **Total** | **265ms** |
+
+The 200ms shard read budget is generous because HBase/Cassandra reads from block cache typically complete in 5–20ms. The buffer covers cold reads (disk access) and edge cases.
+
+## Cache Strategy
+
+Two-level caching prevents repeated queries for the same data from hitting the storage layer.
+
+### L1 Cache (Local)
+
+Per-query-instance cache using a bounded LRU.
+
+```
+Key: SHA256(query_string + start + end + step)
+Value: QueryResult (JSON or protobuf)
+Size limit: 100,000 entries (~500 MB)
+TTL: 2 minutes
+Eviction: LRU (least recently used)
+```
+
+Hit rate: ~40% for dashboard queries (dashboards refresh on fixed 15–30s intervals).
+
+### L2 Cache (Redis Shared)
+
+Shared across all query service instances.
+
+```
+Key: query_cache:\{SHA256_hash\}
+Value: QueryResult
+TTL: 5 minutes
+Size limit: 10 GB (Redis maxmemory-policy: allkeys-lru)
+```
+
+Hit rate: ~60% of total queries (covers all cached results, not just this instance's).
+
+### Cache Coherence
+
+The query cache is invalidated implicitly by TTL — there's no explicit invalidation. This is acceptable because:
+
+1. Metrics are append-only (existing results never change)
+2. Stale cache returns data from up to 5 minutes ago — acceptable for monitoring
+3. Explicit invalidation would be expensive (2M series_keys × multiple cache entries each)
+
+**Cache stampede prevention:**
+
+For high-concurrency dashboard queries (e.g., "CPU for all API servers" hit by 200 users simultaneously), use a singleflight pattern:
+
+```go
+func queryWithSingleflight(query string) (*QueryResult, error) {
+    // Try L1 first
+    if result := l1.Get(query); result != nil {
+        return result, nil
+    }
+    
+    // Singleflight: only one goroutine executes per unique query
+    call := singleflight.Group.Do(query, func() (*QueryResult, error) {
+        result := doActualQuery(query)
+        l1.Set(query, result)
+        l2.Set(query, result) // L2 with longer TTL
+        return result, nil
+    })
+    return call.Result, call.Err
+}
+```
+
+This ensures that only one goroutine per unique query hits the storage layer, and all others wait for and share the result.

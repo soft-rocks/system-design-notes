@@ -1,0 +1,61 @@
+---
+title: Shuffle Optimization
+description: Partition assignment, data transfer, skew handling, and network optimization.
+---
+
+## Partition Assignment
+
+After the spill phase, each worker has one or more sorted spill files with known key ranges. The merge coordinator must assign these spill files to merge partitions.
+
+**Boundary determination:**
+1. Sample 10K keys from each spill file (uniform sampling)
+2. Build global key histogram across all samples
+3. Select boundaries at N/P, 2N/P, 3N/P... percentiles where P = number of merge partitions
+4. Assign each spill file to partitions based on key range overlap
+
+**Partition assignment strategy:**
+
+| Scenario | Strategy |
+|----------|----------|
+| Uniform key distribution | Even split — each partition gets roughly equal spill file count |
+| Skewed key distribution | Adaptive — more partitions for high-density key ranges |
+| Small dataset (< cluster capacity) | Single partition — no shuffle needed |
+
+## Data Transfer
+
+**Shuffle protocol:** HTTP/2 multiplexed streams with chunked transfer encoding.
+
+1. Source worker serves spill file as a series of 1 MB blocks
+2. Destination worker pulls blocks sequentially with CRC32C checksum
+3. On checksum mismatch: re-transfer the block (retry up to 3 times)
+4. After full transfer: verify block count matches source metadata
+
+**Bandwidth utilization:** All workers pull and serve data simultaneously. Total network utilization ≈ (workers × 2) × link_bandwidth. On 1 Gbps links, 10 workers transfer ~20 Gbps aggregate (theoretical max).
+
+## Skew Handling
+
+Key skew is the biggest shuffle problem: one partition may receive 10× more data than others, straggling the entire merge.
+
+**Detection:** After boundary sampling, if any partition's estimated key count exceeds 2× the median, apply adaptive rebalancing:
+
+1. **Increase partition count:** Dynamically split the hot partition into 2-3 sub-partitions
+2. **Redistribute spill files:** Reassign spill files crossing the boundary to balance load
+3. **Penalize skew workers:** Workers with > 2× average spill data get additional merge tasks
+
+**Fallback:** If skew is unresolvable (e.g., all keys are identical), default to a single partition — shuffle is skipped, final merge runs on all workers independently then merges locally.
+
+## Network Optimization
+
+| Technique | Impact |
+|-----------|--------|
+| **Data locality** | If source spill file is on the same node as target merge, skip network transfer |
+| **Batching** | Group small spill files into single transfer batch to reduce HTTP connection overhead |
+| **Parallel streams** | HTTP/2 multiplexing — 8 streams per source, 1 per destination |
+| **Compression** | Gzip on spill files before transfer (typically 3:1 compression on sorted data) |
+| **Connection pooling** | Persistent TCP connections to avoid handshake overhead |
+| **Pre-fetch** | Destination worker pre-fetches next block while processing current one |
+
+**Transfer time estimate:** For 1 TB dataset, 10-node cluster, 1 Gbps links:
+- After partitioning: each merge partition ≈ 1 TB / P partitions
+- With 3x compression: ~333 GB transferred
+- Per-node transfer: ~33 GB at 100 MB/s = ~5.5 minutes per node

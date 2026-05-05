@@ -1,0 +1,98 @@
+---
+title: Core Entities
+description: Core domain entities for a messaging platform
+---
+
+## Core Domain Entities
+
+### User
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID | Primary key (derived from phone number or signup) |
+| `phone_number` | String | Unique identifier, E.164 format |
+| `display_name` | String | User-given display name |
+| `avatar_url` | String | Reference to profile image |
+| `status` | Enum | active, blocked, deleted |
+| `created_at` | Timestamp | Account creation time |
+
+**Relationships:**
+- 1:N Conversations (as participant)
+- 1:N Messages (as sender)
+- 1:N Device sessions
+
+### Conversation (Chat)
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `type` | Enum | `direct` or `group` |
+| `name` | String | Group name (nullable for direct) |
+| `avatar_url` | String | Group avatar (nullable) |
+| `created_at` | Timestamp | |
+| `updated_at` | Timestamp | Last message timestamp |
+
+**Relationships:**
+- N:N User (via ChatParticipant join table)
+- 1:N Messages
+
+### Participant (ChatParticipant)
+| Field | Type | Notes |
+|---|---|---|
+| `user_id` | UUID | Foreign key to User |
+| `conversation_id` | UUID | Foreign key to Conversation |
+| `role` | Enum | `member` or `admin` (groups only) |
+| `joined_at` | Timestamp | |
+| `last_read_message_id` | Snowflake/ULID | Cursor for read sync (matches Message.id type) |
+
+### Message
+| Field | Type | Notes |
+|---|---|---|
+| `id` | Snowflake/ULID | Unique, time-ordered |
+| `conversation_id` | UUID | |
+| `sender_id` | UUID | |
+| `type` | Enum | `text`, `photo`, `video`, `document`, `call` |
+| `content` | JSON/Text | Text body or media metadata |
+| `media_url` | String | Reference to stored media (nullable) |
+| `timestamp` | Timestamp | Server-assigned send time |
+| `status` | Enum | `pending`, `sent`, `delivered`, `read`, `failed` |
+| `deleted` | Boolean | Soft-delete flag |
+| `edit_count` | Int | Number of edits (0 = original) |
+| `encryption_tag` | String | E2EE envelope ID (nullable) |
+
+**Relationships:**
+- N:1 Conversation
+- N:1 User (sender)
+- 1:N DeliveryReceipt
+
+### DeliveryReceipt
+| Field | Type | Notes |
+|---|---|---|
+| `message_id` | String | FK to Message |
+| `user_id` | UUID | Recipient |
+| `status` | Enum | `delivered`, `read` |
+| `timestamp` | Timestamp | Receipt time |
+
+**Composite key:** (message_id, user_id)
+
+### TypingIndicator (Ephemeral)
+| Field | Type | Notes |
+|---|---|---|
+| `conversation_id` | UUID | |
+| `user_id` | UUID | |
+| `state` | Enum | `typing`, `stopped` |
+| `expires_at` | Timestamp | Auto-expire after 3s |
+
+**Storage:** In-memory (Redis/Memcached), not persisted.
+
+## Entity Relationship Summary
+
+```
+User 1:N  Message       Conversation 1:N  Message
+  |               |          |
+  |               |          |
+  +-- N:M <-----> +          +-- N:M <----> User
+                   |                     (via ChatParticipant)
+              1:N  |
+                   v
+          DeliveryReceipt
+          (message_id, user_id)
+```

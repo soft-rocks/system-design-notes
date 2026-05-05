@@ -1,0 +1,219 @@
+---
+title: API / System Interface
+description: RESTful API endpoints、security requirements、observability、versioning，以及 Pastebin service 的 integration points。
+---
+
+### 1. Paste Creation API
+
+**Endpoint**：`POST /api/v1/pastes`
+
+**Request**：
+
+```json
+{
+  "content": "def hello():\n    print('world')",
+  "title": "Hello World", // optional
+  "language": "python", // optional: enables syntax highlighting
+  "key": "mykey", // optional: custom key
+  "expires_in": 86400, // optional: seconds (e.g., 600, 3600, 86400, 604800)
+  "access_mode": "unlisted" // optional: "public" or "unlisted" (default: "public")
+}
+```
+
+**Response** (Success - 201 Created)：
+
+```json
+{
+  "key": "abc123",
+  "url": "https://pastebin.com/abc123",
+  "expires_at": "2026-04-24T10:00:00Z",
+  "created_at": "2026-04-23T10:00:00Z"
+}
+```
+
+**Response** (Error)：
+
+- `400 Bad Request`：無效內容（空值、超過 64KB、無效的 language）
+- `409 Conflict`：Custom key 已存在
+- `429 Too Many Requests`：Rate limit 超過
+- `500 Internal Server Error`：系統故障
+
+**Rate Limit**：每 IP 10 requests/minute，每 API key 100 requests/minute
+
+**Idempotency**：接受 `Idempotency-Key` header 防止 duplicate creation
+
+**Performance Target**：P95 < 200ms
+
+### 2. Paste Retrieval API
+
+**Endpoint**：`GET /api/v1/pastes/\{key\}`
+
+**Response** (Success - 200 OK)：
+
+```json
+{
+  "key": "abc123",
+  "title": "Hello World",
+  "content": "def hello():\n    print('world')",
+  "language": "python",
+  "created_at": "2026-04-23T10:00:00Z",
+  "expires_at": "2026-04-24T10:00:00Z",
+  "view_count": 42
+}
+```
+
+**Response** (Error)：
+
+- `404 Not Found`：Paste 不存在
+- `410 Gone`：Paste 已過期或已被刪除
+- `403 Forbidden`：Private paste（如果後續加入 user accounts）
+- `429 Too Many Requests`：Read rate limit 超過
+
+**Performance Target**：P95 < 100ms
+
+### 3. Paste List API (Public)
+
+**Endpoint**：`GET /api/v1/pastes`
+
+**Query Parameters**：
+
+- `page` (int, default: 1)：Page number
+- `per_page` (int, default: 20, max: 100)：Items per page
+- `sort` (enum: new, hot)：Sort order（最新 vs. 最多人瀏覽）
+
+**Response**：
+
+```json
+{
+  "items": [
+    {
+      "key": "abc123",
+      "title": "Hello World",
+      "language": "python",
+      "created_at": "2026-04-23T10:00:00Z",
+      "view_count": 42
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "per_page": 20,
+    "total": 1500000
+  }
+}
+```
+
+**Performance Target**：P95 < 300ms
+
+### 4. Paste Delete API
+
+**Endpoint**：`DELETE /api/v1/pastes/\{key\}`
+
+**Response**：
+
+- `204 No Content`：成功刪除
+- `404 Not Found`：Paste 不存在
+- `410 Gone`：Paste 已過期或已刪除
+- `403 Forbidden`：此 client 無法刪除該 paste
+
+### 5. Syntax Highlighting Lookup API
+
+**Endpoint**：`GET /api/v1/syntax/\{language\}`
+
+**Response** (Success - 200 OK)：
+
+```json
+{
+  "language": "python",
+  "highlight_id": "python",
+  "mime_type": "text/x-python"
+}
+```
+
+**Response** (Error)：
+
+- `404 Not Found`：Language not supported
+
+**Performance Target**：P95 < 5ms（由 in-memory cache 提供）
+
+### 6. Health Check API
+
+**Endpoint**：`GET /health`
+
+**Response**：
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-04-23T10:00:00Z",
+  "version": "1.0.0",
+  "dependencies": {
+    "database": "healthy",
+    "cache": "healthy",
+    "moderation_queue": "healthy"
+  }
+}
+```
+
+### API Design Principles
+
+1. **Consistent Error Handling**：Structured JSON errors，清楚的 codes
+2. **Idempotency**：Write operations 支援 `Idempotency-Key` header
+3. **Pagination**：Listing endpoints 支援 `limit` 和 `offset` parameters
+4. **Caching**：Read endpoints 支援 `If-None-Match` 和 `If-Modified-Since`，供 CDN caching
+5. **Rate Limiting**：在 API gateway level 執行
+6. **Authentication**：預設 anonymous；API keys 供 programmatic access
+7. **HTTPS Only**：所有 endpoints 需要 TLS 1.3+
+8. **CORS**：僅配置 CORS 給 trusted origins
+9. **Logging**：所有 requests 都記錄 request ID 供 traceability
+10. **Versioning**：在 URL path 中 version（`/api/v1/...`），並有 deprecation policy
+
+### Protocol Selection
+
+| Protocol | 使用時機 | Trade-off |
+| --- | --- | --- |
+| REST | Public API、client web/mobile apps | Verbose 但大家熟悉 |
+| HTTP Serve | Paste rendering（直接 HTML） | 簡單 reads 最快 |
+| gRPC | Internal services（moderation、analytics） | 效能最好，比較不彈性 |
+
+### Performance Requirements
+
+- **Paste Creation**：約 12 requests/second sustained，peak ~40 RPS，P95 < 200ms
+- **Paste Read**：約 1,200 requests/second sustained，peak ~4,000 RPS，P95 < 100ms
+- **Syntax Lookup**：低於 5ms（完全 cached，成本可忽略）
+- **Throughput**：系統必須處理 5M+ daily active users 和 100M+ reads/day
+
+### Security Requirements
+
+1. **Input Validation**：內容不得超過 64KB；reject 無效的 UTF-8
+2. **Content Filtering**：掃描 phishing links、malware patterns、illegal content
+3. **Rate Limiting**：Per-IP 和 per-API-key limits 防止 abuse
+4. **CORS Policy**：僅限制 trusted origins
+5. **HTTPS Enforcement**：所有 endpoints 需要 TLS 1.3+
+6. **API Key Management**：安全的 storage 和 rotation
+7. **DDoS Protection**：與 cloud provider 的 DDoS protection 整合
+8. **Data Sanitization**：Strip null bytes，所有欄位限制 string length
+
+### Observability Requirements
+
+1. **Metrics**：Expose Prometheus metrics，涵蓋 paste creation、reads、errors
+2. **Tracing**：Distributed tracing 追蹤 request flow 經過 cache → DB → moderation
+3. **Logs**：Structured JSON logs，附 request ID correlation
+4. **Alerting**：Real-time alerts 針對 latency spikes（P95 > 200ms）、error rate > 1%、cache miss rate > 30%
+5. **Dashboards**：Monitor traffic volume、success/error rates、storage usage、expiration backlog
+
+### API Versioning Strategy
+
+- Current version：`v1`
+- Backward compatibility 在 deprecation 後維持 12 個月
+- Deprecated endpoints 標記 `Deprecation` header
+- 新功能在新 endpoints 引入，不破壞既有 ones
+- Versioned 在 URL path：`/api/v1/...`
+
+### Integration Points
+
+1. **Content Moderation Service**：Paste creation 時 async scan（webhook/callback pattern）
+2. **CDN**：Paste rendering pages 的 edge caching（TTL 基於 `expires_at`）
+3. **Rate Limiting Service**：API gateway 層的 Redis-backed sliding window
+4. **Syntax Highlighting Service**：In-memory language-to-token mapping
+5. **Monitoring System**：Health checks、metrics、alerting
+6. **Message Queue**：Async ingestion 供 moderation 和 analytics

@@ -1,0 +1,295 @@
+---
+title: DAG Dependency Management
+description: Deep dive into DAG topology, trigger evaluation, cancellation/rollback, and versioning/replay.
+---
+
+## DAG Topology & State Machine
+
+DAGs model job dependencies as a directed acyclic graph. Each node is a job; each edge represents a completion dependency.
+
+### DAG Data Model
+
+```
+DAG {
+  id: "daily-etl-2026-01-15"
+  name: "daily-etl"
+  version: 3
+  nodes: [node_a, node_b, node_c, node_d]
+  edges: [(a, b), (a, c), (b, d), (c, d)]
+}
+
+Node {
+  id: "node_a"
+  name: "extract"
+  job: ExtractJob(...)
+  status: SUCCESS | PENDING | RUNNING | FAILED | SKIPPED
+  attempt: 0
+}
+```
+
+### Node State Machine
+
+Each DAG node transitions through well-defined states:
+
+```
+PENDING → (all parents SUCCESS) → READY → (assigned) → RUNNING
+                                              → SUCCESS | FAILED
+                      (parent FAILED or SKIPPED) → SKIPPED
+FAILED → (retry) → PENDING
+SCHEDULED → (cancel signal) → CANCELLED
+```
+
+### Trigger Evaluation
+
+After each node completes, the scheduler evaluates whether dependent nodes become ready:
+
+```
+on node_completed(node):
+    for child in DAG.children(node):
+        child.unfinished_parent_count -= 1
+        if child.unfinished_parent_count == 0:
+            child.status = READY  # Trigger evaluation passed
+            enqueue(child.job)
+        elif child.has_failed_parent():
+            child.status = SKIPPED
+            propagate_skip(child)
+```
+
+**Cascading skips**: If node A fails and nodes B, C depend on A, then B and C are skipped. If node D depends on both B and C, it is also skipped (transitive).
+
+### DAG Storage
+
+- DAG definition stored in etcd under `/dag-definitions/\{name\}/\{version\}`.
+- DAG execution state stored in etcd under `/dag-executions/\{dag-id\}`.
+- State is updated atomically using etcd transactions with condition checks.
+
+### Topological Sort
+
+The scheduler computes a topological ordering once when the DAG starts, then incrementally updates it:
+
+```
+topo_order = Kahn's algorithm on DAG structure
+level_assignment = parallel_level[topo_order]
+
+# Nodes at the same level can execute in parallel
+level 0: [node_a]
+level 1: [node_b, node_c]
+level 2: [node_d]
+```
+
+### Strengths
+- **Deterministic execution**: Topological ordering ensures correct dependency resolution.
+- **Parallel execution**: Nodes at the same level run concurrently.
+- **Transitive skip propagation**: Failed nodes cascade skip to all dependents automatically.
+
+### Weaknesses
+- **Full DAG in memory**: Each scheduler must hold the complete DAG structure; large DAGs (10K+ nodes) increase memory.
+- **No cyclic detection at runtime**: Cycles must be detected at DAG definition time; a runtime cycle is a bug.
+
+## Trigger Evaluation Engine
+
+The trigger engine evaluates when dependent nodes become ready and enqueues them for scheduling.
+
+### Trigger Types
+
+| Type | Behavior | Example |
+|------|----------|---------|
+| success | Child starts when parent succeeds | Standard ETL pipeline |
+| always | Child starts regardless of parent outcome | Cleanup job runs even if main job fails |
+| failed | Child starts only when parent fails | Alerting / notification job |
+| completion | Child starts when parent finishes (success or failure) | Post-processing regardless of outcome |
+
+### Dependency Types
+
+```
+# Standard: B runs after A succeeds
+A ──✓──> B
+
+# Conditional: B runs after A completes, but skips if A failed
+A ──?──> B  (only if A SUCCESS)
+
+# Fallback: B runs if A fails
+A ──✗──> B  (only if A FAILED)
+
+# Always: B runs after A regardless of outcome
+A ──!──> B  (always)
+```
+
+### Evaluation Strategy
+
+Two approaches for trigger evaluation:
+
+**Approach 1: Push-based (event-driven)**
+- When a node completes, emit an event → trigger engine processes → enqueues ready children.
+- Pros: Immediate evaluation, no polling.
+- Cons: Requires event propagation; events can be lost if engine crashes between write and process.
+
+**Approach 2: Pull-based (periodic scan)**
+- Periodically scan all pending nodes → check if parents completed → enqueue ready nodes.
+- Pros: Simple, idempotent, crash-safe.
+- Cons: Latency bounded by scan interval (typically 5-10s).
+
+**Hybrid approach (recommended):**
+- Push-based for immediate evaluation.
+- Pull-based reconciliation every 30s to catch any missed events (idempotent).
+
+### Concurrency Control
+
+When multiple nodes complete simultaneously, multiple trigger evaluations may target the same child. The engine uses etcd compare-and-set to ensure each node is enqueued exactly once:
+
+```
+etcd txn:
+  if /dag/\{dag-id\}/nodes/\{child-id\}/status == PENDING:
+    set /dag/\{dag-id\}/nodes/\{child-id\}/status = READY
+    create event: node_ready(dag-id, child-id)
+```
+
+### DAG Fan-Out Limit
+
+Large DAGs can fan out to hundreds of parallel nodes. The scheduler limits concurrent starts to prevent overload:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| Max parallel starts per cycle | 100 | Prevents queue spike |
+| Max DAG nodes | 10,000 | Memory limit for DAG in-memory state |
+| Max DAG depth | 200 | Stack depth limit for topological sort |
+| Max fan-out per node | 500 | Prevents thundering herd |
+
+### Strengths
+- **Multiple trigger types**: Flexible dependency semantics beyond simple success.
+- **Hybrid evaluation**: Push for speed, pull for safety.
+- **Idempotent enqueuing**: CAS prevents duplicate scheduling.
+
+### Weaknesses
+- **Eventual consistency**: Push-pull hybrid has a 30s reconciliation window before crash-safety kicks in.
+- **Fan-out throttling**: Large parallel stages are rate-limited, adding latency to DAG completion.
+
+## DAG Cancellation & Rollback
+
+Users may need to cancel a running DAG or replay a failed one from a specific point.
+
+### Cancellation
+
+When a user cancels a DAG, the scheduler performs a cascading cancel:
+
+```
+on dag_cancel(dag-id):
+    for node in all_nodes(dag-id):
+        if node.status in [PENDING, READY, QUEUED]:
+            cancel(node)  # Remove from queue, mark CANCELLED
+        elif node.status == RUNNING:
+            kill_running_job(node)  # Terminate container, mark CANCELLED
+        else:
+            keep(node)  # Already SUCCESS/FAILED — leave as-is
+```
+
+**Partial success preservation:** Successful nodes remain in SUCCESS state; cancelled/skipped nodes are marked CANCELLED. The DAG status becomes CANCELLED but is not FAILED.
+
+### Replay from Checkpoint
+
+Instead of replaying the entire DAG, users can replay from a specific node:
+
+```
+Replay options:
+├── Replay all (from root)
+├── Replay from node: "node_b" → replays node_b and all descendants
+└── Replay failed only → replays all FAILED and SKIPPED nodes
+```
+
+Implementation:
+1. The scheduler creates a new execution ID (e.g., `daily-etl-2026-01-15-replay-1`).
+2. Nodes before the replay point inherit status from the original execution.
+3. Nodes at and after the replay point start fresh with PENDING status.
+4. Dependencies cross the replay boundary: if a parent was inherited as SUCCESS, the child is immediately READY.
+
+### Dry Run
+
+Before executing, the scheduler supports a dry-run mode:
+
+```
+dry_run(dag) → returns:
+  - Execution order (topological)
+  - Parallel levels
+  - Estimated total duration (critical path)
+  - Estimated resource peak (max simultaneous resource requests)
+```
+
+Critical path calculation:
+```
+earliest_start[node] = max(earliest_finish[parent] for parent in parents)
+earliest_finish[node] = earliest_start[node] + estimated_duration[node]
+critical_path_length = earliest_finish[last_nodes]
+```
+
+### Strengths
+- **Cascading cancellation**: Stops entire DAG with proper state propagation.
+- **Partial replay**: Saves time by re-executing only affected nodes.
+- **Dry run**: Helps users estimate execution time and resource needs before committing.
+
+### Weaknesses
+- **Cannot undo SUCCESS nodes**: Once a node succeeds, replay creates a new execution ID — old state is not mutated.
+- **Dry run estimates**: Estimated duration and resources are heuristic; actual values may differ significantly.
+
+## DAG Versioning & Replay
+
+DAGs evolve over time. Users need to run new versions alongside historical executions.
+
+### DAG Versioning Model
+
+```
+DAG Definition: daily-etl (name, immutable)
+├── v1: \{ nodes: [a, b], edges: [(a, b)] \}  → executed 100 times
+├── v2: \{ nodes: [a, b, c], edges: [(a, b), (a, c)] \}  → executed 50 times
+└── v3: \{ nodes: [a, b, c, d], edges: [(a, b), (a, c), (b, d), (c, d)] \}  → current
+```
+
+Versioning rules:
+- Versions are immutable: once a DAG version is executed, it cannot be changed.
+- A new version is created when any node or edge is added, removed, or modified.
+- Historical executions reference the exact version they were created with.
+
+### Version Storage
+
+```
+etcd keys:
+  /dag-definitions/daily-etl/versions → [1, 2, 3]
+  /dag-definitions/daily-etl/1 → \{ nodes: [...], edges: [...] \}
+  /dag-definitions/daily-etl/2 → \{ nodes: [...], edges: [...] \}
+  /dag-definitions/daily-etl/3 → \{ nodes: [...], edges: [...] \}
+  /dag-executions/daily-etl/2026-01-15 → \{ dagId, version: 3, status: RUNNING \}
+```
+
+### Replay Strategies
+
+| Strategy | Use Case | Behavior |
+|----------|----------|----------|
+| Full replay | Testing new DAG version | Create execution of latest version, run all nodes from scratch |
+| Point-in-time replay | Failed data was from yesterday | Replay from the date the DAG was healthy |
+| Node-level replay | Only one node is failing | Replay from failing node to end |
+| Recurring replay | Scheduled daily run | Each recurrence creates a new execution ID with the current version |
+
+### Execution History
+
+For each DAG, the scheduler maintains an execution timeline:
+
+| Execution ID | Version | Status | Started | Ended | Duration |
+|-------------|---------|--------|---------|-------|----------|
+| daily-etl-2026-01-15 | 3 | SUCCESS | 02:00 | 02:45 | 45m |
+| daily-etl-2026-01-14 | 3 | FAILED | 02:00 | 02:12 | 12m |
+| daily-etl-2026-01-13 | 2 | SUCCESS | 02:00 | 02:50 | 50m |
+
+### Migration Between Versions
+
+When upgrading from v1 to v2 (adding node c):
+- Existing v1 executions continue with v1 semantics.
+- New executions use v2 by default (configurable).
+- No automatic migration of historical data.
+
+### Strengths
+- **Version immutability**: Historical executions are reproducible and auditable.
+- **Flexible replay**: Full, partial, and point-in-time replay options.
+- **Execution history**: Clear timeline of DAG runs with duration and status.
+
+### Weaknesses
+- **Storage growth**: Each execution state is stored in etcd; historical executions should be archived to cold storage.
+- **Version drift**: Users may not realize their recurring DAG has been silently upgraded to a new version.

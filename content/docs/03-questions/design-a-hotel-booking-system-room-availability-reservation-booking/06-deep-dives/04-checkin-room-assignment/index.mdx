@@ -1,0 +1,101 @@
+---
+title: Check-In Room Assignment
+description: How room-type-level bookings map to specific room instances at check-in, with preference matching and operational optimization.
+---
+
+## Room-Type-Level vs Room-Instance-Level Booking
+
+Most bookings are **room-type-level**: a guest books "Deluxe King" — any of the 50 Deluxe King rooms on the property. Room-instance-level booking exists (for guests who request a specific room number), but this is a special request, not the default.
+
+**Why room-type-level is the default**: It reduces write contention from 50 lock rows (one per room instance) to 1 lock row (the room type's availability count). This is the single most important design decision for throughput — it allows the availability table to handle 50K booking/sec without partitioning.
+
+Room-instance-level booking is supported: when a guest explicitly selects a room number (e.g., "Room 507, ocean view") during checkout, the system creates a room-instance reservation that bypasses the room-type availability and locks a specific room.
+
+## Assignment Algorithm
+
+At check-in, the system assigns a specific room from the booked room type's pool. The algorithm prioritizes:
+
+1. **Guest preferences** (from guest profile): room floor, bed type, view, accessibility needs, pillow type.
+2. **Housekeeping status**: Only CLEAN or INSPECTED rooms are eligible. DIRTY, UNDER_MAINTENANCE, or OUT_OF_ORDER rooms are excluded.
+3. **Operational efficiency**: Cluster guests by floor to minimize housekeeping travel time. If a guest checks out from floor 5, the next guest on floor 5 is preferred.
+4. **Loyalty tier**: Platinum/Gold members get first pick. They can see a list of available rooms in the app before check-in.
+
+```sql
+SELECT room_id FROM rooms
+WHERE room_type_id = $1
+  AND physical_state IN ('CLEAN', 'INSPECTED')
+  AND room_id NOT IN (
+    SELECT room_id FROM reservations
+    WHERE room_id IS NOT NULL
+      AND status IN ('CHECKED_IN', 'CONFIRMED')
+      AND check_out_date > $2
+  )
+ORDER BY
+  CASE WHEN floor = (SELECT preference_room_floor FROM guest_profiles WHERE guest_id = $3) THEN 0 ELSE 1 END,
+  floor ASC,
+  room_number ASC
+LIMIT 1;
+```
+
+**Batch assignment**: At peak check-in hours (11am–2pm), a background job runs every 60 seconds, pre-assigning rooms for all guests checking in within the next 2 hours. This spreads the load and gives guests their room number immediately upon app login.
+
+## Physical State Transition
+
+```
+CLEAN ──check-in──► OCCUPIED ──check-out──► DIRTY ──housekeeping──► CLEAN
+INSPECTED ──check-in──► OCCUPIED
+UNDER_MAINTENANCE ──(maintenance done)──► INSPECTED
+OUT_OF_ORDER ──(repaired)──► INSPECTED
+```
+
+At check-in, the room's physical state transitions from CLEAN/INSPECTED → OCCUPIED:
+
+```sql
+BEGIN;
+-- Atomic room assignment with state validation
+UPDATE rooms SET physical_state = 'OCCUPIED', updated_at = NOW()
+WHERE room_id = $1 AND physical_state IN ('CLEAN', 'INSPECTED')
+RETURNING room_id;  -- 0 rows = room was already assigned elsewhere → 409
+
+-- Update reservation
+UPDATE reservations SET status = 'CHECKED_IN', check_in_at = NOW(), room_id = $1
+WHERE reservation_id = $2;
+COMMIT;
+```
+
+Published to Kafka as `operations.checkin`, consumed by:
+- **Housekeeping**: Mark room as occupied, stop cleaning alerts.
+- **Keyless entry**: Program the room door lock for the stay duration (check-in to check-out).
+- **Revenue**: Begin billing clock if not already started.
+
+## Early Check-In / Late Check-Out
+
+Early check-in (before 3pm) and late check-out (after 11am) are **availability-based**, not guaranteed.
+
+**Pricing:**
+
+| Time Window | Pricing |
+|---|---|
+| Early check-in before 10am | 50% of nightly rate |
+| Early check-in 10am–3pm | Free if available, otherwise 50% rate |
+| Late check-out before 2pm | Free if available |
+| Late check-out 2pm–6pm | 50% of nightly rate |
+| Late check-out after 6pm | 100% of nightly rate (effectively a half-day booking) |
+
+**Availability check**: Same algorithm as a same-day booking for the room type. The RateEngine validates the request, and if rooms are available, the assignment proceeds without creating a new reservation.
+
+```sql
+-- Can we do early check-in?
+SELECT COUNT(*) FROM rooms
+WHERE room_type_id = $1
+  AND physical_state IN ('CLEAN', 'INSPECTED')
+  AND room_id NOT IN (
+    SELECT room_id FROM reservations
+    WHERE room_id IS NOT NULL
+      AND status IN ('CHECKED_IN', 'CONFIRMED')
+      AND check_out_date > NOW()
+  );
+-- If count > 0: available, assign the room with the applicable pricing
+```
+
+If no rooms are available, the guest can join a waitlist. They're notified via push notification when a room becomes available (typically when an earlier guest checks out and housekeeping cleans the room).

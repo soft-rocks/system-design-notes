@@ -1,0 +1,108 @@
+---
+title: "Future Extensibility"
+description: "Planned features and implementation strategy"
+---
+
+### Future Extensibility
+
+#### Planned Features with Implementation Strategy
+
+1. **Password Protection**:
+
+Add `password_hash` field to `url_mappings`. On redirect, check if hash is set — if so, return a 200 with a password form instead of a 302.
+
+```python
+# Verification (bcrypt, cost factor 12)
+import bcrypt
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
+```
+
+- **Complexity:** Low. One extra DB column, one middleware check in the redirect path (~0.5ms bcrypt verification).
+- **Backward compatibility:** `password_hash IS NULL` is the default — existing behavior unchanged. The password check is an early return before the 302 redirect.
+- **One-time passwords:** Generate a random 256-bit token, store its hash as `password_token_hash`, and serve it as a query parameter. Invalidate the token after first use (atomic `UPDATE ... WHERE token_hash = $1 RETURNING status`).
+
+2. **Custom Domains**:
+
+Allow enterprise users to use their own short domain (e.g., `go.brand.co/abc123` instead of `t.ly/abc123`).
+
+```sql
+ALTER TABLE url_mappings ADD COLUMN domain VARCHAR(255) NOT NULL DEFAULT 't.ly';
+ALTER TABLE url_mappings ADD CONSTRAINT unique_short_code_per_domain
+    UNIQUE (domain, short_code);
+```
+
+- **DNS validation:** User adds a TXT record (`brand-co-verification=abc123`) to prove ownership. Our system verifies via DNS query.
+- **SSL:** Use Let's Encrypt wildcard certificates per domain. Automate renewal via cert-manager. **Limitation:** Wildcards don't cover apex domains (`brand.co`) — use CNAME flattening or a CDN (Cloudflare) for apex support.
+- **Complexity:** Medium. Requires changes to the shard router (lookup by `domain + short_code`), new certificate management, and DNS validation flow.
+- **Backward compatibility:** `DEFAULT 't.ly'` on the domain column. Existing lookups use the default domain — no change to the redirect path logic, just an extra column in the query.
+
+3. **Analytics Dashboard**:
+
+Expose ClickHouse data via a REST API for visual analytics.
+
+- **API endpoints:**
+  - `GET /api/v1/links/\{code\}/analytics?range=7d` — click trends (P95 < 200ms via daily_aggregates table)
+  - `GET /api/v1/links/\{code\}/analytics/geography?range=7d` — country breakdown
+  - `GET /api/v1/links/\{code\}/analytics/devices?range=7d` — device breakdown
+
+- **Complexity:** Medium. Requires building the API layer and frontend. The data pipeline (ClickHouse) already exists.
+- **Backward compatibility:** Completely separate endpoint namespace (`/api/v1/links/`), no impact on redirect path.
+
+4. **Link Preview**:
+
+When a short URL is shared (e.g., in Slack), show a preview of the target page (title, description, thumbnail) without redirecting.
+
+```python
+def get_link_preview(url: str) -> Preview:
+    response = httpx.get(url, timeout=5.0, follow_redirects=True)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    return Preview(
+        title=soup.find('title').string if soup.find('title') else None,
+        description=soup.find('meta', \{'name': 'description'\})['content'] if soup.find('meta', \{'name': 'description'\}) else None,
+        image=soup.find('meta', \{'property': 'og:image'\})['content'] if soup.find('meta', \{'property': 'og:image'\}) else None,
+    )
+```
+
+- **Complexity:** Medium. Async task queue (Celery/RQ) to fetch preview on URL creation. Cache the preview for 7 days (HTML changes infrequently).
+- **Performance impact:** Preview fetch is async — does not affect the redirect path. The task queue should have a timeout (5s) and max retry (1) to prevent queue buildup.
+- **Backward compatibility:** Preview is optional — URLs without a preview still redirect normally.
+
+5. **QR Code Generation**:
+
+Auto-generate QR codes for short URLs.
+
+- **Complexity:** Low. Add `GET /api/v1/links/\{code\}/qr` endpoint that generates a QR code on-the-fly using a library like `qrcode`. Cache the QR code in Redis with TTL=1 year (URL content doesn't change).
+- **Backward compatibility:** New endpoint, no impact on existing behavior.
+
+6. **Webhooks**:
+
+Notify external systems on click events (useful for real-time analytics integration).
+
+```python
+# Webhook delivery with retry
+class WebhookDelivery:
+    RETRIES = 3
+    BACKOFF = [1, 2, 4, 8]  # seconds
+
+    async def deliver(self, url: str, event: dict):
+        for i in range(self.RETRIES):
+            try:
+                await httpx.post(url, json=event, timeout=5.0)
+                return
+            except httpx.HTTPError:
+                if i == self.RETRIES - 1:
+                    log.error("Webhook delivery failed after retries", url=url)
+```
+
+- **Complexity:** Medium. Add webhook subscriptions to the API, store delivery state in a separate table, run a delivery worker that retries failed deliveries with exponential backoff.
+- **Backward compatibility:** Webhooks are opt-in per-link or per-account. Existing links without webhook subscriptions behave identically.
+- **Important:** Webhooks are best-effort. The analytics pipeline remains the source of truth. If a webhook fails after retries, it's logged but does not block the redirect.
+
+7. **Bulk Import/Export**:
+
+CSV upload for creating multiple short URLs at once. Export analytics as CSV.
+
+- **Complexity:** Low-Medium. For import, process rows asynchronously (queue-based). For export, stream rows from ClickHouse to CSV file (no in-memory buffering).
+- **Backward compatibility:** Bulk import uses a separate API endpoint (`POST /api/v1/bulk`). Existing single-URL endpoint unchanged.

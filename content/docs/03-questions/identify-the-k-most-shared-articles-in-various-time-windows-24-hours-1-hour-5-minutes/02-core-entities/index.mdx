@@ -1,0 +1,129 @@
+---
+title: "Core Entities"
+description: "Core domain entities for the most shared articles tracking system"
+---
+
+## Share Event
+
+The atomic unit of data in the system. Every user share action creates one share event.
+
+```
+{
+  event_id:     string          // UUID, deduplication key
+  article_id:   string          // ID of the shared article
+  user_id:      string          // Who shared it (optional, may be absent for webhooks)
+  source:       ShareSource     // twitter | facebook | email | sms | whatsapp | direct_link
+  timestamp:    int64           // Unix epoch millis (event creation time)
+  received_at:  int64           // When the system ingested it
+  metadata:     map<string,string> // url, referrer, user_agent, geo (optional)
+}
+```
+
+**Key properties**:
+- `event_id` is the deduplication key — retries should be idempotent.
+- `source` enables filtering (e.g., "top shared on Twitter in last 5 minutes").
+- Timestamps may be slightly out of order; the system handles late arrivals.
+
+## Article Entity
+
+The entity being shared. Exists in a separate content system; this service references it.
+
+```
+{
+  article_id:    string
+  title:         string
+  url:           string
+  category:      string          // tech | sports | politics | ...
+  author_id:     string
+  publish_time:  int64           // Used to exclude very old articles from trending
+  is_active:     bool            // Soft delete flag
+}
+```
+
+**Note**: We do **not** store the full article content. We only need metadata for enriching top-K results (title, category) at query time.
+
+## Counter Bucket
+
+An aggregation unit that maps `(article_id, bucket_key) → count`.
+
+```
+BucketKey {
+  granularity: Granularity  // 5min | 1hr | 24hr
+  window_start: int64       // Start of the time bucket (aligned to granularity)
+  article_id: string
+}
+```
+
+**Granularity alignment**:
+- For 5-minute window: each event maps to a 10-second micro-bucket.
+- For 1-hour window: each event maps to a 1-minute micro-bucket.
+- For 24-hour window: each event maps to a 10-minute macro-bucket.
+
+The **hierarchical bucketing** strategy:
+```
+24hr window:  [10min-bucket] × 144 buckets = 24hr
+  └─ each 10min bucket is pre-aggregated from finer buckets
+
+1hr window:   [1min-bucket] × 60 buckets = 1hr
+  └─ each 1min bucket aggregates from the same 10s micro-buckets
+
+5min window:  [10s-bucket] × 30 buckets = 5min
+```
+
+This way, the same raw events feed all three windows at different aggregation levels.
+
+## Top-K Result
+
+The query output — a sorted, limited list.
+
+```
+TopKResult {
+  articles: [{
+    article_id:    string
+    rank:          int            // 1-based rank
+    count:         int            // Number of shares in the window
+    title:         string         // Enriched from Article service
+    category:      string
+    shares_by_source: {           // Optional breakdown
+      twitter: int,
+      facebook: int,
+      email: int,
+      ...
+    }
+  }]
+  window:      string           // "5m" | "1h" | "24h"
+  query_time:  int64            // When the query was issued
+}
+```
+
+## Entity Relationships
+
+```
+┌──────────────┐     emits      ┌──────────────┐
+│   Article    │ ◄───────────── │  ShareEvent  │
+│              │                │              │
+│ article_id   │                │ article_id   │
+│ title        │                │ source       │
+│ category     │                │ timestamp    │
+│ url          │                │ user_id      │
+└──────────────┘                └──────┬───────┘
+                                       │
+                                        │  aggregates into
+                                        ▼
+                              ┌──────────────────┐
+                              │  CounterBucket   │
+                              │  (article_id,    │
+                              │   granularity,   │
+                              │   window_start)  │
+                              │  → count         │
+                              └──────────────────┘
+                                       │
+                                        │  ranked by
+                                        ▼
+                              ┌──────────────────┐
+                              │   TopKResult     │
+                              │  limited to K,   │
+                              │  enriched with   │
+                              │  Article metadata│
+                              └──────────────────┘
+```

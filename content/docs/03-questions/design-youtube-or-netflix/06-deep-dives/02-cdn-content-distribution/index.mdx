@@ -1,0 +1,67 @@
+---
+title: CDN & Content Distribution
+description: Deep dive into CDN architecture for video delivery
+---
+
+## CDN Architecture & Edge Caching
+
+**Design goal**: Serve 30 Tbps of video traffic with &lt;100ms latency to users worldwide.
+
+**CDN topology:**
+```
+User → DNS → Nearest Edge → Mid-Tier (PoP) → Origin (S3)
+```
+
+- **Edge nodes**: ~3,000 locations globally. Cache HLS manifests + video segments. Edge nodes handle ~99% of all requests.
+- **Mid-tier PoPs**: ~50 regional aggregation points. Act as warm cache for nearby edges, reducing origin fetches.
+- **Origin**: S3 bucket per region (primary + replica). Only serves cache misses from mid-tier PoPs.
+
+**Cache hierarchy TTL strategy:**
+- **HLS/DASH manifests** (`.m3u8`/`.mpd`): TTL = 60 seconds. Small files (1-10KB), frequently change as quality switches.
+- **Video segments** (`.ts`/`.mp4`): TTL = 7 days (or video lifetime). Large files (2-10MB each), static content.
+- **Manifest URL signed token**: Valid for 4-8 hours. Prevents link sharing of manifest URLs.
+
+**Cache hit optimization:**
+- **Pre-warming**: When transcoding completes, push hot content to top 100 edge nodes proactively
+- **Dedicated hot content cache**: Top 10,000 videos get pinned in all edge caches (guaranteed 100% hit rate)
+- **Cache-aware scheduling**: Video segments are named with content-hash paths so identical segments at different quality levels share cache slots
+
+## Signed URL & DRM
+
+**Signed URL mechanism:**
+1. Client requests manifest URL from Metadata API with JWT
+2. Metadata API validates JWT, generates a signed URL valid for 4 hours with IP-binding
+3. Client uses signed URL to fetch `.m3u8`/`.mpd` from CDN
+4. CDN verifies the signature before serving — rejects tampered URLs
+
+**DRM layers (for premium content):**
+- **Widevine** (Android/Chrome): L1 (hardware-backed) on devices that support it, L3 (software) fallback
+- **FairPlay** (Safari/iOS): Integrated with Apple Key Trust Service
+- **PlayReady** (Windows Edge): Pre-installed on Windows 10+
+
+**DRM flow:**
+```
+Client → CDN (manifest) → DRM License Server → Decrypt → Decrypt segments
+```
+- Manifest references DRM-encrypted segments
+- Client requests license from DRM provider-specific endpoint
+- License server validates JWT + user subscription status
+- Decryption happens in secure hardware enclaves (prevents screen capture)
+
+## Cache Invalidation Strategy
+
+**Problem**: When video metadata changes (title, visibility, deleted), cached data must be invalidated.
+
+**Strategies by content type:**
+
+| Content Type | Invalidation Method | Why |
+|-------------|---------------------|-----|
+| Segments (.ts/.mp4) | Never invalidate; use content-hash filenames | Identical content = identical hash, no stale data risk |
+| Manifest (.m3u8) | Short TTL (60s) + versioned manifest names | Changes are frequent but low-impact |
+| Metadata (DB records) | Redis cache with write-through + TTL fallback | Strong consistency on writes, eventual on stale reads |
+| Deleted content | Soft-delete with 24h visibility → purge | Allows rollback window, prevents content disappearance during sessions |
+
+**Redis cache invalidation pattern:**
+- Write-through: every DB update propagates to Redis via pub/sub
+- TTL fallback: 5-minute TTL as a safety net if pub/sub delivery fails
+- Read-through: cache miss triggers DB fetch + cache write

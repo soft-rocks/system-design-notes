@@ -1,0 +1,151 @@
+---
+title: API / System Interface
+description: Producer, consumer, admin, metadata, and replication interfaces
+---
+
+## Producer Interface (binary protocol)
+
+```protobuf
+rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+message ProduceRequest {
+  repeated TopicPartition partitions = 1;
+  required_acks     required_acks   = 2;  // NONE / LEADER / ALL
+  int32             timeout_ms      = 3;
+}
+
+message TopicPartition {
+  string       topic_name   = 1;
+  int32        partition_id = 2;
+  repeated Message messages  = 3;
+}
+
+message Message {
+  bytes   key       = 1;
+  bytes   value     = 2;
+  int64   timestamp = 3;
+  map&lt;string, string&gt; headers = 4;
+}
+
+message ProduceResponse {
+  repeated TopicPartitionResponse responses = 1;
+}
+
+message TopicPartitionResponse {
+  string  topic_name   = 1;
+  int32   partition_id = 2;
+  int64   offset       = 3;  // assigned offset
+  ErrorCode error_code = 4;
+}
+```
+
+- **required_acks = NONE**: fire-and-forget, lowest latency.
+- **required_acks = LEADER**: leader acknowledges, risk of data loss on leader crash.
+- **required_acks = ALL**: all in-sync replicas acknowledge, guarantees durability.
+
+## Consumer Interface
+
+```protobuf
+rpc Consume(ConsumeRequest) returns (stream ConsumeResponse);
+
+message ConsumeRequest {
+  string         group_id       = 1;
+  string         topic_name     = 2;
+  int32          partition_id   = 3;
+  int64          fetch_offset   = 4;
+  int32          max_bytes      = 5;
+  int32          timeout_ms     = 6;
+}
+
+message ConsumeResponse {
+  repeated Message messages = 1;
+  ErrorCode error_code      = 2;
+}
+```
+
+## Admin Interface (REST / gRPC)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | /admin/topics | Create a new topic |
+| GET | /admin/topics/\{topicName\} | Get topic metadata |
+| DELETE | /admin/topics/\{topicName\} | Delete a topic |
+| PUT | /admin/topics/\{topicName\} | Update topic config |
+| GET | /admin/topics/\{topicName\}/partitions | List partitions and replica assignment |
+| POST | /admin/topics/\{topicName\}/partition-reassign | Reassign partition leadership |
+| GET | /admin/consumer-groups | List consumer groups |
+| GET | /admin/consumer-groups/\{groupId\} | Get group details (members, offsets, assignments) |
+| DELETE | /admin/consumer-groups/\{groupId\} | Delete a consumer group |
+| GET | /admin/brokers | List brokers and their health |
+| POST | /admin/brokers/\{brokerId\}/decommission | Gracefully decommission a broker |
+| GET | /admin/config | Cluster-wide configuration |
+| PUT | /admin/config | Update cluster configuration |
+
+## Metadata Interface
+
+Producers and consumers fetch metadata from the controller broker:
+```protobuf
+rpc GetMetadata(MetadataRequest) returns (MetadataResponse);
+
+message MetadataRequest {
+  repeated string topics = 1;
+}
+
+message MetadataResponse {
+  repeated Broker brokers = 1;
+  repeated TopicMetadata topics = 2;
+}
+
+message Broker {
+  string broker_id = 1;
+  string host = 2;
+  int32 port = 3;
+}
+
+message TopicMetadata {
+  string topic_name = 1;
+  int32 partition_count = 2;
+  repeated PartitionMetadata partitions = 3;
+}
+
+message PartitionMetadata {
+  int32 partition_id = 1;
+  string leader_broker = 2;
+  repeated string replicas = 3;
+  repeated string in_sync_replicas = 4;
+}
+```
+
+## Internal Replication Protocol
+
+Leader ↔ Follower communication for log replication:
+```protobuf
+rpc AppendMessages(AppendRequest) returns (AppendResponse);
+
+message AppendRequest {
+  string       topic_name     = 1;
+  int32        partition_id   = 2;
+  repeated Message messages  = 3;
+  int64        leader_epoch   = 4;
+}
+
+message AppendResponse {
+  int64   next_offset       = 1;  // next offset the follower should use
+  ErrorCode error_code      = 2;
+}
+
+// Heartbeat to keep follower in ISR
+rpc FetchCommitted(FetchRequest) returns (FetchResponse);
+
+message FetchRequest {
+  string topic_name    = 1;
+  int32 partition_id   = 2;
+  int64 high_watermark = 3;  // last offset follower has seen
+}
+
+message FetchResponse {
+  int64 high_watermark = 1;  // updated high watermark
+  repeated Message messages = 2;
+  ErrorCode error_code = 3;
+}
+```

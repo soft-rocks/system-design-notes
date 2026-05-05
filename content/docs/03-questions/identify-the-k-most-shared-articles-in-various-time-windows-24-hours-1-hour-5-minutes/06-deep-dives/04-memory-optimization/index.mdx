@@ -1,0 +1,183 @@
+---
+title: "Memory Optimization"
+description: "Strategies for optimizing Redis memory usage in the counter-based sliding window system"
+---
+
+## The Memory Problem
+
+With ~100K active articles, 234 buckets (30 10s-buckets for 5m + 60 1min-buckets for 1hr + 144 10min-buckets for 24hr), and ~100 bytes per Redis key (including overhead), we need:
+
+```
+100,000 articles × 234 buckets × ~100 bytes = ~2.34 GB
+```
+
+Plus Redis memory overhead (dict structures, string objects, fragmentation): **~3–4 GB total**.
+
+While this is manageable on a modest Redis cluster, it's worth optimizing because:
+- It reduces infrastructure cost
+- It improves cache hit rates (more useful data fits in memory)
+- It reduces the cost of background operations (TTL expiration, compaction)
+
+## TTL Strategy: When to Evict
+
+Each bucket type has a TTL slightly longer than its window size, to handle late arrivals and sliding window edge effects:
+
+| Granularity | Window Size | TTL | Buffer |
+| --- | --- | --- | --- |
+| 10-second bucket | 5 minutes | 25 minutes | 20 min |
+| 1-minute bucket | 1 hour | 90 minutes | 30 min |
+| 10-minute bucket | 24 hours | 26 hours | 2 hours |
+
+**Why so much buffer for the 10s buckets?**
+
+Late events are the biggest problem. Events can arrive up to 5 seconds late, and in extreme network conditions, up to 30 seconds. A 25-minute buffer gives us room to handle:
+- Event reordering: 30 seconds
+- Consumer lag during spikes: up to 5 minutes
+- Redis failover and restart: up to 1 minute
+- Headroom for edge-case delays: 20+ minutes
+
+The buffer is wasteful (storing buckets that are no longer needed), but it's the simplest correct approach. Tuning the buffer smaller is a tradeoff between memory and accuracy.
+
+## Background Compaction
+
+Redis has a TTL-based eviction mechanism, but it's lazy (only evicts on access) and probabilistic (not exact). We supplement this with **active compaction** that runs every 5 minutes:
+
+### What Gets Compacted
+
+```
+Before compaction:
+  counter:5m:10s:1714672200:art_12345  →  10
+  counter:5m:10s:1714672210:art_12345  →  15
+  counter:5m:10s:1714672220:art_12345  →  8
+  counter:5m:10s:1714672230:art_12345  →  12
+  ...
+
+After compaction (every 3 TTLs of stability):
+  counter:5m:10s:1714672200:art_12345  →  (deleted)
+  counter:5m:10s:1714672210:art_12345  →  (deleted)
+  counter:5m:10s:1714672220:art_12345  →  (deleted)
+  counter:5m:10s:1714672230:art_12345  →  (deleted)
+  counter:5m:compacted:1714672200:art_12345 →  45  ← merged
+```
+
+### Compaction Algorithm
+
+```python
+def compact_buckets():
+    """Runs every 5 minutes in a background worker."""
+    # 1. Scan for buckets that have been stable (no new events) for 3 TTLs
+    for article_id in hot_article_list():
+        for granularity, ttl in [("5m", 25*60), ("1h", 90*60), ("24h", 26*60*60)]:
+            buckets = redis.scan(f"counter:\{granularity\}:*:\{article_id\}")
+
+            # Find consecutive stable buckets (oldest first)
+            stable_buckets = find_stable_sequence(buckets, ttl * 3)
+
+            # Merge stable buckets into a single compacted key
+            if stable_buckets:
+                total = sum(bucket.count for bucket in stable_buckets)
+                redis.set(f"counter:\{granularity\}:compacted:\{stable_buckets[0].key\}:art_\{article_id\}", total)
+
+                # Delete individual buckets
+                redis.delete(*[b.key for b in stable_buckets])
+```
+
+**Impact**: Reduces Redis memory usage by ~40–60% over time, as older stable buckets get merged and eventually expire.
+
+### Why Not Compress Individual Buckets?
+
+Redis doesn't support per-key compression. We could use **binary values** (varint encoding for counts) to save a few bytes per key, but the key name itself dominates the memory footprint (~70 bytes of the ~100 bytes per key are the key string). Compression would save < 5%.
+
+## Hot/Cold Article Split
+
+Not all articles are equally shared. The distribution is **Zipf-like**:
+
+```
+Top 1 article:     10,000 shares in 5 minutes
+Top 10 articles:     2,000 shares each
+Top 100 articles:      500 shares each
+Top 1K articles:       50 shares each
+Top 10K articles:       5 shares each
+Rest 90K articles:   < 1 share each
+```
+
+This means most memory is spent on articles that almost never appear in top-K. We can split the storage:
+
+```
+Hot articles (top 1K):      Exact counters in Redis, full resolution
+Medium articles (1K–10K):   Exact counters in Redis, coarser buckets
+Cold articles (10K+):       Compressed in Redis or evicted early
+```
+
+**Implementation**:
+
+| Tier | Count | Counter Resolution | TTL | Memory Estimate |
+| --- | --- | --- | --- | --- |
+| Hot | 1,000 | 10s / 1min / 10min | Standard | 10,000 × 234 × 100B = 23 MB |
+| Medium | 9,000 | 1min / 10min (skip 10s) | 1hr / 26hr | 9,000 × 204 × 100B = 180 MB |
+| Cold | 90,000 | 10min (24hr only) | 26hr | 90,000 × 144 × 100B = 1.3 GB |
+
+**Key insight**: Cold articles only need the 24hr window resolution (10min buckets) because no one queries "top articles shared in last 5 minutes" for an article with < 1 share per 10 minutes.
+
+This reduces memory from 2.3GB to ~1.5GB — a 35% savings.
+
+## Delta Encoding for Counter Values
+
+Instead of storing raw counts, use **delta encoding** for sequential buckets:
+
+```
+Raw values per article: [10, 15, 8, 12, 3, 0, 0, 7, 2, 1]
+Delta encoded:          [10, +5, -7, +4, -9, -3, 0, +7, -5, -1]
+```
+
+For most articles, most deltas are **small** (the share rate doesn't change dramatically between adjacent buckets). We can encode small deltas in 1–2 bytes using **varint** encoding:
+
+- Delta of 0 → encoded as 1 byte (0x80)
+- Delta of 1–127 → encoded as 1 byte
+- Delta of 128–16383 → encoded as 2 bytes
+- Larger deltas → encoded as 4 bytes
+
+**For hot articles** with frequent sharing, deltas are larger and encoding saves less. **For cold articles** with many zero buckets, this saves ~80% per counter value.
+
+**Tradeoff**: Delta encoding requires deserialization on every read, adding ~10μs per key. In a pipeline of 144 MGET calls, this adds ~1.4ms — negligible.
+
+## Memory Budget Breakdown
+
+Target Redis cluster: 2 GB usable (after replication), broken down as:
+
+| Component | Budget | Actual Usage | Notes |
+| --- | --- | --- | --- |
+| Counter storage | 1.2 GB | ~1.0–1.5 GB | Varies with active article count |
+| Article metadata cache | 300 MB | ~100 MB | 100K entries × ~1KB each |
+| Query result cache | 100 MB | ~30 MB | 10K cached queries × ~3KB each |
+| Redis overhead | 400 MB | ~200–400 MB | Dict structures, fragmentation |
+| **Total** | **2.0 GB** | **~1.3–2.0 GB** | Headroom for traffic growth |
+
+## Monitoring and Alerts
+
+```
+Alert: Redis memory > 80% of maxmemory
+  Action: Trigger emergency compaction, evict cold counters
+
+Alert: Redis fragmentation ratio > 1.5
+  Action: Trigger Redis save and restart (copy-on-write migration)
+
+Alert: Counter TTL expiration rate > 10K keys/sec
+  Action: Indicates compaction backlog — add compaction workers
+
+Metric: Counter key count per granularity
+  Dashboard: show trend of hot/medium/cold article split
+  Alert: if cold articles > 200K, promote to separate tier or archive
+```
+
+## When to Add More Memory
+
+The system scales gracefully as traffic grows, but at some point, more Redis memory is needed:
+
+| Metric | Threshold | Action |
+| --- | --- | --- |
+| Active articles > 200K | Memory > 1.5 GB | Add Redis shard |
+| Active articles > 500K | Memory > 3 GB | Add second Redis cluster |
+| Active articles > 1M | Need ~6 GB | Switch to CMS for cold tail (see deep dive #2) |
+
+Adding Redis shards requires **resharding**, which is a major operation. Planning for growth from the start with virtual sharding minimizes disruption.

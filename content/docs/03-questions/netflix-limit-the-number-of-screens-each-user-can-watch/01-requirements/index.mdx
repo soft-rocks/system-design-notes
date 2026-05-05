@@ -1,0 +1,75 @@
+---
+title: Requirements
+description: Functional, non-functional, and scale requirements for the Netflix screen-limit system.
+---
+
+## Functional Requirements
+
+### Per-Tier Device Limits
+Each plan tier has a well-defined concurrent stream limit: Basic = 1, Standard = 2 (or 3 for newer plans), Premium = 4. Limits are enforced per household (account), not per device — multiple devices can stream simultaneously up to the cap. The limit applies to **active video rendering streams**, not just logged-in sessions. Different content tiers (ad-supported vs. ad-free) do NOT change device limits.
+
+### Device Registration & Tracking
+Every device that plays content must register with the limit service (device_id, platform, app_version, geo). Registration happens on first playback start; device persists across app reinstalls via long-lived device tokens. User can view all registered devices and forcibly unregister any of them via account settings. Maximum device limit: ~10 devices per account (to prevent abuse).
+
+### Concurrent Stream Enforcement
+Each playback request checks if active_streams < plan_limit before allowing video start. If over limit, the user receives a 409 Conflict response with list of active streams. The enforcement is soft-partial: if the limit is 4 and a user starts on device 5, only device 5 is blocked. Stream ends are tracked via push/pull: client sends STOP signal, but the server also has a TTL-based cleanup fallback.
+
+### Offline Download Limits
+Separate quota: number of downloads per account (e.g., 100) and per device (e.g., 30). Downloads expire after a period (e.g., 30 days) or after watching (to protect DRM). Download count is checked at download time but does NOT affect concurrent streaming limit.
+
+### Plan Change Handling
+When a user upgrades or downgrades, the new limit applies immediately. If downgrading (e.g., Premium 4 streams → Standard 2 streams), the user can FINISH current streams but cannot start new ones beyond the new limit. A grace period message informs the user which devices can continue. Plan change events must be processed within < 5 seconds for all replicas.
+
+## Non-Functional Requirements
+
+### Latency
+- Limit check (has_capacity?) must return in < 5ms p99 — this is on the hot path for every video play
+- Registration/de-registration operations are async but return within 200ms p99
+- Device listing (GET /devices) returns within 500ms p99
+
+### Availability & Fault Tolerance
+- **Fail-open policy**: if the limit service is unavailable, allow the playback to proceed. Denying content to paying customers is far worse than allowing one extra stream.
+- Circuit breaker on limit checks: when downstream failure rate > 5% for 30s, open the breaker and enter allow-all mode
+- Local cache fallback: each CDN edge node caches recent limit states locally to serve checks without hitting the central service
+
+### Consistency Model
+- Stream count state is **eventually consistent** across regions (RPO < 1 stream, RTO < 10s). It's acceptable to allow 1 extra stream briefly during failover.
+- Plan configuration changes are **strongly consistent** — they propagate via a versioned config store with leader-based writes
+- Device registry is eventually consistent across regions (replicated via CDC from primary DB)
+
+### Throughput & Scalability
+- Support ~20M limit checks/second at peak (playback starts across global user base)
+- Each service instance must handle &gt;= 10K checks/sec (with horizontal scaling)
+- State store must support millions of concurrent stream records with O(1) lookup
+
+### Durability
+- All device registrations and plan changes are persisted in a relational DB (source of truth)
+- Stream counts are stored in an in-memory key-value store (Redis) with periodic snapshots to storage
+- Crash recovery: replay stream registration log from persistent log; tolerate ~5s of gap via stale state
+
+## Scale Assumptions
+
+### User Base & Scale
+- ~270M global subscribers across 190+ countries
+- ~50M+ concurrent video streams at any given moment
+- DAU: ~200M; MAU: ~270M
+- Peak ratio: ~25% of concurrent streams occur within any 5-minute window
+
+### Request Rates
+- Limit checks (has_capacity?): ~20M requests/sec — every time a user presses play
+- Stream registration: ~10M writes/sec (new playback sessions)
+- Stream deregistration: ~10M writes/sec (session ends)
+- Device operations (register/unregister/list): ~1M requests/sec
+- Plan changes: ~100K events/sec (burst up to 1M during promotions)
+
+### Storage Scale
+- Active stream records in Redis: ~50M entries (one per concurrent stream)
+- Device registry: ~1B device-account pairs globally (each user averages ~4 devices)
+- Storage footprint: ~50MB for active streams in Redis
+- Download records: ~500M active downloads at any time
+- Daily event volume: ~500M stream start events, 500M stream end events
+
+### Data Distribution
+- Traffic is regional but account state is global (user may register devices in different regions)
+- ~60% traffic from NA + EMEA, ~40% from APAC + LATAM
+- Multi-region active-active: primary DB in US-East, read replicas in EU-West and APAC-South

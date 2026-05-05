@@ -1,0 +1,51 @@
+---
+title: Hash-Based Assignment Algorithm
+description: How deterministic hashing assigns users to variants consistently across all services and devices.
+---
+
+## Deterministic Hash Function
+
+The core of assignment is a deterministic, uniform hash function: `hash(userId, experimentId) % 10000`.
+
+We use **MurmurHash3** (32-bit) or **xxHash** (64-bit) — both are extremely fast (10+ GB/s throughput), produce uniform output, and are deterministic.
+
+The hash key is `userId + "|" + experimentId` (or `user_id:experiment_id`) to ensure that the combination produces a unique hash — different experiments on the same user yield different buckets, and the same experiment on different users yields different buckets.
+
+For anonymous users (no userId), we fall back to a generated UUID stored in a client cookie or device fingerprint. This introduces a risk: if the fingerprint changes, the user may get a different variant. We mitigate this with a short-lived persistence window (e.g., 7 days) on the cookie.
+
+**Why not UUID-based hashing?** UUIDs have 128-bit entropy but are not computable client-side without a network call. A client-side hash function must be deterministic and fast — we evaluate it locally using the experiment key and a deterministic user identifier.
+
+**Why % 10000 (10,000 buckets)?** 10,000 provides fine-grained traffic splitting down to 0.01% increments. A smaller bucket count (e.g., 100) would only allow 1% minimum splits, which is too coarse for small experiments. A larger count (e.g., 1,000,000) wastes hash space and doesn't provide meaningful practical benefit.
+
+## Traffic Allocation
+
+Traffic allocation is a mapping from hash buckets to variants. The algorithm:
+
+1. Compute `bucket = hash(userId, experimentId) % 10000` (range: 0–9999)
+2. Cumulative allocation: control=[0, 5000), variant_a=[5000, 7500), variant_b=[7500, 10000) (50%/25%/25% split)
+3. Find the first variant whose cumulative range contains the bucket
+
+This mapping is stored as part of the experiment config and loaded by the SDK. Changing allocation ratios only requires a config update — no rehashing of existing users.
+
+### Rebalancing traffic
+
+When experiment creators change traffic allocation, existing users stay in their current bucket (their hash result doesn't change). New users are evaluated against the new bucket boundaries. To ensure a clean transition for new experiments, we support a `force_reassign` flag that invalidates all existing assignments and re-hashes from the new distribution.
+
+### Small traffic segments
+
+For experiments with very small traffic (e.g., 0.1%), we use a "sample first" approach: check `hash(userId, experimentId) % 100000 < 100` first as a cheap filter, then evaluate the full experiment config. This avoids evaluating the full targeting + variant logic for the 99.9% of users who shouldn't participate.
+
+## Consistency & Collision Avoidance
+
+**Guaranteed consistency:** The same `userId + experimentId` always produces the same bucket, which always maps to the same variant. This is true regardless of:
+
+- What server handles the request
+- What time of day
+- What region the user is in
+- Whether other experiments have been created/modified
+
+**No collision handling needed:** Unlike a database-based approach, hash-based assignment has zero collisions by design. The bucket is the assignment key — two users who hash to the same bucket for the same experiment are intentionally assigned to the same variant. This is the desired behavior.
+
+**Collision between experiments:** Each experiment has a unique experimentId, so two different experiments will produce different hash outputs. Users can be in different variants across experiments, which is the expected behavior. Within a layer, we use a compound hash: `hash(userId, layerId) % 10000` to assign the user to one experiment per layer, then apply the variant hash within that experiment.
+
+**Edge case — user removal:** If a user is removed from an experiment (e.g., they're a QA tester who should see control), we maintain an exclusion list keyed by `\{userId, experimentId\}` that short-circuits the hash evaluation and returns the control variant.

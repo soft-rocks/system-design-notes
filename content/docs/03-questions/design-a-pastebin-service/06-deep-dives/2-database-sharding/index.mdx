@@ -1,0 +1,154 @@
+---
+title: Database Sharding
+description: Deep dive into row-level sharding strategy for PostgreSQL.
+---
+
+### Database Sharding
+
+#### Challenge
+
+Distributing ~1M paste metadata writes/day (~12/sec sustained) and ~100M reads/day (~1,157/sec sustained) across multiple PostgreSQL instances while ensuring every write targets exactly one shard, reads never require cross-shard queries, and schema changes propagate uniformly. At 100:1 read/write ratio, the dominant cost is read throughput, not write — but each read touches a single shard deterministically, so horizontal read scaling is the primary driver.
+
+**Key observation**: At current scale, a single well-tuned PostgreSQL instance (with read replicas) could handle both reads and writes. Sharding is an architectural commitment for predictable linear scaling past a single-node ceiling (~50 writes/sec, ~5K reads/sec per shard) and to keep hot shards balanced as paste popularity skews distribution.
+
+#### Solution: MurmurHash3-Based Row Sharding with Connection Pooling
+
+**1. Sharding Strategy — Deterministic Key Routing**
+
+Each shard is an independent PostgreSQL instance running the identical schema. Row distribution is deterministic — the `paste_key` maps to a shard via `MurmurHash3(paste_key) % N`. This means:
+
+- **Every request targets exactly one shard** — no cross-shard joins, no distributed transactions. The `content_hash` dedup check is a single-row indexed lookup on `idx_content_hash` (unique index), running at write frequency (~12/sec) — negligible relative to single-shard read throughput (~116 rps/shard).
+- **Routing is local to the application** — no separate routing service, no consistent hashing ring, no proxy. The Paste Service computes the shard ID and routes directly via a connection pool.
+- **Reads use replicas, writes use primaries** — each shard has 1 primary + 2 read replicas. Read traffic is load-balanced across replicas using PgBouncer in transaction-mode pooling.
+
+**2. Sharding Key: `paste_key`**
+
+The `paste_key` (8-char string from `a-z2-7` alphabet) is the natural key for every operation — creation, retrieval, deletion. We use **MurmurHash3** for sharding distribution — it has proven avalanche properties on short base32 strings and is the standard choice for hash-based partitioning:
+
+**Sharding routing during write**: The paste_key is generated in the Paste Service *before* the DB insert, so shard routing can be computed deterministically:
+
+```
+1. Generate paste_key via CSPRNG (Section 3)
+2. Compute shard_id = MurmurHash3(paste_key) % N
+3. Route all operations (dedup check, write, cache warm) to shard_<shard_id>
+```
+
+The content_hash dedup check (Section 1) uses a global Redis pre-check followed by a shard-local DB lookup. The DB lookup runs only on the target shard (computed from paste_key), which is the correctness gate via the `content_hash` unique index. This means cross-key dedup (same content, different paste_key) works within a shard but not across shards — a minor acceptance for simplicity at current scale. For global cross-key dedup, a separate Redis-based index (`content_hash:<hash> → paste_key`) maintained by Section 1 handles that case.
+
+| Metric | Value |
+|--------|-------|
+| Shard space (N=10) | 10 shards |
+| Rows per shard at 1M pastes | ~100K |
+| Rows per shard at 100M pastes | ~10M |
+| Rows per shard at 1B pastes | ~100M |
+| P95 CPU per shard at 100M reads/day (N=10) | ~35% (assuming avg 1ms/query, 1,157 rps / 10 = 116 rps/shard) |
+
+**3. Schema (identical per shard)**
+
+```sql
+CREATE TABLE pastes (
+    paste_key VARCHAR(16) NOT NULL,
+    title VARCHAR(256),
+    language VARCHAR(64),
+    content_hash CHAR(64),
+    content_size INT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    access_mode VARCHAR(10) DEFAULT 'public',
+    status VARCHAR(10) DEFAULT 'active',
+    PRIMARY KEY (paste_key)
+);
+
+-- Unique index for deduplication (point lookup by hash)
+CREATE UNIQUE INDEX idx_content_hash ON pastes(content_hash);
+
+-- Partial index: only active pastes with TTLs (used by cleanup cron)
+CREATE INDEX idx_expires_at ON pastes(expires_at)
+    WHERE expires_at IS NOT NULL AND status = 'active';
+
+-- Status index: used by admin queries (e.g., find all deleted pastes)
+CREATE INDEX idx_status ON pastes(status);
+```
+
+The `PRIMARY KEY (paste_key)` ensures uniqueness within each shard and enables O(log n) lookups. The `content_hash` unique index is the deduplication gate. The partial index on `idx_expires_at` is critical — it stays small because it only covers active TTL-destined pastes, making the periodic cleanup query index-only.
+
+**4. Write Path**
+
+```
+Client POST /api/v1/pastes
+  → Paste Service computes shard_id = MurmurHash3(paste_key) % N
+  → Acquire connection from shard_<shard_id> pool
+  → BEGIN
+  → INSERT INTO pastes (paste_key, title, language, content_hash, ...)
+  → COMMIT
+```
+
+- **No cross-shard transaction**: The paste metadata insert is a single-shard operation. Blob upload and cache warm are application-level side effects, not database work.
+- **Retry on unique constraint violation**: If two concurrent requests generate the same `paste_key` (impossible with CSPRNG in practice, but possible with custom keys), the second hits the primary key constraint → retry with a new random key (up to 3 attempts).
+- **Content hash conflict**: If two different contents collide on `content_hash`, the second INSERT fails the unique constraint. The application catches this (vanishingly rare with SHA-256, ~1 in 2^128) and regenerates both key and hash with a salted hash.
+
+**5. Read Path**
+
+```
+Client GET /api/v1/pastes/\{key\}
+  → Paste Service computes shard_id = MurmurHash3(paste_key) % N
+  → Acquire connection from shard_<shard_id> replica pool (round-robin across 2 replicas)
+  → SELECT paste_key, content_hash, expires_at, access_mode, status
+    FROM pastes
+    WHERE paste_key = :key
+```
+
+- **Reads always hit a replica** to offload primaries. With 2 replicas per shard and 1,157 reads/sec total (~116 reads/sec/shard), each replica handles ~58 reads/sec — well within a single PostgreSQL's capacity.
+- **Read replicas serve both read traffic and admin queries** (e.g., analytics dashboards). Primary is write-only to eliminate lock contention.
+
+**6. Connection Pooling**
+
+Each shard has a dedicated PgBouncer instance in transaction-mode:
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Pool mode | Transaction | Connections shared across requests; safe because all queries are single-shard, no distributed transactions needed |
+| Max client connections | 500 per PgBouncer | Each Paste Service instance connects with ~50 connections (10 shards × 5 per shard) |
+| Default pool size | 5 per application instance | 10 shards × 5 = 50 max connections per instance |
+| Idle timeout | 300s | Reclaims connections from idle instances |
+| Query timeout | 5s | Fails fast on slow queries |
+
+**7. Scaling Triggers**
+
+| Trigger | Action | Downtime |
+|---------|--------|----------|
+| Single shard CPU > 70% sustained for 5 min | Add 3rd read replica to that shard | Zero (streaming replication) |
+| All shards > 80% of designed capacity | Add new shard: N → N+1, rebalance | Rolling (see below) |
+| New shard added | Update routing table, migrate ~1/N of rows from each existing shard | Rolling (see below) |
+
+**Rebalancing (N → N+1)**:
+
+When a new shard is added, the routing function changes from `hash % N` to `hash % (N+1)`, which remaps roughly every row. This is done via a **rolling migration**:
+
+1. Provision new shard and register it in the routing table.
+2. Start dual-write mode in the application: new writes go to both old shard and new shard based on the new routing function. Existing reads continue using the old routing table.
+3. Background row migrator: iterate through each old shard, read rows whose new routing target is the new shard, write them to the new shard, then delete from the old shard. Run at limited throughput (e.g., 1K rows/sec per shard) to avoid impacting live traffic.
+4. Once all rows are migrated, disable dual-write. New routing table becomes the single source of truth.
+5. Decommission old shards when N+1 reaches a stable state.
+
+This is complex and only triggered at very large scale. With `hash % N` sharding, rebalancing migrates ~98% of all rows (coprime modulo redistributes almost everything). At 1B pastes, that's ~980M rows — requiring ~28 hours at 1K rows/sec. **Critical insight**: this is why `hash % N` sharding becomes problematic at large scale. Consider switching to consistent hashing (murmur ring) at scale, where only ~1/N rows (~10M) need to move per rebalance. The dual-write migration pattern above remains the same regardless of sharding strategy.
+
+**8. Backup and Recovery**
+
+| Aspect | Strategy |
+|--------|----------|
+| WAL archiving | Continuous WAL to S3 for point-in-time recovery (PITR) |
+| Base backup | Daily `pg_basebackup` to S3, 7-day retention |
+| RPO | 0 for content (blob store is immutable), 1 minute for metadata (WAL lag) |
+| RTO | < 5 minutes read, < 15 minutes write (per shard) |
+| Restore granularity | Per-shard (individual shard can be restored without affecting others) |
+
+**9. Failure Modes**
+
+| Failure | Impact | Recovery |
+|---------|--------|----------|
+| Shard primary crashes | Writes to that shard fail; reads continue on replicas | PgBouncer promotes replica, ~1–2s blip |
+| Shard replica crashes | Read capacity drops 1 replica | Auto-rejoin after restart; provision new replica if needed |
+| All replicas of a shard crash | Reads fall back to primary (increased load) | Replicas recover or new replica provisioned |
+| Application loses shard routing table | Cannot route to shards | Routing table cached in application memory, synced via Redis Pub/Sub on shard changes |
+| PgBouncer process crash | Connection pool lost for that shard | Application reconnects on next request; brief spikes |

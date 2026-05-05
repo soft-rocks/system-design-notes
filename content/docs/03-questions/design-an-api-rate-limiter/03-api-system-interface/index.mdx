@@ -1,0 +1,108 @@
+---
+title: API / System Interface
+description: REST admin APIs, HTTP response headers, and internal gRPC interfaces for the API rate limiter
+---
+
+## REST Endpoints (Admin / Configuration)
+
+### GET /admin/policies
+List all rate limit policies.
+```
+GET /admin/policies?tier=free&status=active
+```
+
+### POST /admin/policies
+Create a new rate limit policy.
+```json
+POST /admin/policies
+{
+  "tier": "pro",
+  "scopes": {
+    "second":  \{"rate": 50,  "burst": 100\},
+    "minute":  \{"rate": 3000,"burst": 5000\},
+    "hour":    \{"rate": 100000,"burst": 150000\},
+    "day":     \{"rate": 1000000,"burst": 1500000\}
+  }
+}
+```
+
+### PUT /admin/policies/\{policyId\}
+Update an existing policy. Propagates to all rate limiter nodes within 1s.
+
+### DELETE /admin/policies/\{policyId\}
+Remove a policy. Clients assigned to this tier revert to default.
+
+### POST /admin/policies/\{policyId\}/assign
+Assign a client (or batch of clients) to a policy.
+```json
+POST /admin/policies/\{policyId\}/assign
+\{ "clientIds": ["client-001", "client-002"] \}
+```
+
+### GET /admin/clients/\{clientId\}/usage
+Query real-time usage for a specific client.
+```
+GET /admin/clients/\{clientId\}/usage?window=minute
+```
+
+### POST /admin/clients/\{clientId\}/blacklist
+Add a client to the blacklist.
+
+### POST /admin/clients/\{clientId\}/whitelist
+Add a client to the whitelist (bypass rate limiting).
+
+## HTTP Response Headers (Every API Response)
+
+Every response from the API gateway includes:
+```
+X-RateLimit-Limit: 50          // bucket capacity (burst)
+X-RateLimit-Remaining: 42      // tokens remaining in current second
+X-RateLimit-Reset: 1700000060  // UTC timestamp when bucket resets
+Retry-After: 3                 // seconds until next token is available (only on 429)
+```
+
+## Internal Service Interface (gRPC / Protobuf)
+
+The API Gateway calls the Rate Limiter Service internally:
+
+```protobuf
+service RateLimiterService {
+  // Check if a request should be allowed
+  rpc CheckRateLimit(CheckRequest) returns (CheckResponse);
+  // Batch check for concurrent requests from same client
+  rpc BatchCheckRateLimit(BatchCheckRequest) returns (BatchCheckResponse);
+}
+
+message CheckRequest {
+  string client_id    = 1;
+  string scope_type   = 2;  // API_KEY / IP / USER_ID
+  string scope_value  = 3;
+  int32  cost         = 4;  // tokens to consume (default 1)
+}
+
+message CheckResponse {
+  bool   allowed          = 1;
+  int32  limit            = 2;
+  int32  remaining        = 3;
+  int64  reset_timestamp  = 4;
+  int32  retry_after_secs = 5;  // set when allowed == false
+}
+```
+
+## Configuration Sync Interface
+
+Policy changes are propagated via a publish-subscribe mechanism:
+```protobuf
+service ConfigSyncService {
+  // Subscribe to policy change events
+  rpc SubscribeConfigUpdates(SubscribeRequest) returns (stream ConfigUpdate);
+}
+
+message ConfigUpdate {
+  oneof change {
+    PolicyCreate create   = 1;
+    PolicyUpdate update   = 2;
+    PolicyDelete delete   = 3;
+  }
+}
+```

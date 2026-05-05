@@ -1,0 +1,96 @@
+---
+title: Requirements
+description: Functional, non-functional, and scale requirements for the ETA and location sharing service.
+---
+
+## Functional Requirements
+
+### ETA Estimation
+Given a driver location and a pickup/dropoff location, compute estimated time of arrival in real time. ETA must account for real-time traffic conditions, road closures, construction, and weather. Expressed in minutes (rounded to nearest 1 or 5). Updates are pushed to the rider when the driver starts moving and at regular intervals (every 30 seconds). Supports multi-leg ETAs (driver picks up at A, then B). If real-time data is unavailable, falls back to historical average ETAs based on time of day, day of week, and geographic area.
+
+### Real-Time Location Sharing
+The rider sees the driver's current position on a live map. Driver location is shared at a configurable interval (every 5-10 seconds). Rider sees driver's heading direction and optionally speed. Rider sees driver name, photo, vehicle make/model, license plate. Location sharing is one-way: rider sees driver's location but NOT the driver's other pickups/dropoffs or future route. After ride completion, location sharing is automatically disabled. Driver can opt out for safety reasons (blurred/simplified view for rider).
+
+### Matching & Assignment
+When a rider requests a ride, the system identifies nearby available drivers within a configurable radius (e.g., 5 km). Drivers are ranked by proximity, estimated pickup time, rating, and vehicle type match. The best driver is offered the ride (soft assignment) — they can accept or decline. If declined or timeout (15 seconds), the system retries with the next-best driver. Supports batch matching: one driver pickup can serve multiple nearby riders going in the same direction (pooling).
+
+### Trip State Machine
+The system tracks the trip lifecycle: REQUESTED → MATCHED → DRIVER_ARRIVING → IN_PROGRESS → COMPLETED. Each state transition triggers downstream actions (notifications, ETA updates, billing). Supports trip cancellation at any stage (by rider, driver, or system due to anomaly detection).
+
+### Route Estimation
+Given pickup and dropoff coordinates, compute the driving route (not just straight-line distance) using road network data with turn-by-turn paths. Compute estimated distance and duration. Support multiple route options (fastest, shortest, avoids tolls). Compute route from driver's current location to pickup, then pickup to dropoff.
+
+## Non-Functional Requirements
+
+### Latency
+- ETA computation: < 100ms p99 — called during matching and displayed to user
+- Location update ingestion: < 50ms p99 — must handle high-frequency GPS uploads
+- Rider location query (rider app): < 50ms p99 — map must update smoothly
+- End-to-end rider sees driver on map: < 2 seconds from driver's GPS reading to rider's screen
+
+### Throughput
+- Location updates: ~500K GPS pings/sec peak (500K concurrent active trips × weighted avg ~1 ping/sec)
+- ETA computations: ~200K requests/sec (matching phase + periodic updates + recalculation)
+- Rider location queries: ~1M reads/sec (500K active trips × 1 query/sec avg per rider)
+- Route computations: ~100K requests/sec (new ride matches + route recalculation)
+
+### Availability
+- Location sharing is critical for user experience — a static map during an active trip is a severe UX failure
+- Target availability: 99.99% during active trips
+- Fail-open: if location service is down, show last-known driver location (stale data is better than blank screen)
+- ETA degradation: stale ETA is acceptable for up to 30 seconds while system recovers
+
+### Consistency
+- Location state is **eventually consistent** — a driver's position may be 1-5 seconds stale
+- ETA is **eventually consistent** — computed independently, may vary slightly
+- Trip state must be **strongly consistent** — both rider and driver must see the same status
+- Driver privacy: location visible to rider only during active trip; historical location is NOT shared
+
+### Scalability
+- Support ~500K concurrent active trips at peak globally
+- Each active trip has a driver location stream (variable interval: 1s moving, 60s stationary) × 500K = ~500K writes/sec peak
+- Each active trip has a rider reading location (1-5s interval) × 500K = ~1M reads/sec peak
+- Hot-spot problem: a busy driver in a dense urban area may have many concurrent riders watching; handled via trip_id partition key in real-time store
+
+### Privacy & Safety
+- Driver location is only visible to the rider of the matched trip
+- Location data is not stored longer than necessary (e.g., 30 days for dispute resolution)
+- GDPR/CCPA: users can request deletion of their location history
+- Safety features: emergency button, trip sharing with trusted contacts, location blur option
+
+## Scale Assumptions
+
+### User Base & Scale
+- ~150M weekly active riders, ~10M weekly active drivers globally (as of 2025)
+- ~10M total completed trips/day globally
+- ~500K concurrent active trips at peak (across all regions simultaneously)
+- Average trip duration: 25 minutes
+- Peak hour multiplier: ~2x midday traffic volume
+
+### Request Rates
+- GPS pings from drivers: ~500K pings/sec peak (500K active trips × weighted avg 1 ping/sec; higher during slow movement/traffic, lower on highways)
+- ETA computations: ~200K/sec (matching: every 3s per active match; trip phase: every 30s per active trip; recalculations due to traffic)
+- Rider location queries: ~1M reads/sec (500K active trips × 1 query/sec avg per rider)
+- Route computations: ~100K/sec (new trip matches + route recalculation due to traffic changes)
+
+### Storage
+- Active driver locations in real-time store: ~500K entries (one per active trip at peak)
+- Location history per trip: ~25 pings/trip (avg 25 min × 1 ping/min weighted)
+- Location history: ~10M trips/day × 25 pings = 250M location points/day
+- Location history storage: ~250M points × 100 bytes = ~25 GB/day → ~750 GB/month
+- Trip state records: ~10M new trips/day; active set ~500K at any time
+
+### Geographic Distribution
+- Traffic is uneven: ~40% from North America, ~30% from Asia-Pacific, ~20% from Europe, ~10% from other regions
+- Within regions: heavy concentration in urban areas (top 20 cities handle ~60% of all trips)
+- Multi-region deployment: each continent has its own data center; cross-region trip coordination is rare (< 1%)
+
+### Map & Routing Data
+- Road network graph: ~50M nodes, ~200M edges globally
+- Real-time traffic data: updates every 30 seconds, covering ~10K cities
+- Historical travel time database: per-road-segment, per-time-of-day, per-day-of-week buckets
+
+### Map & Routing Data
+- Road network graph: ~50M nodes, ~200M edges globally
+- Real-time traffic data: updates every 30 seconds, covering ~10K cities
+- Historical travel time database: per-road-segment, per-time-of-day, per-day-of-week buckets

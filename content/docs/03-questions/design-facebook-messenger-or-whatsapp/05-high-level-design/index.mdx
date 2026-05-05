@@ -1,0 +1,214 @@
+---
+title: High Level Design
+description: Three-tier architecture with WS gateways, core services, and sharded storage
+---
+
+## Architecture Overview
+
+Three-tier architecture: edge gateways, core services, and storage layer.
+
+- **Edge Layer**: Load balancers + WS Gateway nodes (handle WebSocket connections, auth, routing)
+- **Service Layer**: Message Service, Presence Service, Call Service, Notification Service
+- **Storage Layer**: Sharded DB (messages), Redis (presence/sessions), Object Store (media), Message Broker
+
+## Key Design Decisions
+
+1. **WebSocket-based real-time transport**: Persistent connections for low-latency push. Long-polling fallback for restricted networks.
+2. **Connection sharding by user_id**: Hash user_id -> gateway node. Gateway maintains the WS connection and knows where each user is connected.
+3. **Message ordering via time-ordered IDs**: Snowflake/ULID IDs embed timestamp for natural ordering without centralized clock.
+4. **Sharded message storage by conversation_id**: All messages in one conversation on one shard for ordering guarantees.
+5. **Store-and-forward**: Pending messages buffered in DB, delivered when recipient comes online, with push notification as trigger.
+6. **Redis-backed presence**: In-memory for O(1) reads, with TTL cleanup.
+
+## Component Diagram
+
+```
+                              ┌──────────────────────────────────────────────────────┐
+                              │                      Internet                        │
+                              └──────────────────────────┬───────────────────────────┘
+                                                         │
+                              ┌──────────────────────────┴───────────────────────────┐
+                              │                 Load Balancer (NGINX)                 │
+                              │              SSL termination, health checks           │
+                              └──┬────────────────────────────┬───────────────────────┘
+                                 │                            │
+                    ┌────────────┴────────────┐     ┌─────────┴──────────┐
+                    │    WS Gateway Nodes      │     │   REST API Nodes   │
+                    │  (Stateful, WebSocket)   │     │  (Stateless)       │
+                    │                          │     │                    │
+                    │  • Auth                   │     │  • Message send    │
+                    │  • Connection mgmt        │     │  • Media upload    │
+                    │  • Message routing        │     │  • Profile queries │
+                    │  • Keepalive/ping-pong    │     │  • Search          │
+                    └────┬──────────┬──────────┘     └─────────┬──────────┘
+                         │          │                          │
+          ┌──────────────┘          └──────────────┐    ┌────────┴──────────┐
+          v                                         v    v                   v
+   ┌──────────────┐                       ┌─────────────┐  ┌────────────┐
+   │  Message      │                       │  Presence    │  │  Call       │
+   │  Service      │                       │  Service     │  │  Service    │
+   │  (Sharded)    │                       │  (Redis)     │  │  (WebRTC)   │
+   └──────┬────────┘                       └──────────────┘  └─────────────┘
+          │
+          v
+   ┌──────────────┐     ┌────────────────┐     ┌──────────────────┐
+   │  Notification  │     │  Media         │     │  Search          │
+   │  Service       │     │  Service       │     │  Service         │
+   │  (FCM/APNs)    │     │  (S3/CDN)      │     │  (Elasticsearch) │
+   └────────────────┘     └────────────────┘     └──────────────────┘
+
+          ┌──────────────────────── Storage Layer ────────────────────────┐
+          │                                                                │
+          │  ┌────────────┐  ┌──────────┐  ┌────────┐  ┌──────────────┐  │
+          │  │ PostgreSQL  │  │  Redis   │  │  S3    │  │  Kafka /     │  │
+          │  │ (sharded)   │  │ (cluster)│  │(media) │  │  RabbitMQ    │  │
+          │  │ messages    │  │ presence │  │        │  │  (broker)    │  │
+          │  │ conversations│ │ sessions │  │        │  │              │  │
+          │  │ participants│  │ typing   │  │        │  │              │  │
+          │  │ receipts    │  │          │  │        │  │              │  │
+          │  │ devices     │  │          │  │        │  │              │  │
+          │  └────────────┘  └──────────┘  └────────┘  └──────────────┘  │
+          └────────────────────────────────────────────────────────────────┘
+```
+
+## Component Responsibilities
+
+### Load Balancer (NGINX / HAProxy)
+- Routes HTTPS traffic to WS Gateway nodes (WebSocket)
+- Routes REST API traffic to service backends
+- SSL termination, health checks
+
+### WS Gateway (Stateful, Connection-Sharded)
+- Maintains persistent WebSocket connections
+- Authenticates connections via session token
+- Routes messages: sender -> Message Service -> find recipient's gateway -> push
+- Handles keepalive/ping-pong
+- Fallback: HTTP long-polling for restricted networks
+
+### Message Service (Stateless, Sharded by conversation_id)
+- Writes messages to sharded DB
+- Publishes message events to broker
+- Consumes delivery events, updates status
+- Serves message history queries (cursor-based pagination)
+- Message ID generation (snowflake: timestamp + shard_id + sequence)
+
+### Presence Service (Stateless)
+- Reads/writes user online status to Redis cluster
+- Manages typing indicator TTLs (3s expiry)
+- Broadcasts presence events via internal pub/sub
+
+### Call Service (Stateless)
+- Call signaling via WebSocket events
+- Routes invite/answer/hangup to recipient's gateway
+- WebRTC media via P2P or SFU (for group calls)
+- ICE candidate relay
+
+### Notification Service (Stateless)
+- Detects offline users (Redis presence check)
+- Generates push notification payload
+- Sends via FCM (Android) / APNs (iOS)
+- Tracks delivery status, retries on failure
+
+### Media Service (Stateless)
+- Accepts uploads, stores in object store (S3)
+- Generates thumbnails for photos
+- Signs download URLs
+- CDN distribution for global delivery
+
+### Search Service (Stateless)
+- Indexes message text in Elasticsearch
+- Synced via message broker events (near-real-time)
+- Query service for text search within conversations
+
+## Message Broker
+- Apache Kafka or RabbitMQ
+- Topics: `message.created`, `message.delivered`, `message.read`, `user.presence`
+- Decouples message production from delivery workers and search indexing
+
+## Storage Design
+
+### Database (PostgreSQL, sharded by conversation_id)
+
+**messages**
+| Column | Type | Notes |
+|---|---|---|
+| id | Snowflake | Time-ordered, shard-key includes conversation_id |
+| conversation_id | UUID | Shard key |
+| sender_id | UUID | |
+| type | Enum | text, photo, video, document, call |
+| content | JSON/Text | |
+| media_url | String | Nullable |
+| timestamp | Timestamp | Server-assigned |
+| status | Enum | pending/sent/delivered/read/failed |
+| deleted | Boolean | Soft-delete |
+| encryption_tag | String | E2EE envelope ID |
+
+**Index:** (conversation_id, id) for range queries. Partitioned by month.
+
+**conversations**
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID | PK |
+| type | Enum | direct / group |
+| name | String | Nullable |
+| avatar_url | String | Nullable |
+| created_at | Timestamp | |
+| updated_at | Timestamp | Last message timestamp |
+
+**chat_participants**
+| Column | Type | Notes |
+|---|---|---|
+| user_id | UUID | Composite PK |
+| conversation_id | UUID | Composite PK |
+| role | Enum | member / admin |
+| joined_at | Timestamp | |
+| last_read_message_id | Snowflake/ULID | Cursor for read sync (matches Message.id type) |
+
+**delivery_receipts**
+| Column | Type | Notes |
+|---|---|---|
+| message_id | String | Composite PK |
+| user_id | UUID | Composite PK |
+| status | Enum | delivered / read |
+| timestamp | Timestamp | |
+
+**devices**
+| Column | Type | Notes |
+|---|---|---|
+| user_id | UUID | Composite PK |
+| device_id | UUID | Composite PK |
+| push_token | String | FCM / APNs token |
+| session_token | String | |
+| last_seen | Timestamp | |
+| created_at | Timestamp | |
+
+### Redis Cluster
+
+| Key | Value | TTL |
+|---|---|---|
+| `user:\{id\}:presence` | "online" / "offline" | Set on connect/disconnect |
+| `typing:\{conv_id\}:\{user_id\}` | "typing" | 3s |
+| `session:\{token\}` | user_id + device_id | Session duration |
+
+### Object Store (S3)
+- Media files: `/media/\{user_id\}/\{message_id\}.\{ext\}`
+- Thumbnails: `/media/\{user_id\}/\{message_id\}_thumb.\{ext\}`
+- CDN (CloudFront) in front for global distribution
+
+## Failure Modes & Resilience
+
+| Failure | Handling |
+|---|---|
+| Gateway crash | LB routes to healthy node; user reconnects; pending messages already in DB |
+| DB shard failure | Replication failover; messages on failed shard re-queued via broker |
+| Redis outage | Presence falls back to DB; typing indicators disabled temporarily |
+| Broker outage | Message Service buffers; retries on recovery |
+| Region outage | Multi-region deployment with DNS failover; regional gateway pools |
+
+## Scalability
+
+- **Stateless services** (Message, Presence, Call, Notification) scale horizontally
+- **Gateway pool** grows with connection count; user_id hash ring updates
+- **DB sharding** grows with message volume; conversation_id hashing ensures balance
+- **Redis clustering** distributes keys automatically
+- **CDN** offloads media traffic from origin

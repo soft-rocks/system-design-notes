@@ -1,0 +1,287 @@
+---
+title: Resource Management & Scaling
+description: Deep dive into resource tracking, horizontal scheduler scaling, auto-scaling worker pool, and resource preemption.
+---
+
+## Resource Tracking & Accounting
+
+The scheduler must track resource usage across all workers to make accurate scheduling decisions.
+
+### Resource Model
+
+Each worker reports its total and available resources:
+
+```
+Worker {
+  id: "worker-42"
+  capacity: \{ cpu: 16 cores, memory: 64GB, gpu: 2, disk: 500GB \}
+  allocated:  \{ cpu: 10 cores, memory: 40GB, gpu: 1, disk: 200GB \}
+  available:  \{ cpu: 6 cores, memory: 24GB, gpu: 1, disk: 300GB \}
+}
+```
+
+Resources are tracked at three levels:
+
+| Level | Granularity | Storage | Update Frequency |
+|-------|-------------|---------|------------------|
+| Per-worker | Aggregate allocatable resources | In-memory scheduler cache | On every job start/stop |
+| Per-job | Individual job resource request | etcd | On job submission |
+| Per-tenant | Sum of all jobs for a tenant | Computed on-demand or cached | Every scheduling cycle |
+
+### Resource Accounting
+
+When a job is scheduled, the scheduler updates accounting atomically:
+
+```
+on_job_assigned(worker_id, job):
+    worker.allocated.cpu += job.cpu_request
+    worker.allocated.memory += job.memory_request
+    worker.available.cpu -= job.cpu_request
+    worker.available.memory -= job.memory_request
+
+    # Atomically in etcd
+    etcd txn:
+      compare: /workers/\{worker_id\}/available.cpu &gt;= job.cpu_request
+      set: /workers/\{worker_id\}/available.cpu -= job.cpu_request
+      set: /workers/\{worker_id\}/allocated.cpu += job.cpu_request
+```
+
+### Resource Fragmentation
+
+Over time, resource fragmentation increases — small jobs leave fragmented gaps that don't fit larger jobs.
+
+**Fragmentation metrics:**
+```
+fragmentation_ratio = 1 - (largest_contiguous_free / total_free)
+```
+
+| Fragmentation | Value | Impact |
+|---------------|-------|--------|
+| Low | < 0.1 | Minimal impact on scheduling |
+| Medium | 0.1-0.3 | Some large jobs delayed |
+| High | > 0.3 | Scheduling decisions degraded; consider rebalancing |
+
+**Mitigation:**
+- **Bin-packing on assignment**: When multiple workers can fit a job, prefer the one that leaves the smallest remainder (best-fit decreasing).
+- **Periodic rebalancing**: Migrate small jobs from fragmented workers to consolidate and free up whole workers for decommission.
+- **Anti-fragmentation reservations**: Reserve 10% of each worker for "overflow" small jobs to reduce fragmentation pressure.
+
+## Horizontal Scheduler Scaling
+
+As the cluster grows, a single scheduler may become a bottleneck. We need to scale the scheduler horizontally.
+
+### Scaling Bottlenecks
+
+| Component | Bottleneck | Scaling Factor |
+|-----------|-----------|----------------|
+| Scheduling queue | Single priority queue limits throughput | O(num_schedulers) with sharding |
+| State storage | etcd write throughput | O(etcd cluster size) |
+| Worker heartbeats | gRPC connection limit per scheduler | O(num_schedulers) with sharding |
+| Trigger evaluation | DAG state update contention | O(num_schedulers) with sharding |
+
+### Sharding Strategy
+
+Workers are sharded across scheduler instances by worker ID hash:
+
+```
+scheduler_id = worker_id.hashCode() % num_schedulers
+```
+
+Each scheduler is responsible for:
+- Handling heartbeats from its assigned workers.
+- Scheduling jobs to its assigned workers.
+- Evaluating triggers for DAGs that include its workers.
+
+### Coordination Between Schedulers
+
+Schedulers need to coordinate for DAG trigger evaluation:
+
+| Scenario | Coordination |
+|----------|-------------|
+| Node on scheduler A completes, child on scheduler B | Scheduler A sends event to scheduler B via gRPC |
+| Fair-share calculation | All schedulers read fair-share state from shared etcd |
+| Backfill across shards | Each shard runs backfill independently; global backfill via shared queue |
+
+### Scheduler Queue Sharding
+
+The main scheduling queue is sharded by tenant:
+
+```
+tenant_queue[t] = priority_queue for tenant t
+
+Each scheduler owns a subset of tenant queues:
+  scheduler_id = t.hashCode() % num_schedulers
+  owns tenant_queues[owned_tenants]
+```
+
+This ensures that scheduling decisions for a tenant are made by a single scheduler (consistency) while load is distributed across the cluster (scalability).
+
+### Strengths
+- **Linear scalability**: Adding schedulers increases capacity linearly.
+- **Tenant isolation**: Tenant-level queue sharding prevents cross-tenant contention.
+- **Simple sharding**: Hash-based worker assignment is easy to understand and debug.
+
+### Weaknesses
+- **Rebalancing cost**: Adding/removing schedulers requires redistributing worker assignments.
+- **Cross-scheduler events**: DAG triggers that span workers on different schedulers require inter-scheduler gRPC calls.
+- **Uneven sharding**: Hash distribution may be uneven if worker capabilities vary significantly.
+
+## Auto-Scaling Worker Pool
+
+The worker pool should scale up during peak demand and scale down during idle periods to optimize cost.
+
+### Scaling Triggers
+
+| Trigger | Action | Cool-down |
+|---------|--------|-----------|
+| Pending jobs > threshold (e.g., 100) | Scale up: add N workers | 5 min |
+| Worker utilization < 20% for 15 min | Scale down: remove N workers | 10 min |
+| Pending job wait time > SLA | Scale up aggressively | 2 min |
+| All pending jobs assigned for 10 min | Scale down conservatively | 15 min |
+
+### Scaling Policies
+
+**Policy 1: Target Utilization**
+```
+desired_workers = ceil(total_requested_resources / worker_capacity) * 1.2
+current_workers = count(active_workers)
+if desired_workers > current_workers:
+    add(desired_workers - current_workers)
+elif desired_workers < current_workers * 0.7:
+    remove(current_workers - desired_workers)
+```
+
+The 1.2 multiplier provides headroom for new jobs; the 0.7 threshold for scale-down provides hysteresis to prevent thrashing.
+
+**Policy 2: Predictive Scaling**
+```
+predicted_demand = forecast(t+5min)  # ARIMA / Prophet model
+desired_workers = ceil(predicted_demand / worker_capacity) * 1.1
+scale_to(desired_workers)
+```
+
+Predictive scaling adds workers **before** the load arrives, reducing job wait time. Combined with reactive scaling, it handles both predictable (daily patterns) and unpredictable (spikes) demand.
+
+**Policy 3: Spot/Preemptible Instance Handling**
+- 30% of the worker pool uses spot/preemptible instances (70% cheaper).
+- Jobs submitted with `preemptible: true` run on spot workers.
+- When spot instances are reclaimed, the scheduler:
+  1. Captures the job state (if checkpointing is enabled).
+  2. Reschedules the job on a non-spot worker.
+  3. Increments the spot-retry counter (separate from normal retry count).
+
+### Scale-Up Execution
+
+```
+on scale_up(count, job_requirements):
+    # Match worker specs to job requirements
+    suitable_specs = filter_specs(job_requirements, available_instance_types)
+    
+    # Launch workers in parallel, but respect API rate limits
+    for spec in suitable_specs[:max_parallel_launch]:
+        launch_worker(spec, cloud_provider)
+    
+    # Monitor worker readiness
+    for launched_worker in launched_workers:
+        wait_until(launched_worker.status == READY)
+        assign_to_scheduler(launched_worker)
+```
+
+Typical provisioning time:
+- Container worker (Kubernetes Pod): 10-30s
+- VM worker (cloud VM): 60-120s
+- Bare metal: 5-10 min
+
+### Scale-Down Execution
+
+```
+on_scale_down(count):
+    # Pick workers to remove (least utilized, no running jobs)
+    candidates = sort_by_utilization(available_workers)  # ascending
+    to_remove = candidates[:count] where not has_running_jobs(it)
+    
+    # Drain: stop accepting new jobs, wait for running jobs to finish
+    for worker in to_remove:
+        set(worker.status = DRAINING)
+        wait_for(worker.running_jobs == 0, timeout=5min)
+    
+    # Terminate workers
+    for worker in to_remove:
+        terminate(worker)
+```
+
+### Strengths
+- **Cost optimization**: Scale down during idle periods; use spot instances for fault-tolerant jobs.
+- **Proactive scaling**: Predictive model pre-provisions before demand arrives.
+- **Hybrid scaling**: Combines reactive (threshold-based) and predictive (forecast-based) approaches.
+
+### Weaknesses
+- **Provisioning latency**: VM-based workers take 60-120s to provision; jobs may wait during peak.
+- **Forecast accuracy**: Predictive models degrade under unusual traffic patterns (e.g., one-time large jobs).
+- **Spot volatility**: Spot instance reclaim can interrupt jobs unexpectedly; requires checkpointing.
+
+## Resource Preemption
+
+When high-priority jobs compete for resources with low-priority jobs, the scheduler can preempt low-priority jobs to free capacity.
+
+### Preemption Triggers
+
+| Condition | Action |
+|-----------|--------|
+| High-priority job PENDING > 5 min with no available workers | Consider preemption |
+| Deadline approaching: < 50% remaining time and no available workers | Preempt lower-priority jobs |
+| Cluster utilization > 95% and SLA breach imminent | Aggressive preemption |
+
+### Preemption Selection
+
+When preemption is needed, the scheduler selects jobs to preempt using a cost function:
+
+```
+preemption_cost(job) = (job.priority / 100) * job.estimated_remaining_runtime / job.resource_efficiency
+```
+
+The scheduler selects jobs with the **lowest preemption cost** first — i.e., low-priority, long-running, inefficient jobs are preempted before high-priority, short-running, efficient ones.
+
+**Additional constraints:**
+- Do not preempt jobs that have less than 1 minute remaining (waste of preemption effort).
+- Do not preempt jobs with `preemptible: false` unless all preemptable options are exhausted.
+- Group preemptions to minimize total jobs preempted (knapsack-style optimization).
+
+### Preemption Execution
+
+```
+on_preempt(preempted_jobs, target_job):
+    for job in preempted_jobs:
+        # 1. Stop the running container
+        container_api.kill(job.container_id)
+        
+        # 2. Save checkpoint (if available)
+        if job.supports_checkpoint:
+            save_checkpoint(job)
+        
+        # 3. Return job to queue
+        job.status = PENDING
+        job.submission_time = now()  # Reset submission time (fair scheduling)
+        
+        # 4. Free resources on the worker
+        worker.available += job.resource_request
+    
+    # 5. Schedule target_job on freed resources
+    assign(target_job, best_worker)
+```
+
+### Preemption Safety
+
+- **Idempotent preemption**: The scheduler sends a preemption signal to the worker and waits for acknowledgment. If the worker is already dead, the lease timeout handles cleanup.
+- **No preemption loops**: The scheduler tracks recent preemptions per job. If a job was preempted within the last 10 minutes, it is exempt from further preemption.
+- **Preemption budget**: Each tenant has a preemption budget (e.g., 10% of their jobs can be preempted at any time). This prevents a tenant from being permanently interrupted.
+
+### Strengths
+- **SLA protection**: High-priority jobs with deadlines get resources regardless of low-priority backlog.
+- **Cost-aware**: Low-cost-to-preempt jobs are chosen first.
+- **Tenant protection**: Preemption budgets prevent abuse.
+
+### Weaknesses
+- **Job disruption**: Preempted jobs lose progress (unless checkpointing is used).
+- **Scheduling complexity**: Preemption adds significant complexity to the scheduler.
+- **Preemption loops**: In extreme cases, preempted jobs may compete for the same resources again (mitigated by preemption budget and cooldown).

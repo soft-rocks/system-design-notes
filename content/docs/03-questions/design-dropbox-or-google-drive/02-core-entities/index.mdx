@@ -1,0 +1,125 @@
+---
+title: Core Entities
+description: Domain entities for a cloud file storage and sync service
+---
+
+## User
+
+| Field | Type | Notes |
+|---|---|---|
+| userId | string (UUID) | Primary key |
+| email | string | Unique, indexed |
+| displayName | string | |
+| storageQuota | long | Bytes; per-tier limits |
+| storageUsed | long | Bytes; approximate, updated via async aggregation job |
+| passwordHash | string | Bcrypt / Argon2 |
+| twoFactorSecret | string (nullable) | |
+| createdAt | timestamp | |
+| updatedAt | timestamp | |
+| status | enum | active / suspended / deleted (grace period) |
+
+## File
+
+| Field | Type | Notes |
+|---|---|---|
+| fileId | string (UUID) | Primary key |
+| ownerUserId | string (UUID) | FK → User |
+| sizeBytes | long | |
+| mimeType | string | e.g. image/png, application/pdf |
+| sha256 | string | For deduplication and integrity |
+| isDirectory | boolean | |
+| createdAt | timestamp | |
+| updatedAt | timestamp | Last content change |
+| status | enum | active / deleted / permanently_deleted |
+
+## FileReference (Folder membership)
+
+| Field | Type | Notes |
+|---|---|---|
+| fileReferenceId | string (UUID) | Primary key |
+| fileId | string (UUID) | FK → File |
+| parentFolderId | string (UUID) | FK → File (where isDirectory=true) |
+| name | string | Display name in parent |
+| sortOrder | int | For ordering siblings |
+| createdAt | timestamp | |
+
+**Invariants:**
+- A FileReference links a File to exactly one parent folder (tree structure).
+- Circular references prevented by application-level constraint.
+
+**Root namespace:** Each user has a virtual root folder (parentFolderId = null). All top-level items in the user's namespace reference this virtual root via null parentFolderId, avoiding the need for a separate root File record.
+
+## Version
+
+| Field | Type | Notes |
+|---|---|---|
+| versionId | string (UUID) | Primary key |
+| fileId | string (UUID) | FK → File |
+| versionNumber | int | Monotonically increasing |
+| createdByUserId | string (UUID) | Who made this version |
+| sizeBytes | long | |
+| sha256 | string | Content hash; used for dedup |
+| storedInBucket | string | Object storage bucket/key reference |
+| createdAt | timestamp | |
+
+**Invariants:**
+- Only active files have current versions.
+- Deleted files retain versions during grace period (30 days).
+
+## Share
+
+| Field | Type | Notes |
+|---|---|---|
+| shareId | string (UUID) | Primary key |
+| fileId | string (UUID) | FK → File |
+| sharedByUserId | string (UUID) | FK → User |
+| sharedWithUserId | string (UUID, nullable) | FK → User; null for public links |
+| publicToken | string (nullable) | UUID for public links |
+| role | enum | viewer / editor |
+| expiresAt | timestamp (nullable) | |
+| createdAt | timestamp | |
+| status | enum | active / revoked |
+
+## Permission
+
+| Field | Type | Notes |
+|---|---|---|
+| permissionId | string (UUID) | Primary key |
+| fileId | string (UUID) | FK → File (or Folder) |
+| userId | string (UUID) | FK → User |
+| role | enum | owner / editor / viewer |
+| inherited | boolean | true if derived from a parent share |
+| createdAt | timestamp | |
+
+**Inheritance:** Permissions cascade down the folder tree. Direct permissions override inherited ones.
+
+**Tradeoff:** Storing explicit `inherited=true` rows simplifies permission lookups (no tree traversal needed) but multiplies storage for deep hierarchies. When parent permissions change, all descendant `inherited=true` rows must be invalidated — typically via a recursive batch job or event-driven update. At scale, consider computing inherited permissions on-read instead (traverse up the folder tree at query time).
+
+## Device
+
+| Field | Type | Notes |
+|---|---|---|
+| deviceId | string (UUID) | Primary key |
+| userId | string (UUID) | FK → User |
+| platform | enum | desktop / mobile / web |
+| osVersion | string | |
+| lastActiveAt | timestamp | Heartbeat timestamp |
+| syncToken | string | Opaque cursor for delta sync — client passes this to request only changes since last sync |
+| status | enum | active / logged_out |
+
+## SyncOperation (journal)
+
+| Field | Type | Notes |
+|---|---|---|
+| operationId | string (UUID) | Primary key |
+| userId | string (UUID) | FK → User |
+| fileId | string (UUID) | FK → File |
+| operationType | enum | create / update / delete / move / share |
+| sourceState | string (JSON) | Metadata snapshot (path, name, size) before change |
+| targetState | string (JSON) | Metadata snapshot (path, name, size) after change |
+| createdAt | timestamp | Monotonically increasing |
+| status | enum | pending / synced / conflict |
+
+**Invariants:**
+- This journal is the append-only source of truth for sync state machines.
+- Consumed by the sync engine to propagate changes to connected devices.

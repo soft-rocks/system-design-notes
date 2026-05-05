@@ -1,0 +1,40 @@
+---
+title: Deep Dives
+description: In-depth explorations of Redis session architecture, sharing detection, circuit breaker patterns, and plan change propagation for the Netflix screen-limit system.
+---
+
+## Deep Dive Topics
+
+This section contains deep dives into critical subsystems of the Netflix screen-limit system.
+
+### 01. Redis Session Architecture
+
+Deep dive into the Redis-based session tracking design — TTL mechanics, key structure, memory management, and consistency guarantees.
+
+**Covers**: HSETEX atomicity, 5-minute TTL tradeoffs, hash-based per-device tracking, cluster sharding by user_id, memory footprint (~10 GB active), noeviction policy.
+
+[Read more →](./01-redis-session-architecture/)
+
+### 02. Sharing Detection Algorithm
+
+Deep dive into Netflix's credential sharing detection — geo analysis, IP network clustering, and the verification flow.
+
+**Covers**: Detection signals (temporal, spatial, behavioral), weighted scoring system (threshold &gt;= 50), real-time Kafka pipeline, IP ASN clustering, time-overlap detection, verification flow and device trust tokens.
+
+[Read more →](./02-sharing-detection-algorithm/)
+
+### 03. Circuit Breaker & Fallback
+
+Deep dive into failure modes, circuit breaker patterns, and graceful degradation for Netflix's device limit system.
+
+**Covers**: Four-tier fallback strategy (Redis → DB → in-memory → fail open), three independent circuit breakers (Redis, User Service, Kafka), degradation modes (normal, degraded, critical), recovery monitoring.
+
+[Read more →](./03-circuit-breaker-fallback/)
+
+### 04. Plan Change Propagation
+
+Deep dive into Kafka-driven plan change propagation, cache invalidation, and race condition handling.
+
+**Covers**: Event flow and schema, < 60ms end-to-end propagation, event-driven cache invalidation (no TTL expiry), upgrade race and downgrade race mitigation, missed event handling with reconciliation.
+
+[Read more →](./04-plan-change-propagation/)

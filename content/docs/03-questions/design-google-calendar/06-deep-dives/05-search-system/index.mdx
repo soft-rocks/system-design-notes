@@ -1,0 +1,106 @@
+---
+title: Search System
+description: Elasticsearch indexing pipeline, full-text query, ranking, and performance.
+---
+
+## Search Schema
+
+```json
+{
+  "event_id": "abc123",
+  "calendar_id": "primary",
+  "summary": "Sprint planning",
+  "description": "Review sprint goals and assign tasks",
+  "location": "Room 3B-2250",
+  "start": "2026-05-04T14:00:00-07:00",
+  "end": "2026-05-04T15:00:00-07:00",
+  "attendees": ["alice@corp.com", "bob@corp.com"],
+  "organizer": "alice@corp.com",
+  "status": "confirmed",
+  "visibility": "default",
+  "recurrence": ["FREQ=WEEKLY;BYDAY=MO"],
+  "created_at": 1714712345,
+  "updated_at": 1714712400,
+  "calculated_text": "sprint planning review goals assign tasks room 3b-2250 alice bob"
+}
+```
+
+- `calculated_text`: concatenated searchable fields, lowercased, stemmed
+- Indexed fields: `summary`, `description`, `location`, `attendees`, `organizer`
+- Filter-only fields: `recurrence`, `visibility`
+
+## Indexing Pipeline
+
+```
+Event Service → Kafka `calendar-events` → Elasticsearch Ingest Pipeline
+                                              │
+                                    ┌─────────┼─────────┐
+                                    ▼         ▼         ▼
+                              Index event  Index calendar  Delete event
+```
+
+**Ingest pipeline stages:**
+1. Parse event JSON → extract searchable fields
+2. Tokenize `calculated_text` (lowercase, stemmer, n-gram for partial match)
+3. Normalize email addresses (lowercase + trim)
+4. Index with TTL: 3 years non-recurring, 5 years recurring
+
+**Latency:** event commit → searchable in < 2s. **Reindex:** on update, delete old doc → index new doc (idempotent by event_id).
+
+## Search Query
+
+```
+GET /calendar/v3/events?q=sprint planning
+  ?timeMin=2026-05-01T00:00:00Z
+  &timeMax=2026-05-31T23:59:59Z
+  &calendarId=primary,work
+  &attendeeId=alice@corp.com
+  &maxResults=50
+```
+
+**Elasticsearch query:**
+```json
+{
+  "query": {
+    "bool": {
+      "must": [
+        \{"multi_match": {"query": "sprint planning", "fields": ["summary^3", "description^1", "location^2", "calculated_text^1"]\\&#125;&#125; ,
+        \{"range": {"start": {"gte": "timeMin", "lte": "timeMax"\\&#125;&#125; },
+        \{"range": {"end": {"gte": "timeMin", "lte": "timeMax"\\&#125;&#125; }
+      ],
+      "filter": [
+        \{"terms": {"calendar_id": ["primary", "work"]\\&#125;&#125; ,
+        \{"term": {"attendees": "alice@corp.com"\\&#125;&#125; 
+      ]
+    }
+  },
+  "sort": [\{"updated_at": "desc"\}, \{"_score": "desc"\}],
+  "from": 0, "size": 50
+}
+```
+
+- **Boosting:** summary x3, location x2, description x1
+- **Sorting:** updated_at DESC (recency), then _score (relevance)
+- **Pagination:** from/size for shallow; search_after for deep
+
+## Search Infrastructure
+
+| Parameter | Value |
+|-----------|-------|
+| Data nodes | 3 per region |
+| Master nodes | 3 per region |
+| Shards | 3 per index |
+| Replication | RF=1 (best-effort; event store is source of truth) |
+| Index TTL | 5 years, monthly rollover |
+
+**Query routing:** API Gateway → search proxy (connection pool, rate limit) → cluster.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| p50 latency | < 50ms |
+| p99 latency | < 200ms |
+| Index throughput | 5,000 events/sec |
+| Search cache | Redis, key=SHA256(query+filters), TTL=60s |
+| Cold start | Rebuild from Kafka (7d retention) |

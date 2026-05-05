@@ -1,0 +1,55 @@
+---
+title: Explore & Recommendation
+description: Deep dive into the ML-powered recommendation system — two-stage retrieval, feature engineering, ranking model, and diversity mechanisms.
+---
+
+## Two-Stage Retrieval
+
+**Stage 1 — Retrieval (Candidate Generation):** Narrows ~M candidates to ~500 using multi-armed bandit exploration + collaborative filtering.
+
+Sources of candidates:
+- Hashtags the user has engaged with recently
+- Similar accounts (overlapping engagement patterns)
+- Trending content in the user's geographic region
+- Suggested accounts the user doesn't follow
+
+**Stage 2 — Ranking:** Gradient-boosted decision tree (XGBoost/LightGBM) predicts P(engage) for each candidate. Returns top ~50.
+
+**Why two stages?** Full ranking over millions of candidates is too slow for the 200ms SLA. Retrieval narrows to a manageable set; ranking fine-sorts.
+
+## Feature Engineering
+
+| Category | Features |
+| --- | --- |
+| **Photo** | Engagement velocity (likes/min), image quality score, content category (ML classification), creator engagement rate, time since upload |
+| **User** | Historical engagement with similar content, past interaction with creator, session length (early = broad, late = narrow) |
+| **Context** | Time of day, day of week, network type (WiFi/cellular), engagement mode (explore vs. check-in) |
+
+## Ranking Model
+
+The model predicts a composite engagement score:
+
+```
+score = w1 × P(like) + w2 × P(comment) + w3 × P(save) + w4 × P(time_spent > 3s)
+```
+
+Weights are tuned to maximize **long-term user engagement (DAU retention)**, not just short-term clicks. The `P(save)` signal is particularly important — saves indicate high-quality content.
+
+**Training:** Retrained daily using a labeled dataset of interactions over the past 30 days. Positive = like/comment/save/>3s view. Negative = scroll past.
+
+**Serving:** TensorFlow Serving microservice. Inference &lt;5ms per candidate. 500 candidates scored in parallel.
+
+## Diversity & Freshness
+
+**Diversity constraints (post-processing):**
+- At most 30% from a single content category
+- At most 2 photos from the same creator
+- Limited photos with the same hashtag
+
+**Exploration vs. exploitation:** 10% of Explore slots reserved for exploration (new categories, new creators). Thompson Sampling dynamically adjusts exploration rate per user.
+
+**Freshness boost:** Photos uploaded within 24 hours receive a 1.2× multiplicative score boost.
+
+**Negative feedback:**
+- Swipe past: category/creator decay 0.5× for 24 hours
+- "Not Interested": 0.2× for 7 days

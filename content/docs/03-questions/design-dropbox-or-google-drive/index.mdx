@@ -1,0 +1,35 @@
+---
+title: Design Dropbox or Google Drive
+description: System design for a cloud file storage and sync service
+---
+
+## Overview
+
+Design a cloud file storage and synchronization service like Dropbox or Google Drive that allows millions of users to store, sync, share, and collaborate on files across multiple devices.
+
+### Key Challenges
+
+- **Sync at scale**: Propagating changes from a single device to all user devices within seconds, even when offline for days.
+- **Conflict resolution**: Handling concurrent edits to the same file from multiple devices without data loss.
+- **Storage efficiency**: Content-addressable deduplication to reduce storage costs across billions of files.
+- **Permission model**: Fine-grained access control with inheritance across nested folders.
+- **Reliability**: 11-nines durability for user data with minimal downtime.
+
+### What to Focus On
+
+- Client-server sync protocol and change detection (file system watches, journaling)
+- Conflict resolution strategies: OT for text, conflict copies for binary
+- Content-addressable storage with reference counting and garbage collection
+- Per-user sharding strategy for metadata service
+- Scaling file operations and handling hot keys
+
+## Document Structure
+
+| Section | Description |
+|---|---|
+| [Requirements](01-requirements/) | Functional, non-functional requirements, and scale assumptions |
+| [Core Entities](02-core-entities/) | Domain model and data relationships |
+| [API / System Interface](03-api-system-interface/) | Public APIs and internal service contracts |
+| [Data Flow](04-data-flow/) | Key user journeys and request paths |
+| [High Level Design](05-high-level-design/) | Architecture overview and service responsibilities |
+| [Deep Dives](06-deep-dives/) | Detailed explorations of key subsystems |

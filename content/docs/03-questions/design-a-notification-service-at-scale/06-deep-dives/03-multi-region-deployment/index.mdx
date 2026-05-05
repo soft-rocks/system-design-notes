@@ -1,0 +1,134 @@
+---
+title: Multi-Region Deployment
+description: Active-active architecture, data replication, geo-routing, and failover strategy.
+---
+
+## Active-Active Architecture
+
+Active-active ensures all regions serve traffic simultaneously:
+
+| Region | Role | Write Target | Read Source |
+|--------|------|-------------|-------------|
+| US-East | Primary (leader) | Local PG Primary | Local PG Primary |
+| EU-West | Replica | Route to US-East | Local PG Replica |
+| AP-Southeast | Replica | Route to US-East | Local PG Replica |
+
+**Why not local writes in replicas?** PostgreSQL supports only one primary. Multi-master replication would require complex conflict resolution (CRDTs, last-write-wins).
+
+```mermaid
+graph TB
+    DNS[Global DNS + GSLB] -->|US users| A_API[API Server - Region A]
+    DNS -->|EU users| B_API[API Server - Region B]
+    DNS -->|APAC users| C_API[API Server - Region C]
+
+    A_API --> A_DB[(PG Primary)]
+    A_DB -->|CDC| A_Kafka[Kafka]
+
+    A_Kafka -->|MirrorMaker| B_Kafka[Kafka]
+    A_Kafka -->|MirrorMaker| C_Kafka[Kafka]
+
+    B_Kafka --> B_DB[(PG Replica)]
+    C_Kafka --> C_DB[(PG Replica)]
+
+    B_API -.->|write routing| A_API
+    C_API -.->|write routing| A_API
+```
+
+## Data Replication
+
+### PostgreSQL Replication
+
+```mermaid
+sequenceDiagram
+    participant W as Writer (API Server)
+    participant P as PG Primary
+    participant R1 as PG Replica (Region B)
+    participant R2 as PG Replica (Region C)
+
+    W->>P: INSERT notification
+    P->>P: WAL write
+    P-->>W: Ack (async)
+    P->>R1: Stream WAL
+    P->>R2: Stream WAL
+
+    Note over R1,R2: Replication lag: 50-200ms typically
+```
+
+### Kafka MirrorMaker
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Source cluster | Region A Kafka | Primary producer |
+| Target clusters | Region B, C Kafka | Mirror consumers |
+| Topic replication | All notification.* topics | Full event replay |
+| Lag tolerance | < 1 second | Sufficient for eventual consistency |
+
+### CDC Pipeline
+
+```mermaid
+flowchart TD
+    A[PG Primary] -->|Logical Decoding| B[Debezium Connector]
+    B -->|CDC events| C[Kafka notification.cdc]
+    C --> D[Region B MirrorMaker]
+    C --> E[Region C MirrorMaker]
+    D --> F[PG Replica B]
+    E --> G[PG Replica C]
+```
+
+## Geo-Routing
+
+### DNS-Based Routing
+
+| Algorithm | Use Case | Implementation |
+|-----------|----------|---------------|
+| Latency-based | Normal operation | Route53 latency routing |
+| Weighted | Canary deployments | 90% region A, 10% region B |
+| Failover | Region outage | Health checks → failover |
+
+### Health Check Configuration
+
+```
+Interval: 10 seconds
+Timeout: 5 seconds
+Healthy threshold: 3 consecutive checks
+Unhealthy threshold: 2 consecutive checks
+```
+
+With this config:
+- **Detection time**: 10-15 seconds (first failed check + unhealthy threshold)
+- **False positive rate**: < 0.01% (double-check with multiple endpoints)
+
+## Failover Strategy
+
+### Failover Scenarios
+
+| Scenario | RTO | RPO | Automatic? |
+|----------|-----|-----|------------|
+| Single AZ outage | < 30s | 0 | Yes (auto-redirect within region) |
+| Region outage | 60s | < 10s | Yes (DNS failover + PG promotion) |
+| etcd leader crash | < 1s | 0 | Yes (automatic re-election) |
+| Database corruption | 5 min | Depends | Manual (operator intervention) |
+
+### Failover Flow
+
+```mermaid
+sequenceDiagram
+    participant M as Prometheus
+    participant FC as Failover Controller
+    participant R as Route53
+    participant E as etcd
+    participant PG as PostgreSQL
+
+    M->>FC: Alert: Region A unhealthy
+    FC->>M: Verify (double-check)
+    M-->>FC: Region A confirmed down
+
+    FC->>R: Update health checks
+    R->>Users: Route to healthy region
+
+    FC->>E: Trigger leader election (Region B)
+    E-->>FC: New leader in Region B
+
+    FC->>PG: Promote Region B replica
+    PG-->>FC: Region B is now primary
+```

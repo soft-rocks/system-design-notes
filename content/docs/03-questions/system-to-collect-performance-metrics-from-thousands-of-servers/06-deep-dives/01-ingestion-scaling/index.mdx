@@ -1,0 +1,161 @@
+---
+title: "Deep Dive: Ingestion Scaling"
+description: "How the system handles 500K metrics/sec ingestion from 10,000 servers"
+---
+
+## Agent Connection Management
+
+Each of the 10,000 agents maintains a persistent TCP connection to a collector instance. With 500K metrics/sec peak, the ingestion layer must handle ~50,000 concurrent connections efficiently.
+
+**Connection topology:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 Load Balancer (HAProxy)                      │
+│                                                              │
+│  Backend: collectors (round-robin with weight)               │
+│  Sticky: none (connections load-balanced per batch)          │
+│  Health: TCP probe every 5s, mark unhealthy after 3 failures │
+└──────────────┬──────────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Collector Instances (10 nodes)                  │
+│                                                              │
+│  Per node:                                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  Goroutine pool: 5,000 active goroutines            │    │
+│  │  Connection pool: 1,000 TCP connections             │    │
+│  │  Buffer per connection: 32KB                        │    │
+│  │  Max memory per connection: 32KB + TCP buffers      │    │
+│  │  Total per node: ~50MB connection memory            │    │
+│  │  Total system: ~500MB connection memory             │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Connection handling:**
+
+```go
+// Collector side
+func handleConnection(conn net.Conn) {
+    // Read batch (blocking, 10s timeout)
+    buf := readBatch(conn)
+    
+    // Parse and validate
+    batch, err := parseBatch(buf)
+    if err != nil {
+        conn.Write([]byte("INVALID"))
+        return
+    }
+    
+    // Push to Kafka channel (non-blocking with backpressure)
+    select {
+    case kafkaCh <- batch:
+        conn.Write([]byte("OK"))
+    case <-time.After(500 * time.Millisecond):
+        // Kafka backpressure — drop batch
+        conn.Write([]byte("FULL"))
+        dropCounter.Inc()
+    }
+}
+```
+
+**Why not UDP for everything:**
+- UDP has no delivery guarantees — packet loss on large batches means dropped metrics
+- For critical metrics (CPU, error rate), TCP ensures at-least-once delivery
+- For non-critical (custom app metrics), UDP is used with 1400-byte datagrams (no fragmentation)
+- UDP packets are fire-and-forget: if the collector drops one, the next 10s interval retries
+
+## Batch Push Protocol
+
+A single agent collects metrics from multiple sources and batches them every 10 seconds.
+
+**Batch format (Protobuf):**
+
+```protobuf
+message Batch {
+  repeated Series series = 1;
+}
+
+message Series {
+  string metric_name = 1;       // e.g., "cpu_usage"
+  map&lt;string, string&gt; labels = 2; // \{"host": "web-01", "service": "api"\}
+  repeated Point values = 3;
+}
+
+message Point {
+  int64 timestamp = 1;          // Unix ms
+  double value = 2;             // gauge value
+}
+```
+
+**Sizing per agent (worst case):**
+
+| Parameter | Value |
+| --- | --- |
+| Metrics per agent | 200 |
+| Points per metric (10s) | 1 |
+| Labels per metric | 4 (host, service, region, instance) |
+| Bytes per label key | 10 (avg) |
+| Bytes per label value | 15 (avg) |
+| Total per series | ~150 bytes |
+| Total batch size | 200 × 150 = 30KB |
+| Total bandwidth | 10,000 agents × 30KB / 10s = 30 MB/s |
+
+The 30 MB/s total bandwidth is trivial for modern datacenter networks (10–100 Gbps). The real bottleneck is Kafka throughput and storage I/O.
+
+**Batching strategy:**
+
+```
+Per-agent batching loop (every 10s):
+  1. Gather metrics from all scrapers
+  2. Group by metric name + label set → deduplicate within agent
+  3. Compress payload (Snappy, ~50% compression ratio)
+  4. Send via TCP (or UDP if &lt;1400 bytes)
+  5. Retry up to 3 times on "FULL" response (exponential backoff)
+  6. Discard on persistent failure after 3 retries
+```
+
+**Backpressure propagation:**
+
+```
+Collector → Kafka channel full → reject new batches → agent retries with backoff
+```
+
+If the Kafka partition producer buffer fills, the collector returns "FULL". Agents retry with exponential backoff (500ms, 1s, 2s). If all agents back up, ingestion rate drops gracefully. This is acceptable because monitoring data can tolerate short gaps (the next 10s interval will catch up).
+
+## Distributed Dedup
+
+Deduplication prevents duplicate metrics from inflating values when agents retransmit or collectors retry.
+
+**Redis dedup key:**
+
+```
+Key: dedup:\{series_key\}:\{10s_bucket_timestamp\}
+Value: "1"
+TTL: 60s
+Operation: SETNX (only set if key doesn't exist)
+```
+
+**Why 60s TTL:** covers the maximum agent retry window (3 retries × 2s max backoff).
+
+**Redis cluster distribution:**
+
+```
+Key hash: crc32(dedup_key) % num_redis_nodes
+```
+
+With 100K new series_keys per second (200 metrics × 10,000 servers / 10s), Redis needs to handle ~100K SETNX operations/sec. This is well within Redis capabilities (50K–100K ops/sec per node).
+
+**Multi-region dedup (active-passive):**
+
+In the active-passive replication model, the passive region inherits the dedup state from the active region via Kafka replication. When the active region fails over, the passive region has the dedup window intact because it's been replicating the dedup keys via Kafka log compaction.
+
+**Dedup false positive protection:**
+
+A rare edge case: if two different agents generate the same series_key (same metric name + same labels), they'd deduplicate each other. This is prevented by:
+
+1. **Unique host identification**: Each agent has a unique `agent_id` label embedded in every batch
+2. **Label validation**: Reject batches with duplicate or empty label keys
+3. **Label length limits**: Max 20 labels, 64 bytes per key/value — prevents hash collisions

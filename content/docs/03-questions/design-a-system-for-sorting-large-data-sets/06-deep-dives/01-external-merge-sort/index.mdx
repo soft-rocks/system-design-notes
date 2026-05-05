@@ -1,0 +1,69 @@
+---
+title: External Merge Sort
+description: Why external sort, sort-phase details, merge-phase details, and memory budget management.
+---
+
+## Why External Sort
+
+When the dataset exceeds available RAM (the defining problem), standard in-memory sorting algorithms are inapplicable. External merge sort is the canonical algorithm:
+
+1. **Divide** the input into chunks that fit in memory (64 MB each)
+2. **Sort** each chunk in memory using standard O(n log n) sort
+3. **Spill** each sorted chunk to disk as a spill file
+4. **Merge** all sorted runs via k-way merge, producing the final sorted output
+
+**Time complexity:** O((N/M) log(N/M) + N log K) where N = total records, M = chunk size, K = number of runs for merge.
+
+**Space complexity:** O(M) — independent of dataset size.
+
+## Sort-Phase Details
+
+For each 64 MB input chunk:
+
+1. **Load:** Read chunk into byte buffer
+2. **Parse:** Deserialize rows according to schema (Parquet → columnar structs; CSV → string tokens)
+3. **Extract keys:** Compute sort key(s) for each row (pre-compute comparator costs)
+4. **Sort:** In-place quicksort with 3-way partitioning (handles duplicates efficiently)
+5. **Serialize:** Write sorted rows to disk as block-encoded spill file (1 MB blocks)
+
+**Block structure:**
+
+```
+[Header: magic, block_size, record_count, first_key]
+[Records: var-length row data]
+[Index: key offsets for binary search]
+```
+
+The block index at the end enables **skip-merge** during global merge: when pulling from multiple spill files, binary search skips blocks whose key range falls before the current output position.
+
+## Merge-Phase Details
+
+**K-way merge** using a min-heap of size K (K = number of input runs):
+
+```
+Initialize: Pull first record from each of K runs → build min-heap (O(K))
+Loop:
+  Extract min from heap → output
+  Pull next record from the same run → insert into heap (O(log K))
+Until all runs exhausted
+```
+
+**Heap structure:** Entry = `(key, run_id, offset)`. Comparison uses multi-key comparator (primary + secondary + tertiary).
+
+**Block-level merge:** Instead of pulling record-by-record, pull block-by-block. Each block's first key is used to determine which block to pull next (skip-merge optimization).
+
+## Memory Budget Management
+
+| Resource | Budget | Usage |
+|----------|--------|-------|
+| Heap | 1 GB total | 64 MB chunk buffers + 128 MB sort buffer + 64 MB spill write buffer + 64 MB merge heap per run |
+| Sort buffer | 128 MB | In-memory sort of chunk |
+| Spill write buffer | 64 MB | Sequential write buffer |
+| Merge heap | 64 MB / run | Max 8 concurrent runs per merge (8 × 64 MB = 512 MB) |
+
+**Dynamic adjustment:** If heap usage exceeds budget, the system:
+1. Reduces chunk size by 50% (from 64 MB to 32 MB)
+2. Re-sorts with smaller chunks
+3. Produces more spill files (higher K in merge phase)
+
+**Tradeoff:** Smaller chunks → more spill files → higher merge fan-in → slower merge. But correctness is maintained at any chunk size ≥ 1 record.

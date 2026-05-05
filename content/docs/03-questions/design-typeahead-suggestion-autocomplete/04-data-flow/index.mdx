@@ -1,0 +1,62 @@
+---
+title: Data Flow
+description: Data flow for typeahead/autocomplete system design
+---
+
+## Suggestion Lookup Flow
+
+1. Client sends `GET /suggest?q=go` to API Gateway
+2. API Gateway routes to Suggest Service, which performs session lookup (Redis)
+3. Suggest Service queries the cache layer for matching terms under prefix "go" → returns top 50
+4. If user is authenticated, personalization re-ranks the 50 results using user context (query history, location, device)
+5. Top 10 suggestions returned with latency metadata
+6. Analytics events fired asynchronously to Kafka (non-blocking)
+
+**Key decisions:**
+- Cache is the primary path; dictionary lookup is fallback only (adds ~2ms)
+- Analytics is fire-and-forget — dropped events are acceptable
+- Personalization re-ranking happens **after** cache fetch to keep cache keys prefix-only (shared across users)
+
+## Dictionary Build Flow
+
+1. Query events stream into Kafka topic `autocomplete-events` (partitioned by prefix first char for ordering)
+2. Stream aggregator computes per-prefix per-term frequency in 24h sliding windows (Flink, checkpoint every 1 min)
+3. Score calculator applies decay function: `score = log(frequency + 1) * freshness_factor * boost_factors * ctr_factor`
+   - `ctr_factor = 1 + log1p(clickCount) / log1p(usageCount)` — rewards terms with high selection rate, not just query count
+4. Cache ingester pushes updated PrefixEntries in batches (every 5 minutes for long-tail terms)
+5. Entries replaced when `score` changes >20% or `usageCount` exceeds threshold
+6. **Trending terms get faster updates**: score updates propagated every 60 seconds (separate Kafka consumer group with lower commit interval)
+
+**Why different update frequencies?** Long-tail terms change slowly — 5-minute batches are fine and reduce write pressure. Trending terms need sub-minute freshness to catch viral content early.
+
+## Trending Detection Flow
+
+1. Trending service consumes from Kafka, computes per-term query velocity (queries/minute)
+2. Z-score spike detection against 7-day rolling baseline (flag if z > 3.0)
+3. Trending terms promoted to `category=TRENDING` with boosted score
+4. Trending cache updated every 60 seconds; suggest API reads from same cache namespace
+5. Terms expire after 24h of silence
+
+## Suggestion Click / Selection Tracking
+
+**Why this matters**: CTR (click-through rate) is the strongest signal for relevance. A term queried 1M times but selected 10% of the time should rank below a term queried 100K times but selected 80% of the time.
+
+1. Client fires analytics event on each suggestion **display** and **selection**:
+   - `display`: `\{query, suggestion_position, term, session_id, timestamp\}`
+   - `select`: `\{query, selected_term, position, latency_ms, session_id, timestamp\}`
+2. Events batched client-side (50 events or 2s, whichever comes first) → POST to analytics endpoint
+3. Analytics endpoint fires events to Kafka topic `autocomplete-interactions`
+4. Flink job consumes interactions, computes per-prefix per-term CTR:
+   - `ctr = selected_count / displayed_count`
+   - Updates `clickCount` in the dictionary builder's working set
+5. CTR factor feeds back into score calculation on next dictionary rebuild cycle
+
+**Data captured per interaction**:
+| Field | Purpose |
+|-------|---------|
+| `query_prefix` | Which prefix was typed |
+| `suggestion_position` | Rank position (1-10) |
+| `selected` | Boolean — was this term clicked? |
+| `time_to_select_ms` | Time from display to selection |
+| `is_corrected` | Whether the query was auto-corrected |
+| `result_count` | How many suggestions were returned |
