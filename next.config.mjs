@@ -7,7 +7,7 @@ const config = {
   reactStrictMode: true,
   ...(process.env.NEXT_PUBLIC_GITHUB_PAGES === 'true' && {
     output: 'export',
-    basePath: '/system-design-notes',
+    basePath: process.env.NEXT_PUBLIC_BASE_PATH || '/system-design-notes',
     images: { unoptimized: true },
     trailingSlash: true,
   }),
